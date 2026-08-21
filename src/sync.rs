@@ -36,6 +36,9 @@ pub enum PullOutcome {
     /// A fast-forward was possible but the worktree has uncommitted local
     /// changes — aborted before touching any ref or file (§5c).
     DirtyLocalChanges,
+    /// Already cloned; `--no-pull` requested skipping fetch/fast-forward
+    /// entirely (cli.rs's `no_pull` flag).
+    Skipped,
 }
 
 /// git2 credentials callback for the *pull* path only — `gh repo clone`
@@ -54,18 +57,24 @@ fn credentials_callback(
 }
 
 /// Clones `owner/name` under `root` via `gh repo clone` if it isn't present
-/// locally yet, otherwise opens the existing clone and fast-forwards its
-/// current branch in place. Returns the opened repo plus what happened.
+/// locally yet, otherwise opens the existing clone and — unless `pull` is
+/// `false` (cli.rs's `--no-pull`, §4: "on an already-cloned repo, skip
+/// fetch/fast-forward entirely") — fast-forwards its current branch in
+/// place. Returns the opened repo plus what happened.
 pub fn clone_or_pull(
     root: &Path,
     owner: &str,
     name: &str,
+    pull: bool,
 ) -> Result<(git2::Repository, PullOutcome)> {
     let path = resolve_local_path(root, owner, name);
 
     if path.join(".git").exists() {
         let repo = git2::Repository::open(&path)
             .with_context(|| format!("opening existing clone at {}", path.display()))?;
+        if !pull {
+            return Ok((repo, PullOutcome::Skipped));
+        }
         let branch = repo
             .head()
             .context("repo HEAD unresolved — detached or unborn?")?

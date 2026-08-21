@@ -9,15 +9,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"               # NOT 0.8 — that's three majors stale; current is 1.x (Opus-audit-caught, F20). Starting stale means Dependabot opens a major-bump PR in week one against a brand-new ruleset, which is exactly the CI-thrash §0 rules out.
 anyhow = "1"
-git2 = { version = "0.21", features = ["https", "ssh"] }
+git2 = { version = "0.21", features = ["https"] }
   # git2 0.21's own `default = []` (verified against its Cargo.toml this
   # session — NOT the "default features (ssh+https)" this comment used to
   # assume); `https` is what registers the https:// transport at all and
   # pulls in `cred` (§5b's `Cred::credential_helper`), and on macOS it
   # resolves to Secure Transport, not OpenSSL (libgit2-sys's build.rs only
   # selects GIT_OPENSSL for non-Apple targets) — so this still matches §0's
-  # "no vendored-openssl by default on either platform" intent. See §0 re:
-  # vendored-openssl — do NOT add preemptively.
+  # "no vendored-openssl by default on either platform" intent. `ssh`
+  # deliberately left off: §0 locks `git_protocol=https`, cloning goes
+  # through `gh repo clone`, and the credential path is `gh auth
+  # git-credential` for `https://github.com` — nothing in this design uses
+  # an ssh remote, so there's no reason to widen the license/link surface
+  # for it. See §0 re: vendored-openssl — do NOT add preemptively.
 skim = { version = "=5.6.5", default-features = false, features = ["frizbee"] }
   # Exact pin — API churns fast across majors. Non-default features (Opus-audit-caught, F21):
   # skim's *default* feature set pulls in a whole CLI stack cw never uses — clap_mangen,
