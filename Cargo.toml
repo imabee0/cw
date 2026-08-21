@@ -2,6 +2,7 @@
 name = "cw"
 version = "0.1.0"
 edition = "2021"   # `cargo init` on rustc 1.95 defaults to 2024 — scaffold agent must explicitly set this, not assume it (Opus-audit-caught, F39)
+license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
