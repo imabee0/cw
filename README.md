@@ -64,7 +64,7 @@ cw --repo owner/name my-slug # skip the repo picker, act on a named repo directl
 - `cw clean` / `cw clean --force` — remove finished worktrees (annotated dirty/clean and idle-days; dirty entries need `--force`).
 - `cw doctor` — sanity-check the environment (`gh` auth, git credential helper, terminal, each configured agent on `PATH`); exits nonzero if anything fails.
 - `cw --repo owner/name --dry-run my-slug` — preview the clone/pull + worktree + agent decision without mutating anything.
-- `cw completions zsh >> ~/.zshrc` — emit a shell completion script.
+- `cw completions zsh` — emit a shell completion script; install via a directory on `fpath` (e.g. `mkdir -p ~/.zfunc && cw completions zsh > ~/.zfunc/_cw`, with `fpath=(~/.zfunc $fpath)` placed *before* `compinit` in `~/.zshrc`). Appending straight into `~/.zshrc` also works only if that file calls `compinit` earlier in the same file — `fpath` avoids the ordering trap.
 
 ## License
 
