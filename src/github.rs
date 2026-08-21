@@ -189,7 +189,16 @@ mod tests {
     #[test]
     fn gh_repo_list_uses_high_limit() {
         let args = repo_list_args(None);
+        assert_eq!(&args[..2], ["repo", "list"]);
         assert!(args.windows(2).any(|w| w == ["--limit", "1000"]));
+        // Pinned alongside the limit check: `parse_gh_output`'s `RawRepo`
+        // struct renames its fields to exactly these two JSON keys, so a
+        // change here without a matching change there would stay green
+        // through `cargo check` and every other test, failing only at
+        // runtime against real `gh`.
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--json", "nameWithOwner,updatedAt"]));
 
         let args = repo_list_args(Some("imabee0"));
         assert!(args.windows(2).any(|w| w == ["--limit", "1000"]));
