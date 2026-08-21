@@ -88,6 +88,20 @@ fn init_logging() -> Result<WorkerGuard> {
         .build(&log_dir)
         .with_context(|| format!("initializing log file appender in {}", log_dir.display()))?;
 
+    // Belt-and-suspenders on top of the 0700 directory above: `.build()`
+    // already eagerly created today's file (tracing-appender's
+    // `RollingFileAppender::new` opens it at construction, not on first
+    // write), so it exists here to chmod. Best-effort only — the directory
+    // permission is what actually holds across every future day's rotation,
+    // since a fresh file each day would otherwise start back at the
+    // process's default umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let today_log = log_dir.join(format!("cw.log.{}", chrono::Utc::now().format("%Y-%m-%d")));
+        let _ = fs::set_permissions(&today_log, fs::Permissions::from_mode(0o600));
+    }
+
     let (file_writer, guard) = tracing_appender::non_blocking(appender);
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -239,7 +253,9 @@ fn determine_slug(
     }
 
     match picker::pick_worktree(same_repo, config.idle_threshold_days, true)? {
-        picker::Pick::Selected(picker::WorktreeSelection::Existing(entry)) => Ok(Some(entry.slug)),
+        picker::Pick::Selected(picker::WorktreeSelection::Existing(entry)) => {
+            Ok(Some(unflatten_slug(&entry.slug)))
+        }
         picker::Pick::Selected(picker::WorktreeSelection::New) => {
             Ok(Some(generate_timestamp_slug()))
         }
@@ -248,6 +264,20 @@ fn determine_slug(
         }
         picker::Pick::Cancelled => Ok(None),
     }
+}
+
+/// Reverses `worktree::flatten_slug` on a slug read back off disk (e.g.
+/// `scan_worktrees`'s `entry.slug`, taken from the flattened directory
+/// name). Safe precisely because `validate_worktree_slug` rejects a literal
+/// `+` in any raw slug segment (§5d) — no slug `create_or_resume_worktree`
+/// ever accepted could already contain the character flattening introduces,
+/// so this reversal can't misfire on a slug that legitimately contained `+`.
+/// Without this, §0a's existing-worktrees picker fed a flattened slug
+/// straight back into `create_or_resume_worktree`, whose first step
+/// (`validate_worktree_slug`) then rejected it — resuming any worktree whose
+/// raw slug contained `/` was unreachable through the picker.
+fn unflatten_slug(flat: &str) -> String {
+    flat.replace('+', "/")
 }
 
 fn interactive_confirm(resolved: &hooks::ResolvedHook) -> bool {
@@ -735,6 +765,64 @@ mod tests {
             agent_picker_needed(None, &cfg_unset),
             "an empty/unset default_agent must trigger the picker"
         );
+    }
+
+    #[test]
+    fn unflatten_slug_reverses_flatten() {
+        assert_eq!(unflatten_slug("foo+bar"), "foo/bar");
+        assert_eq!(unflatten_slug("plain"), "plain");
+        assert_eq!(unflatten_slug(&worktree::flatten_slug("a/b/c")), "a/b/c");
+    }
+
+    /// Regression guard for the bug the advisor pass caught: §0a's
+    /// existing-worktrees picker returns `entry.slug` straight off
+    /// `scan_worktrees`, which reads it from the on-disk (already flattened)
+    /// directory name. Feeding that verbatim into
+    /// `create_or_resume_worktree` — whose first step is
+    /// `validate_worktree_slug`, which rejects a literal `+` by design — made
+    /// resuming any worktree whose raw slug contained `/` fail every time
+    /// `determine_slug` picked it back up. This drives the exact round trip
+    /// `determine_slug`'s Existing arm performs, without needing an
+    /// interactive picker.
+    #[test]
+    fn resumed_slug_survives_scan_and_unflatten_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo_dir = root.join("acme").join("proj");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let repo = git2::Repository::init(&repo_dir).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        fs::write(repo_dir.join("README.md"), "hi").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("README.md")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+
+        let raw_slug = "myfeat/x";
+        let created = worktree::create_or_resume_worktree(&repo, raw_slug, "HEAD").unwrap();
+
+        let scanned = worktree::scan_worktrees(root).unwrap();
+        let entry = scanned
+            .into_iter()
+            .find(|e| e.repo == "acme/proj")
+            .expect("scan_worktrees must find the worktree just created");
+        // Confirms the premise: what comes back off disk IS the flattened
+        // form, not the raw slug.
+        assert_eq!(entry.slug, "myfeat+x");
+
+        let resumed_slug = unflatten_slug(&entry.slug);
+        assert_eq!(resumed_slug, raw_slug);
+        assert!(worktree::validate_worktree_slug(&resumed_slug).is_ok());
+
+        // The actual regression: feeding the unflattened slug back through
+        // `create_or_resume_worktree` must fast-resume the same path, not
+        // error on a rejected '+' segment.
+        let resumed = worktree::create_or_resume_worktree(&repo, &resumed_slug, "HEAD").unwrap();
+        assert_eq!(resumed, created);
     }
 
     #[test]
