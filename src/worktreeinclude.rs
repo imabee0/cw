@@ -152,6 +152,12 @@ fn walk_all_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         Err(_) => return,
     };
     for entry in entries.filter_map(Result::ok) {
+        if entry.file_name() == ".git" {
+            // A matched directory can itself contain a nested repo (a
+            // submodule) — never sweep its `.git` into the worktree, same
+            // guard `walk_dir` applies at the top level.
+            continue;
+        }
         let path = entry.path();
         let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
         let is_dir = !is_symlink && entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
