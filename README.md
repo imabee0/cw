@@ -7,7 +7,7 @@
 Requires the [`gh`](https://cli.github.com) CLI, already authenticated (`gh auth login`), and Rust/Cargo.
 
 ```bash
-git clone <this repo>
+git clone https://github.com/imabee0/cw.git
 cd cw
 cargo install --path . --locked
 ```
