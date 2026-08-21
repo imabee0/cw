@@ -853,3 +853,8 @@ mod tests {
         unsafe { std::env::remove_var("HOME") };
     }
 }
+
+fn    deliberately_unformatted(   )  {
+    let x=1;
+let y = 2;
+}
