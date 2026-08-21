@@ -1,0 +1,40 @@
+[package]
+name = "cw"
+version = "0.1.0"
+edition = "2021"   # `cargo init` on rustc 1.95 defaults to 2024 — scaffold agent must explicitly set this, not assume it (Opus-audit-caught, F39)
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"               # NOT 0.8 — that's three majors stale; current is 1.x (Opus-audit-caught, F20). Starting stale means Dependabot opens a major-bump PR in week one against a brand-new ruleset, which is exactly the CI-thrash §0 rules out.
+anyhow = "1"
+git2 = "0.21"            # default features (ssh+https); see §0 re: vendored-openssl — do NOT add preemptively
+skim = { version = "=5.6.5", default-features = false, features = ["frizbee"] }
+  # Exact pin — API churns fast across majors. Non-default features (Opus-audit-caught, F21):
+  # skim's *default* feature set pulls in a whole CLI stack cw never uses — clap_mangen,
+  # clap_complete_nushell, env_logger, image, ratatui-image, ron — on top of mandatory deps
+  # (tokio, portable-pty, ratatui, nix, mimalloc, which, shell-quote, roff). That inflates
+  # build time and blows past deny.toml's license allowlist (§9). `frizbee` is skim's fuzzy-
+  # match backend and the only default feature cw actually needs. Verify this trims correctly
+  # in the §6 step 2 spike — if `frizbee` alone doesn't build/behave right, fall back to full
+  # defaults and widen deny.toml's allowlist instead of fighting it further.
+ignore = "0.4"           # GitignoreBuilder for .worktreeinclude — same crate ripgrep uses, don't hand-roll
+chrono = { version = "0.4", features = ["serde"] }
+  # `features = ["serde"]` is required, not optional (Opus-audit-caught, F8) — RepoCache{fetched_at:
+  # DateTime<Utc>, ..} is serde_json-serialized in §5k; DateTime only implements Serialize/Deserialize
+  # behind this feature flag. Without it, cache.rs doesn't compile.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"  # persists a copy of the run's log to ~/.cache/cw/cw.log — see §5m
+clap_complete = "4"      # `cw completions <shell>` — see §4
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only uncommented if the §6 Linux Docker build spike fails to link against system OpenSSL:
+# openssl-sys = { version = "0.9", features = ["vendored"] }
+  # `openssl-sys` directly, not `git2 = {features=["vendored-openssl"]}` a second time in this
+  # table — Cargo unions feature flags across duplicate dependency entries, so either form works,
+  # but pulling in openssl-sys directly is the more conventional way to express this (minor, F27).
+
+[dev-dependencies]
+tempfile = "3"
