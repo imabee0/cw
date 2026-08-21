@@ -14,15 +14,35 @@ git2 = { version = "0.21", features = ["https"] }
   # git2 0.21's own `default = []` (verified against its Cargo.toml this
   # session — NOT the "default features (ssh+https)" this comment used to
   # assume); `https` is what registers the https:// transport at all and
-  # pulls in `cred` (§5b's `Cred::credential_helper`), and on macOS it
-  # resolves to Secure Transport, not OpenSSL (libgit2-sys's build.rs only
-  # selects GIT_OPENSSL for non-Apple targets) — so this still matches §0's
-  # "no vendored-openssl by default on either platform" intent. `ssh`
-  # deliberately left off: §0 locks `git_protocol=https`, cloning goes
-  # through `gh repo clone`, and the credential path is `gh auth
-  # git-credential` for `https://github.com` — nothing in this design uses
-  # an ssh remote, so there's no reason to widen the license/link surface
-  # for it. See §0 re: vendored-openssl — do NOT add preemptively.
+  # pulls in `cred` (§5b's `Cred::credential_helper`), and on macOS the
+  # *TLS backend libgit2 actually compiles in* is Secure Transport, not
+  # OpenSSL (libgit2-sys's build.rs selects GIT_OPENSSL only for non-Apple
+  # unix targets, unconditionally on `target.contains("apple")` — verified
+  # against its build.rs this session, unaffected by any openssl feature
+  # flag). `ssh` deliberately left off: §0 locks `git_protocol=https`,
+  # cloning goes through `gh repo clone`, and the credential path is `gh
+  # auth git-credential` for `https://github.com` — nothing in this design
+  # uses an ssh remote, so there's no reason to widen the license/link
+  # surface for it.
+  #
+  # BUT: unlike git2's own optional openssl-sys dep (scoped to
+  # `cfg(all(unix, not(target_os = "macos")))` in git2's Cargo.toml),
+  # libgit2-sys's `https = ["openssl-sys"]` is NOT scoped away from macOS —
+  # it requires openssl-sys on all `cfg(unix)` — because `openssl_init()`
+  # (`#[cfg(all(unix, feature = "https"))] pub fn openssl_init() {
+  # openssl_sys::init(); }` in libgit2-sys's lib.rs) calls it unconditionally
+  # on every unix target regardless of which TLS backend is actually
+  # compiled in. That's a real, observed macOS defect, not a theoretical
+  # one: `otool -L target/debug/cw` showed the built binary dynamically
+  # linked against `/opt/homebrew/opt/openssl@3/lib/{libssl,libcrypto}.3.dylib`
+  # by absolute Homebrew path — despite Secure Transport doing the actual
+  # TLS work — so the binary breaks the moment that install is upgraded,
+  # relocated, or missing. Fixed below via a macOS-scoped `vendored`
+  # openssl-sys, confirmed by re-running otool: Security.framework (Secure
+  # Transport) is still linked, the Homebrew dylib path is gone. See §0 re:
+  # vendored-openssl on Linux — that's a separate, still-unresolved
+  # question (system-openssl-missing contingency); this macOS fix is
+  # narrower and doesn't touch it.
 skim = { version = "=5.6.5", default-features = false, features = ["frizbee"] }
   # Exact pin — API churns fast across majors. Non-default features (Opus-audit-caught, F21):
   # skim's *default* feature set pulls in a whole CLI stack cw never uses — clap_mangen,
@@ -48,6 +68,16 @@ clap_complete = "4"      # `cw completions <shell>` — see §4
   # `openssl-sys` directly, not `git2 = {features=["vendored-openssl"]}` a second time in this
   # table — Cargo unions feature flags across duplicate dependency entries, so either form works,
   # but pulling in openssl-sys directly is the more conventional way to express this (minor, F27).
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Vendor (statically link) OpenSSL on macOS too — not for TLS (Secure
+# Transport handles that, unaffected by this flag; see the git2 dependency
+# comment above) but because libgit2-sys's `https` feature otherwise leaves
+# an unused-but-required openssl-sys dynamically linked against Homebrew's
+# `openssl@3` by absolute path, which breaks on any Mac where that install
+# differs or is missing. Same crate/feature/rationale as the Linux
+# contingency above, different trigger.
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [dev-dependencies]
 tempfile = "3"

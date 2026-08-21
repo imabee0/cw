@@ -72,6 +72,19 @@ pub fn flatten_slug(s: &str) -> String {
     s.replace('/', "+")
 }
 
+/// The on-disk path a worktree for `slug` would live at under `repo_root`,
+/// plus whether it already exists there (the fast-resume predicate). Shared
+/// by `create_or_resume_worktree` below and by callers (main.rs's
+/// `worktree_precheck`) that need to know in advance whether a create call
+/// will fast-resume or actually create — so the two checks can't drift apart
+/// into disagreeing about what "already exists" means.
+pub fn worktree_path_and_exists(repo_root: &Path, slug: &str) -> (PathBuf, bool) {
+    let flat = flatten_slug(slug);
+    let path = repo_root.join(".claude/worktrees").join(&flat);
+    let existed = path.join(".git").exists();
+    (path, existed)
+}
+
 /// The actual entry point every caller (default flow, `cw scratch`, §0a's
 /// resume picker) uses. `create_worktree` below is force-create/reset (`-B`
 /// semantics) — calling it unconditionally on every invocation would
@@ -84,13 +97,9 @@ pub fn create_or_resume_worktree(
     base_ref: &str,
 ) -> Result<PathBuf> {
     validate_worktree_slug(slug)?;
-    let flat = flatten_slug(slug);
-    let path = repo
-        .workdir()
-        .context("repo has no working directory")?
-        .join(".claude/worktrees")
-        .join(&flat);
-    if path.join(".git").exists() {
+    let repo_root = repo.workdir().context("repo has no working directory")?;
+    let (path, existed) = worktree_path_and_exists(repo_root, slug);
+    if existed {
         return Ok(path); // fast-resume: skip creation AND both hooks entirely
     }
     create_worktree(repo, slug, base_ref)
@@ -267,7 +276,11 @@ pub fn scan_worktrees(root: &Path) -> Result<Vec<WorktreeEntry>> {
                 }
                 out.push(WorktreeEntry {
                     repo: repo_label.clone(),
-                    slug: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    slug: path
+                        .file_name()
+                        .expect("invariant: read_dir entry always has a file name")
+                        .to_string_lossy()
+                        .into_owned(),
                     // `.ok()`-chained, not `?` (F34) — one unreadable entry
                     // (permissions, a race with concurrent deletion) would
                     // otherwise abort the ENTIRE scan via `?`, defeating

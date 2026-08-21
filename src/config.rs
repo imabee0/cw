@@ -157,29 +157,39 @@ pub fn resolve_agent(name: Option<&str>, cfg: &Config) -> Result<AgentConfig> {
         )
     })?;
     Ok(AgentConfig {
-        cmd: expand_var(&agent.cmd),
-        args: agent.args.iter().map(|a| expand_var(a)).collect(),
+        cmd: expand_var(&agent.cmd)?,
+        args: agent
+            .args
+            .iter()
+            .map(|a| expand_var(a))
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
 /// Expands a leading `$VAR` or `${VAR}` by reading the env var directly
 /// (never routes through `sh -c`). `$SHELL` specifically falls back to
-/// `/bin/sh` when unset; any other unset variable is left as an empty string
-/// rather than silently producing a nonsensical command.
-fn expand_var(s: &str) -> String {
+/// `/bin/sh` when unset (§3). Anything else that fails to resolve — a
+/// malformed `${VAR}suffix` form (no closing brace, or trailing text after
+/// one), or any other variable that's simply unset — is an error naming the
+/// exact string that didn't resolve, rather than silently substituting an
+/// empty string: an empty `cmd`/arg surfaces later as an opaque "agent not
+/// on PATH" failure with no indication which config value or variable
+/// caused it.
+fn expand_var(s: &str) -> Result<String> {
     let var = if let Some(rest) = s.strip_prefix("${") {
-        rest.strip_suffix('}').unwrap_or(rest)
+        rest.strip_suffix('}').with_context(|| {
+            format!("malformed variable reference '{s}' in config — expected '${{VAR}}'")
+        })?
     } else if let Some(rest) = s.strip_prefix('$') {
         rest
     } else {
-        return s.to_string();
+        return Ok(s.to_string());
     };
-    env::var(var).unwrap_or_else(|_| {
-        if var == "SHELL" {
-            "/bin/sh".to_string()
-        } else {
-            String::new()
-        }
+    if var == "SHELL" {
+        return Ok(env::var(var).unwrap_or_else(|_| "/bin/sh".to_string()));
+    }
+    env::var(var).with_context(|| {
+        format!("config references '{s}', but environment variable '{var}' is not set")
     })
 }
 
@@ -204,6 +214,27 @@ mod tests {
         let agent = resolve_agent(Some("shell"), &cfg).unwrap();
         assert_eq!(agent.cmd, "/bin/zsh");
         unsafe { env::remove_var("SHELL") };
+    }
+
+    #[test]
+    fn expand_var_shell_falls_back_when_unset() {
+        // SAFETY: test-only env mutation, single-threaded within this test.
+        unsafe { env::remove_var("SHELL") };
+        assert_eq!(expand_var("$SHELL").unwrap(), "/bin/sh");
+    }
+
+    #[test]
+    fn expand_var_errors_on_unset_non_shell_var() {
+        let err = expand_var("$CW_TEST_DEFINITELY_UNSET_VAR").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CW_TEST_DEFINITELY_UNSET_VAR"));
+    }
+
+    #[test]
+    fn expand_var_errors_on_malformed_braced_form() {
+        let err = expand_var("${FOO}suffix").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("${FOO}suffix"));
     }
 
     #[test]

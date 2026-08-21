@@ -111,11 +111,24 @@ pub fn save_consent(path: &Path, consent: &HookConsent) -> Result<()> {
     Ok(())
 }
 
-/// Checks whether `repo` is already confirmed; if not, calls `confirm` (the
-/// interactive y/N prompt, or `--yes`'s auto-affirm) exactly once and
+/// Checks whether `--yes` is set or `repo` is already confirmed; if
+/// neither, calls `confirm` (the interactive y/N prompt) exactly once and
 /// records the answer — confirmed or declined — so a later call for the
 /// same repo never prompts again, regardless of the answer. Returns
 /// whether the hook is cleared to run.
+///
+/// `auto_yes` is checked BEFORE the cache, not after: it's the documented
+/// non-interactive escape hatch (§0/§3/§4's `--yes`), so it must be able to
+/// override a previously *declined* consent for THIS run, not just skip
+/// prompting on a first encounter. Checking the cache first would let one
+/// earlier "n" permanently disable a repo's hooks with no way back short of
+/// hand-editing `hook-consent.json`. Deliberately NOT recorded to `consent`,
+/// though: `--yes` is a per-invocation override, not a re-answer of the
+/// prompt — writing `true` here would silently flip a stored decline to a
+/// standing "yes" that a later run WITHOUT `--yes` would then honor with no
+/// prompt at all, defeating the confirm-once-per-repo gate on exactly the
+/// runs that most need it (an interactive session against a repo someone
+/// once declined).
 fn gate(
     repo: &str,
     resolved: &ResolvedHook,
@@ -123,10 +136,13 @@ fn gate(
     auto_yes: bool,
     confirm: impl FnOnce(&ResolvedHook) -> bool,
 ) -> bool {
+    if auto_yes {
+        return true;
+    }
     if let Some(&confirmed) = consent.get(repo) {
         return confirmed;
     }
-    let confirmed = auto_yes || confirm(resolved);
+    let confirmed = confirm(resolved);
     consent.insert(repo.to_string(), confirmed);
     confirmed
 }
@@ -320,6 +336,31 @@ mod tests {
             true
         }));
         assert_eq!(prompts, 1);
+    }
+
+    #[test]
+    fn gate_yes_overrides_a_persisted_decline_without_recording_it() {
+        let mut consent = HookConsent::new();
+        let resolved = ResolvedHook {
+            program: "true".into(),
+            args: vec![],
+            cwd: PathBuf::from("/tmp"),
+        };
+
+        // First run: declined interactively, recorded as `false`.
+        assert!(!gate("me/repo", &resolved, &mut consent, false, |_| false));
+        assert_eq!(consent.get("me/repo"), Some(&false));
+
+        // A later `--yes` run must be able to override that persisted
+        // decline for ITS OWN run, not be permanently blocked by it.
+        assert!(gate("me/repo", &resolved, &mut consent, true, |_| {
+            panic!("auto_yes must not consult the interactive confirm callback")
+        }));
+
+        // But it must NOT durably rewrite the stored decline to a standing
+        // "yes" — a later interactive run (no --yes) should still see the
+        // original decline and re-gate on it, not silently run the hook.
+        assert_eq!(consent.get("me/repo"), Some(&false));
     }
 
     #[test]

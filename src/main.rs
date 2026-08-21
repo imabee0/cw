@@ -192,12 +192,12 @@ fn parse_owner_repo(spec: &str) -> Result<github::Repo> {
 /// `worktree::create_or_resume_worktree`, since that function's return value
 /// alone doesn't say whether it just created a worktree or fast-resumed an
 /// existing one, and callers need that distinction to decide whether
-/// symlinking/`.worktreeinclude`/hooks should run at all.
+/// symlinking/`.worktreeinclude`/hooks should run at all. Delegates to
+/// `worktree::worktree_path_and_exists` — the same predicate
+/// `create_or_resume_worktree` itself uses — so this precheck can't drift
+/// out of sync with what "already exists" actually means there.
 fn worktree_precheck(repo_root: &Path, slug: &str) -> (PathBuf, bool) {
-    let flat = worktree::flatten_slug(slug);
-    let path = repo_root.join(".claude/worktrees").join(&flat);
-    let existed = path.join(".git").exists();
-    (path, existed)
+    worktree::worktree_path_and_exists(repo_root, slug)
 }
 
 /// Whether `--agent`/`default_agent` need the interactive picker at all
