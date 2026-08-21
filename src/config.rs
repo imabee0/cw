@@ -206,9 +206,16 @@ mod tests {
         assert!(msg.contains("claude"));
     }
 
+    // `cargo test` runs tests concurrently by default, but SHELL is process-global —
+    // two tests mutating it without synchronization race (this is what made
+    // resolve_agent_expands_dollar_var flaky on CI's higher parallelism). Both SHELL
+    // mutators lock this for their duration.
+    static SHELL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resolve_agent_expands_dollar_var() {
-        // SAFETY: test-only env mutation, single-threaded within this test.
+        let _guard = SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only env mutation, serialized against other SHELL mutators via SHELL_ENV_LOCK.
         unsafe { env::set_var("SHELL", "/bin/zsh") };
         let cfg = Config::default();
         let agent = resolve_agent(Some("shell"), &cfg).unwrap();
@@ -218,7 +225,8 @@ mod tests {
 
     #[test]
     fn expand_var_shell_falls_back_when_unset() {
-        // SAFETY: test-only env mutation, single-threaded within this test.
+        let _guard = SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only env mutation, serialized against other SHELL mutators via SHELL_ENV_LOCK.
         unsafe { env::remove_var("SHELL") };
         assert_eq!(expand_var("$SHELL").unwrap(), "/bin/sh");
     }
