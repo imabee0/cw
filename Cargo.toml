@@ -3,6 +3,8 @@ name = "cw"
 version = "0.1.0"
 edition = "2021"   # `cargo init` on rustc 1.95 defaults to 2024 — scaffold agent must explicitly set this, not assume it (Opus-audit-caught, F39)
 license = "MIT"
+repository = "https://github.com/imabee0/cw"
+description = "Fuzzy-pick a GitHub repo, clone/pull it, create-or-resume a git worktree, launch an agent CLI inside it."
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -63,11 +65,15 @@ tracing-appender = "0.2"  # persists a copy of the run's log to ~/.cache/cw/cw.l
 clap_complete = "4"      # `cw completions <shell>` — see §4
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Only uncommented if the §6 Linux Docker build spike fails to link against system OpenSSL:
-# openssl-sys = { version = "0.9", features = ["vendored"] }
-  # `openssl-sys` directly, not `git2 = {features=["vendored-openssl"]}` a second time in this
-  # table — Cargo unions feature flags across duplicate dependency entries, so either form works,
-  # but pulling in openssl-sys directly is the more conventional way to express this (minor, F27).
+# Vendored (not just a CI contingency anymore): a release binary that
+# dynamically links whatever libssl the build runner happens to have would
+# fail to run on any end-user distro with a different OpenSSL major (e.g.
+# still on 1.1 while the runner has 3.x). Same rationale as the macOS block
+# below. `openssl-sys` directly, not `git2 = {features=["vendored-openssl"]}`
+# a second time in this table — Cargo unions feature flags across duplicate
+# dependency entries, so either form works, but this is the more conventional
+# way to express it (minor, F27).
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Vendor (statically link) OpenSSL on macOS too — not for TLS (Secure
@@ -81,3 +87,8 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

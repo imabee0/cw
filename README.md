@@ -4,7 +4,13 @@
 
 ## Install
 
-Requires the [`gh`](https://cli.github.com) CLI, already authenticated (`gh auth login`), and Rust/Cargo.
+**macOS or Linux, one line** (installs the latest release to `~/.cargo/bin`, verifying a checksum first):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/imabee0/cw/releases/latest/download/cw-installer.sh | sh
+```
+
+**From source** (an unreleased change, or a platform without a prebuilt binary):
 
 ```bash
 git clone https://github.com/imabee0/cw.git
@@ -12,7 +18,7 @@ cd cw
 cargo install --path . --locked
 ```
 
-Installs `cw` onto `$PATH` via `~/.cargo/bin`.
+Either way requires the [`gh`](https://cli.github.com) CLI, already authenticated (`gh auth login`) — `cw` shells out to it for all GitHub access.
 
 ## Config
 
