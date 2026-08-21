@@ -56,3 +56,7 @@ Flat `src/*.rs`, binary-only crate, no `lib.rs`.
 - **`tracing_appender`'s `WorkerGuard` must stay a named local bound in `main()`** — dropping it early silently loses buffered log lines.
 - Config/cache paths are fixed at `~/.config/cw/config.toml` and `~/.cache/cw/{repos.json,cw.log.*}` on both macOS and Linux — not `directories::ProjectDirs`, deliberately, to avoid diverging per platform.
 - `cw` shells out to `gh` for all GitHub API access (repo/org listing, clone auth) — `gh auth status` must be green; `cw doctor` checks this.
+
+## Standards exceptions
+
+- **This repo's own source is hosted on GitHub** (`imabee0/cw`, public, ruleset + auto-merge on `main`) instead of the house Gitea-only default (global CLAUDE.md § Structure and forge). Explicit, repeated user direction for this one project — see plan §0's "GitHub via `gh`" and "CI/CD + merge policy" rows for the full decision record. Do not migrate this to Gitea without the same explicit direction.
