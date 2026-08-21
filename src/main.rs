@@ -254,6 +254,14 @@ fn determine_slug(
 
     match picker::pick_worktree(same_repo, config.idle_threshold_days, true)? {
         picker::Pick::Selected(picker::WorktreeSelection::Existing(entry)) => {
+            // MUST unflatten here: `entry.slug` is the on-disk (flattened)
+            // directory name, and the caller passes this straight to
+            // `create_or_resume_worktree`, whose first step
+            // (`validate_worktree_slug`) rejects a literal '+'. Regression
+            // test: `tests::resumed_slug_survives_scan_and_unflatten_round_trip`
+            // — that test exercises `unflatten_slug` directly, not this match
+            // arm (which requires a TTY to reach via `pick_worktree`), so it
+            // will NOT catch a revert of this line back to `entry.slug` alone.
             Ok(Some(unflatten_slug(&entry.slug)))
         }
         picker::Pick::Selected(picker::WorktreeSelection::New) => {
