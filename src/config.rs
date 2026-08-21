@@ -111,8 +111,19 @@ pub fn cache_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".cache/cw/repos.json"))
 }
 
-pub fn log_path() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".cache/cw/cw.log"))
+/// Directory the rolling log file lives in. `RollingFileAppender` with
+/// `Rotation::DAILY` and `filename_prefix("cw.log")` (main.rs's
+/// `init_logging`) names each day's actual file `cw.log.<yyyy-MM-dd>` inside
+/// this directory — never a literal `cw.log` — so callers that need the
+/// directory (to create it, to point the appender at it) use this, not a
+/// single fixed log file path.
+pub fn log_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".cache/cw"))
+}
+
+/// Per-repo hook confirm-once consent store (§5h) — `"owner/repo" -> confirmed`.
+pub fn hook_consent_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".cache/cw/hook-consent.json"))
 }
 
 /// Missing config file -> defaults, not an error (fresh-machine case).

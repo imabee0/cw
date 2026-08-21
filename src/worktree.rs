@@ -282,7 +282,7 @@ pub fn scan_worktrees(root: &Path) -> Result<Vec<WorktreeEntry>> {
             }
         }
     }
-    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    out.sort_by_key(|e| std::cmp::Reverse(e.mtime));
     Ok(out)
 }
 
@@ -321,8 +321,12 @@ pub fn symlink_shared_dirs(repo_root: &Path, worktree_path: &Path, dirs: &[Strin
     Ok(())
 }
 
-const SCRATCH_OWNER: &str = ".scratch"; // GitHub usernames can never start with '.' — guaranteed no collision with a real cloned repo under <root>
-const SCRATCH_REPO: &str = "workspace";
+// GitHub usernames can never start with '.' — guaranteed no collision with a
+// real cloned repo under <root>. `pub` so main.rs can build the same
+// "owner/repo"-shaped label `scan_worktrees` derives, for `cw scratch`'s
+// dispatch and its `--dry-run` preview, without duplicating these literals.
+pub const SCRATCH_OWNER: &str = ".scratch";
+pub const SCRATCH_REPO: &str = "workspace";
 
 /// `cw scratch` — repo-less worktrees, reusing the existing worktree
 /// machinery unchanged. Lazily creates a synthetic repo at
