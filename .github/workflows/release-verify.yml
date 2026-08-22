@@ -1,0 +1,81 @@
+name: release-verify
+
+# Not folded into release.yml: that file is cargo-dist-generated
+# (dist-workspace.toml -> `dist generate`) and must never be hand-edited.
+#
+# This is the check that would catch a segfaulting or wrong-version artifact
+# before a user ever saw it -- checksum + attestation alone only prove the
+# archive is authentic and untampered, not that the binary inside it works,
+# so every OS in the matrix actually extracts and executes it.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify (e.g. v0.1.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read   # default-deny baseline; the verify job elevates itself below
+
+jobs:
+  verify:
+    name: verify (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Matches dist-workspace.toml's `targets` and the runner
+          # architectures GitHub-hosted macos-14/macos-13 actually ship.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write     # gh release edit --draft on the rollback path below
+      attestations: read  # gh attestation verify
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+      ASSET: cw-${{ matrix.target }}.tar.xz
+    steps:
+      - name: Download release asset + checksum
+        run: gh release download "$TAG" --repo "${{ github.repository }}" --pattern "$ASSET" --pattern "$ASSET.sha256"
+
+      - name: Verify checksum
+        run: shasum -a 256 -c "$ASSET.sha256"
+
+      - name: Verify build provenance attestation
+        run: gh attestation verify "$ASSET" --repo "${{ github.repository }}"
+
+      - name: Extract archive
+        run: tar -xJf "$ASSET"
+
+      - name: Execute the binary and assert its printed version matches the tag
+        run: |
+          bin="cw-${{ matrix.target }}/cw"
+          chmod +x "$bin"
+          actual_output="$("$bin" --version)"
+          expected_version="${TAG#v}"
+          actual_version="$(printf '%s' "$actual_output" | awk '{print $2}')"
+          echo "binary printed: $actual_output"
+          echo "expected version (from tag $TAG): $expected_version"
+          if [ "$actual_version" != "$expected_version" ]; then
+            echo "::error::version mismatch: binary reports '$actual_version', release tag is '$TAG'"
+            exit 1
+          fi
+
+      # releases/latest falls back to the previous non-draft release the
+      # instant this one is marked draft, so a bad artifact stops being
+      # what `cw`'s install script (and anyone visiting /releases/latest)
+      # hands out next, without deleting the evidence.
+      - name: On failure, draft this release so 'latest' falls back to the previous good one
+        if: failure()
+        run: |
+          gh release edit "$TAG" --repo "${{ github.repository }}" --draft
+          exit 1

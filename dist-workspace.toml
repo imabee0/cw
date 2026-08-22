@@ -20,7 +20,11 @@ install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program
-install-updater = false
+# true: the release-plz.yml/release-verify.yml chain (release-plz.toml)
+# makes releases frequent and automatic, so the shell installer bundles a
+# `cw-update` binary letting existing installs self-update instead of
+# re-running the install script by hand each time.
+install-updater = true
 # Skip running on pull_request — the generated workflow grants contents:write
 # at the workflow level, which every job (including a PR-triggered plan job)
 # would inherit for no reason, contradicting ci.yml's least-privilege
