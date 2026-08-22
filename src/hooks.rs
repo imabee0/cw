@@ -189,7 +189,7 @@ pub enum HookOutcome {
 /// raw OS error. On a nonzero exit, warns and returns `Ok` rather than
 /// aborting — a failed setup script shouldn't block getting into an
 /// interactive agent session where the user can fix it themselves.
-fn exec_hook(resolved: &ResolvedHook, env: &HookEnv) -> Result<HookOutcome> {
+pub(crate) fn exec_hook(resolved: &ResolvedHook, env: &HookEnv) -> Result<HookOutcome> {
     let status = Command::new(&resolved.program)
         .args(&resolved.args)
         .current_dir(&resolved.cwd)

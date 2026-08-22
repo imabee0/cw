@@ -1,18 +1,19 @@
-//! Pure, terminal-free state transitions — `update_repo`/`update_worktree`
-//! mutate a `Model` in response to one `Msg` and optionally yield a terminal
-//! `Outcome`. Every rule in the plan's Interaction model lives here, so it's
-//! exercised directly with fixture `Msg` sequences, no real terminal needed
-//! (see the `tests` module below).
+//! Pure, terminal-free state transitions — `update_dashboard` mutates a
+//! `DashboardModel` in response to one `Msg` and optionally yields a
+//! terminal `DashboardOutcome`. Every rule in the plan's keybinding-gating
+//! table lives here, so it's exercised directly with fixture `Msg`
+//! sequences, no real terminal needed (see the `tests` module below).
+//! Anything impure — spawning the background clone thread, running a hook,
+//! launching the agent CLI — lives in `dashboard.rs`, which inspects the
+//! model after each call here and reacts; this file never touches a
+//! filesystem, subprocess, or thread.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use super::model::{
-    AgentModel, AgentOutcome, ListState, RepoModel, RepoOutcome, WorktreeMode, WorktreeModel,
-    WorktreeOutcome,
-};
+use super::model::{DashboardModel, DashboardOutcome, Focus, Modal, Scope};
 use super::msg::Msg;
 use super::widgets;
-use crate::picker::{CleanCandidate, WorktreeSelection};
+use crate::worktree::WorktreeSelection;
 
 /// `PageUp`/`PageDown` scroll amount. Not derived from the last-rendered
 /// table height (that's `Rect::default()` — height 0 — before the first
@@ -23,395 +24,334 @@ fn is_ctrl_c(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-// ---------------------------------------------------------------------
-// Repo screen
-// ---------------------------------------------------------------------
+fn is_ctrl_a(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
 
-pub fn update_repo(model: &mut RepoModel, msg: Msg) -> Option<RepoOutcome> {
+pub fn update_dashboard(model: &mut DashboardModel, msg: Msg) -> Option<DashboardOutcome> {
     match msg {
-        Msg::Key(key) => handle_repo_key(model, key),
+        Msg::Key(key) => handle_key(model, key),
         Msg::Mouse(mouse) => {
-            handle_list_mouse(&model.list, mouse);
-            None
-        }
-        Msg::DataLoaded(load) => {
-            model.apply_load(load);
+            handle_mouse(model, mouse);
             None
         }
         Msg::Resize | Msg::Tick => None,
-    }
-}
-
-fn handle_repo_key(model: &mut RepoModel, key: KeyEvent) -> Option<RepoOutcome> {
-    if is_ctrl_c(key) {
-        return Some(RepoOutcome::Cancelled);
-    }
-
-    match key.code {
-        KeyCode::Esc => {
-            if !model.list.query.is_empty() {
-                model.list.query.clear();
-                model.list.refilter(|r| r.filter_text.as_str());
-                return None;
-            }
-            return Some(RepoOutcome::Cancelled);
-        }
-        KeyCode::Enter => {
-            if let Some(row) = model.list.selected() {
-                return Some(RepoOutcome::Selected(row.repo.clone()));
-            }
-        }
-        KeyCode::Up => model.list.move_selection(-1),
-        KeyCode::Down => model.list.move_selection(1),
-        KeyCode::PageUp => model.list.move_selection(-PAGE),
-        KeyCode::PageDown => model.list.move_selection(PAGE),
-        // `j`/`k` are unconditional navigation, never typable into the
-        // filter — same deliberate trade-off the plan calls out for `q`
-        // ("bound to quit only when the filter is empty, for the same
-        // reason [as Ctrl-C]"): a fixed, small set of single-letter keys
-        // stay control keys rather than searchable text.
-        KeyCode::Char('j') => model.list.move_selection(1),
-        KeyCode::Char('k') => model.list.move_selection(-1),
-        KeyCode::Backspace if model.list.query.pop().is_some() => {
-            model.list.refilter(|r| r.filter_text.as_str());
-        }
-        KeyCode::Char('q') if model.list.query.is_empty() => {
-            return Some(RepoOutcome::Cancelled);
-        }
-        KeyCode::Char(c) => {
-            model.list.query.push(c);
-            model.list.refilter(|r| r.filter_text.as_str());
-        }
-        _ => {}
-    }
-    None
-}
-
-// ---------------------------------------------------------------------
-// Agent-only screen (`picker::pick_agent`'s fallback — see its doc comment)
-// ---------------------------------------------------------------------
-
-pub fn update_agent(model: &mut AgentModel, msg: Msg) -> Option<AgentOutcome> {
-    match msg {
-        Msg::Key(key) => handle_agent_key(model, key),
-        Msg::Mouse(mouse) => {
-            handle_list_mouse(&model.list, mouse);
+        Msg::DataLoaded(load) => {
+            model.apply_repo_load(load);
             None
         }
-        Msg::Resize | Msg::Tick | Msg::DataLoaded(_) => None,
-    }
-}
-
-fn handle_agent_key(model: &mut AgentModel, key: KeyEvent) -> Option<AgentOutcome> {
-    if is_ctrl_c(key) {
-        return Some(AgentOutcome::Cancelled);
-    }
-
-    match key.code {
-        KeyCode::Esc => {
-            if !model.list.query.is_empty() {
-                model.list.query.clear();
-                model.list.refilter(|a| a.filter_text.as_str());
-                return None;
-            }
-            return Some(AgentOutcome::Cancelled);
-        }
-        KeyCode::Enter => {
-            if let Some(row) = model.list.selected() {
-                return Some(AgentOutcome::Selected(row.name.clone()));
-            }
-        }
-        KeyCode::Up => model.list.move_selection(-1),
-        KeyCode::Down => model.list.move_selection(1),
-        KeyCode::PageUp => model.list.move_selection(-PAGE),
-        KeyCode::PageDown => model.list.move_selection(PAGE),
-        KeyCode::Char('j') => model.list.move_selection(1),
-        KeyCode::Char('k') => model.list.move_selection(-1),
-        KeyCode::Backspace if model.list.query.pop().is_some() => {
-            model.list.refilter(|a| a.filter_text.as_str());
-        }
-        KeyCode::Char('q') if model.list.query.is_empty() => {
-            return Some(AgentOutcome::Cancelled);
-        }
-        KeyCode::Char(c) => {
-            model.list.query.push(c);
-            model.list.refilter(|a| a.filter_text.as_str());
-        }
-        _ => {}
-    }
-    None
-}
-
-// ---------------------------------------------------------------------
-// Worktree(+agent) screen
-// ---------------------------------------------------------------------
-
-pub fn update_worktree(model: &mut WorktreeModel, msg: Msg) -> Option<WorktreeOutcome> {
-    match msg {
-        Msg::Key(key) => handle_worktree_key(model, key),
-        Msg::Mouse(mouse) => {
-            handle_worktree_mouse(model, mouse);
+        Msg::WorktreesLoaded(result) => {
+            model.apply_worktrees_load(result);
             None
         }
-        Msg::Resize | Msg::Tick | Msg::DataLoaded(_) => None,
+        Msg::CloneDone(result) => model.apply_clone_done(result),
+        Msg::DirtyRefreshed(path, result) => {
+            model.apply_dirty_refresh(path, result);
+            None
+        }
     }
 }
 
-fn handle_worktree_key(model: &mut WorktreeModel, key: KeyEvent) -> Option<WorktreeOutcome> {
+fn handle_key(model: &mut DashboardModel, key: KeyEvent) -> Option<DashboardOutcome> {
     if is_ctrl_c(key) {
-        return Some(WorktreeOutcome::Cancelled);
+        return Some(DashboardOutcome::Cancelled);
     }
-
-    let overlay_open = matches!(
-        model.mode,
-        WorktreeMode::Single {
-            agent_overlay: true,
-            ..
-        }
-    );
-    if overlay_open {
-        handle_agent_overlay_key(model, key)
-    } else {
-        handle_worktree_list_key(model, key)
+    if model.modal.is_some() {
+        return handle_modal_key(model, key);
     }
+    if is_ctrl_a(key) {
+        model.cycle_agent();
+        return None;
+    }
+    handle_pane_key(model, key)
 }
 
-fn handle_worktree_list_key(model: &mut WorktreeModel, key: KeyEvent) -> Option<WorktreeOutcome> {
-    let is_multi = matches!(model.mode, WorktreeMode::Multi);
-
-    match key.code {
-        KeyCode::Esc => {
-            if !model.list.query.is_empty() {
-                model.list.query.clear();
-                model.list.refilter(|r| r.filter_text.as_str());
-                return None;
+fn handle_modal_key(model: &mut DashboardModel, key: KeyEvent) -> Option<DashboardOutcome> {
+    match model.modal.as_ref()? {
+        Modal::HookConsent { .. } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => model.resolve_hook_consent(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                model.resolve_hook_consent(false)
             }
-            return Some(WorktreeOutcome::Cancelled);
-        }
-        KeyCode::Enter => {
-            // In multi-select mode Enter "activates the focused row" by
-            // toggling its checkbox, same as Space/click — the batch
-            // delete itself commits on `d` (see the Interaction-model
-            // bullet on multi-select), not on Enter, so keyboard and mouse
-            // stay in lockstep: neither a click nor an Enter ever deletes
-            // by itself.
-            if is_multi {
-                toggle_focused(model);
-                return None;
-            }
-            return enter_worktree_row(model);
-        }
-        KeyCode::Char(' ') if is_multi => toggle_focused(model),
-        // Query-gated like `q` above (and for the same reason): unlike `q`,
-        // an accidental match here is destructive, so it gets the stricter
-        // treatment even though `q` itself only needs it for the "search
-        // string can contain a letter" case.
-        KeyCode::Char('d') if is_multi && model.list.query.is_empty() => {
-            return commit_multi_delete(model)
-        }
-        KeyCode::Up => model.list.move_selection(-1),
-        KeyCode::Down => model.list.move_selection(1),
-        KeyCode::PageUp => model.list.move_selection(-PAGE),
-        KeyCode::PageDown => model.list.move_selection(PAGE),
-        KeyCode::Char('j') => model.list.move_selection(1),
-        KeyCode::Char('k') => model.list.move_selection(-1),
-        KeyCode::Backspace if model.list.query.pop().is_some() => {
-            model.list.refilter(|r| r.filter_text.as_str());
-        }
-        KeyCode::Char('q') if model.list.query.is_empty() => {
-            return Some(WorktreeOutcome::Cancelled);
-        }
-        KeyCode::Char(c) => {
-            model.list.query.push(c);
-            model.list.refilter(|r| r.filter_text.as_str());
-        }
-        _ => {}
-    }
-    None
-}
-
-/// Enter on a worktree row (single-select mode only — multi-select never
-/// reaches this, see `handle_worktree_list_key`): finishes the screen
-/// outright when no agent still needs picking, otherwise opens the inline
-/// agent sub-panel instead of tearing this screen down and relaunching a
-/// second one.
-fn enter_worktree_row(model: &mut WorktreeModel) -> Option<WorktreeOutcome> {
-    let selection = model.list.selected()?.selection.clone();
-    match &mut model.mode {
-        WorktreeMode::Single {
-            agent_needed,
-            agent_overlay,
-            pending,
-            ..
-        } => {
-            if *agent_needed {
-                *pending = Some(selection);
-                *agent_overlay = true;
+            _ => None,
+        },
+        Modal::ConfirmDelete { .. } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                model.confirm_delete();
                 None
-            } else {
-                Some(WorktreeOutcome::Single {
-                    selection,
-                    agent: None,
-                })
             }
-        }
-        WorktreeMode::Multi => unreachable!("multi-select Enter never reaches this function"),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                model.modal = None;
+                None
+            }
+            _ => None,
+        },
     }
 }
 
-fn handle_agent_overlay_key(model: &mut WorktreeModel, key: KeyEvent) -> Option<WorktreeOutcome> {
-    let WorktreeMode::Single {
-        agents,
-        agent_overlay,
-        pending,
-        ..
-    } = &mut model.mode
-    else {
-        unreachable!("overlay_open is only ever true in Single mode");
-    };
-
+/// The nesting order the plan's Esc rule spells out: modal (already routed
+/// away in `handle_key` before reaching here) → delete-mode → the focused
+/// pane's filter → cancel the whole dashboard.
+fn handle_pane_key(model: &mut DashboardModel, key: KeyEvent) -> Option<DashboardOutcome> {
     match key.code {
         KeyCode::Esc => {
-            if !agents.query.is_empty() {
-                agents.query.clear();
-                agents.refilter(|a| a.filter_text.as_str());
-            } else {
-                // Back out to the worktree list — not a full cancel. Esc's
-                // "clear filter, else cancel" rule nests one level deeper
-                // for a sub-panel than for the top-level screen.
-                *agent_overlay = false;
+            if model.delete_mode {
+                model.delete_mode = false;
+                model.checked.clear();
+                return None;
             }
-        }
-        KeyCode::Enter => {
-            if let Some(row) = agents.selected() {
-                let selection = pending
-                    .clone()
-                    .expect("pending is set whenever the overlay opens");
-                return Some(WorktreeOutcome::Single {
-                    selection,
-                    agent: Some(row.name.clone()),
-                });
+            if !focused_query_empty(model) {
+                clear_focused_query(model);
+                return None;
             }
+            Some(DashboardOutcome::Cancelled)
         }
-        KeyCode::Up => agents.move_selection(-1),
-        KeyCode::Down => agents.move_selection(1),
-        KeyCode::PageUp => agents.move_selection(-PAGE),
-        KeyCode::PageDown => agents.move_selection(PAGE),
-        KeyCode::Char('j') => agents.move_selection(1),
-        KeyCode::Char('k') => agents.move_selection(-1),
-        KeyCode::Backspace if agents.query.pop().is_some() => {
-            agents.refilter(|a| a.filter_text.as_str());
+        KeyCode::Tab => {
+            toggle_focus(model);
+            None
         }
-        KeyCode::Char('q') if agents.query.is_empty() => {
-            return Some(WorktreeOutcome::Cancelled);
+        KeyCode::Enter => handle_enter(model),
+        KeyCode::Char(' ') if model.delete_mode && model.focus == Focus::Worktrees => {
+            toggle_focused_if_existing(model);
+            None
         }
+        // Query-gated like `q` below, and for the same reason spelled out in
+        // CLAUDE.md: an accidental match here is destructive (it either
+        // enters delete-mode or opens the removal confirm), so it gets the
+        // gate even in panes where a bare `q` would too.
+        KeyCode::Char('d') if model.focus == Focus::Worktrees && focused_query_empty(model) => {
+            toggle_delete_or_confirm(model);
+            None
+        }
+        KeyCode::Up => {
+            move_focused(model, -1);
+            None
+        }
+        KeyCode::Down => {
+            move_focused(model, 1);
+            None
+        }
+        KeyCode::PageUp => {
+            move_focused(model, -PAGE);
+            None
+        }
+        KeyCode::PageDown => {
+            move_focused(model, PAGE);
+            None
+        }
+        // `j`/`k` are unconditional navigation, never typable into a filter —
+        // the deliberate exception CLAUDE.md's gating rule calls out.
+        KeyCode::Char('j') => {
+            move_focused(model, 1);
+            None
+        }
+        KeyCode::Char('k') => {
+            move_focused(model, -1);
+            None
+        }
+        KeyCode::Backspace => {
+            backspace_focused(model);
+            None
+        }
+        KeyCode::Char('q') if focused_query_empty(model) => Some(DashboardOutcome::Cancelled),
         KeyCode::Char(c) => {
-            agents.query.push(c);
-            agents.refilter(|a| a.filter_text.as_str());
+            type_into_focused(model, c);
+            None
         }
+        _ => None,
+    }
+}
+
+/// Enter on the Repos pane just moves focus onto the Worktrees pane —
+/// there's nothing to "commit" about a repo row on its own, the worktree
+/// pane already tracks the repo cursor live (see `move_focused`). Enter on
+/// the Worktrees pane either toggles the focused row's checkbox
+/// (delete-mode, matching Space/click — the batch delete itself only ever
+/// commits on `d`, never Enter) or starts the clone/hook/create/launch
+/// pipeline for that row.
+fn handle_enter(model: &mut DashboardModel) -> Option<DashboardOutcome> {
+    match model.focus {
+        Focus::Repos => {
+            model.focus = Focus::Worktrees;
+            None
+        }
+        Focus::Worktrees => {
+            if model.delete_mode {
+                toggle_focused_if_existing(model);
+                return None;
+            }
+            let selection = model.worktrees.selected()?.selection.clone();
+            model.start_pending(selection)
+        }
+    }
+}
+
+/// `d` outside delete-mode: enters it. `d` with something checked: opens the
+/// removal confirm modal. `d` in delete-mode with nothing checked: backs
+/// out. The three-state toggle the plan's delete-flow section describes.
+fn toggle_delete_or_confirm(model: &mut DashboardModel) {
+    if !model.checked.is_empty() {
+        model.open_delete_confirm();
+    } else {
+        model.delete_mode = !model.delete_mode;
+    }
+}
+
+/// Never lets the synthetic "+ new worktree" row be checked for removal —
+/// there's nothing on disk yet to delete.
+fn toggle_focused_if_existing(model: &mut DashboardModel) {
+    let is_existing = matches!(
+        model.worktrees.selected().map(|r| &r.selection),
+        Some(WorktreeSelection::Existing(_))
+    );
+    if is_existing {
+        model.toggle_checked_focused();
+    }
+}
+
+fn toggle_focus(model: &mut DashboardModel) {
+    if matches!(model.scope, Scope::Browse { .. }) {
+        model.focus = match model.focus {
+            Focus::Repos => Focus::Worktrees,
+            Focus::Worktrees => Focus::Repos,
+        };
+    }
+}
+
+fn focused_query_empty(model: &DashboardModel) -> bool {
+    match model.focus {
+        Focus::Repos => match &model.scope {
+            Scope::Browse { repos } => repos.query.is_empty(),
+            _ => true,
+        },
+        Focus::Worktrees => model.worktrees.query.is_empty(),
+    }
+}
+
+fn move_focused(model: &mut DashboardModel, delta: isize) {
+    match model.focus {
+        Focus::Repos => {
+            if let Scope::Browse { repos } = &model.scope {
+                repos.move_selection(delta);
+            }
+            model.refresh_worktree_pane();
+        }
+        Focus::Worktrees => model.worktrees.move_selection(delta),
+    }
+}
+
+fn clear_focused_query(model: &mut DashboardModel) {
+    match model.focus {
+        Focus::Repos => {
+            if let Scope::Browse { repos } = &mut model.scope {
+                repos.query.clear();
+                repos.refilter(|r| r.filter_text.as_str());
+            }
+            model.refresh_worktree_pane();
+        }
+        Focus::Worktrees => {
+            model.worktrees.query.clear();
+            model.worktrees.refilter(|r| r.filter_text.as_str());
+        }
+    }
+}
+
+fn backspace_focused(model: &mut DashboardModel) {
+    match model.focus {
+        Focus::Repos => {
+            let popped = if let Scope::Browse { repos } = &mut model.scope {
+                let popped = repos.query.pop().is_some();
+                if popped {
+                    repos.refilter(|r| r.filter_text.as_str());
+                }
+                popped
+            } else {
+                false
+            };
+            if popped {
+                model.refresh_worktree_pane();
+            }
+        }
+        Focus::Worktrees => {
+            if model.worktrees.query.pop().is_some() {
+                model.worktrees.refilter(|r| r.filter_text.as_str());
+            }
+        }
+    }
+}
+
+fn type_into_focused(model: &mut DashboardModel, c: char) {
+    match model.focus {
+        Focus::Repos => {
+            if let Scope::Browse { repos } = &mut model.scope {
+                repos.query.push(c);
+                repos.refilter(|r| r.filter_text.as_str());
+            }
+            model.refresh_worktree_pane();
+        }
+        Focus::Worktrees => {
+            model.worktrees.query.push(c);
+            model.worktrees.refilter(|r| r.filter_text.as_str());
+        }
+    }
+}
+
+/// Resolves a click to a row in whichever pane's last-rendered `Rect`
+/// contains it (checking the Repos pane first, when it exists — panes never
+/// overlap on screen, so at most one hit-tests true), focusing that pane and
+/// row. A click never activates a row — see CLAUDE.md's mouse invariant —
+/// except that, like the keyboard, delete-mode also toggles the checkbox on
+/// the row it just focused. Scroll wheel events move the currently focused
+/// pane's selection, same as `j`/`k`.
+fn handle_mouse(model: &mut DashboardModel, mouse: MouseEvent) {
+    if model.modal.is_some() {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(_) => handle_mouse_down(model, mouse),
+        MouseEventKind::ScrollDown => move_focused(model, 1),
+        MouseEventKind::ScrollUp => move_focused(model, -1),
         _ => {}
     }
-    None
 }
 
-fn toggle_focused(model: &mut WorktreeModel) {
-    let Some(filtered_pos) = model.list.selected_index() else {
-        return;
+fn handle_mouse_down(model: &mut DashboardModel, mouse: MouseEvent) {
+    let repo_idx = match &model.scope {
+        Scope::Browse { repos } => hit_test(repos.table_rect.get(), repos, mouse),
+        _ => None,
     };
-    let Some(&item_idx) = model.list.filtered.get(filtered_pos) else {
-        return;
-    };
-    if !model.checked.remove(&item_idx) {
-        model.checked.insert(item_idx);
-    }
-}
-
-/// `d`: commits the current checked set as the Outcome. Mirrors
-/// `picker.rs`'s old skim-backed behavior exactly: zero rows checked is
-/// `Cancelled`, not an outcome with an empty `Vec` — `clean.rs::run_clean`
-/// never sees a distinction between "cancelled" and "selected nothing".
-/// Dirty rows are never excluded here — `dirty` rides along on each
-/// `CleanCandidate` unchanged, and `clean.rs::run_clean`'s own
-/// dirty/`--force` gate (unaffected by this rewrite) decides what actually
-/// gets removed.
-fn commit_multi_delete(model: &WorktreeModel) -> Option<WorktreeOutcome> {
-    if model.checked.is_empty() {
-        return Some(WorktreeOutcome::Cancelled);
-    }
-    let mut idxs: Vec<usize> = model.checked.iter().copied().collect();
-    idxs.sort_unstable();
-
-    let mut candidates: Vec<CleanCandidate> = Vec::with_capacity(idxs.len());
-    for idx in idxs {
-        if let Some(row) = model.list.items.get(idx) {
-            if let WorktreeSelection::Existing(entry) = &row.selection {
-                candidates.push(CleanCandidate {
-                    entry: entry.clone(),
-                    dirty: row.dirty,
-                });
-            }
+    if let Some(idx) = repo_idx {
+        if let Scope::Browse { repos } = &model.scope {
+            repos.select(Some(idx));
         }
-    }
-    Some(WorktreeOutcome::Multi(candidates))
-}
-
-fn handle_worktree_mouse(model: &mut WorktreeModel, mouse: MouseEvent) {
-    let overlay_open = matches!(
-        model.mode,
-        WorktreeMode::Single {
-            agent_overlay: true,
-            ..
-        }
-    );
-    if overlay_open {
-        if let WorktreeMode::Single { agents, .. } = &model.mode {
-            handle_list_mouse(agents, mouse);
-        }
+        model.focus = Focus::Repos;
+        model.refresh_worktree_pane();
         return;
     }
 
-    let is_multi = matches!(model.mode, WorktreeMode::Multi);
-    let focused = handle_list_mouse(&model.list, mouse);
-    // Mouse click focuses only, never activates — except in multi-select
-    // mode, where the plan makes a click "the mouse equivalent of Space":
-    // it still only toggles a checkbox, it never deletes by itself.
-    if is_multi && focused && matches!(mouse.kind, MouseEventKind::Down(_)) {
-        toggle_focused(model);
+    if let Some(idx) = hit_test(model.worktrees.table_rect.get(), &model.worktrees, mouse) {
+        model.worktrees.select(Some(idx));
+        model.focus = Focus::Worktrees;
+        if model.delete_mode {
+            toggle_focused_if_existing(model);
+        }
     }
 }
 
-/// Resolves a click to a row and focuses it (never activates); scrolls move
-/// the selection like `j`/`k`. Returns whether a click successfully focused
-/// a row, so multi-select mode's click-also-toggles rule can key off it.
-fn handle_list_mouse<T>(list: &ListState<T>, mouse: MouseEvent) -> bool {
-    match mouse.kind {
-        MouseEventKind::Down(_) => {
-            let area = list.table_rect.get();
-            let offset = list.offset();
-            match widgets::row_at(area, offset, mouse.column, mouse.row) {
-                Some(idx) if idx < list.filtered.len() => {
-                    list.select(Some(idx));
-                    true
-                }
-                _ => false,
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            list.move_selection(1);
-            false
-        }
-        MouseEventKind::ScrollUp => {
-            list.move_selection(-1);
-            false
-        }
-        _ => false,
-    }
+fn hit_test<T>(
+    area: ratatui::layout::Rect,
+    list: &super::model::ListState<T>,
+    mouse: MouseEvent,
+) -> Option<usize> {
+    let idx = widgets::row_at(area, list.offset(), mouse.column, mouse.row)?;
+    (idx < list.filtered.len()).then_some(idx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AgentConfig;
+    use crate::config::{AgentConfig, Config};
+    use crate::hooks::HookConsent;
     use crate::worktree::WorktreeEntry as ScannedEntry;
     use ratatui::layout::Rect;
     use std::collections::HashMap;
@@ -426,23 +366,11 @@ mod tests {
         Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
     }
 
-    fn repo_model(names: &[&str]) -> RepoModel {
-        let repos = names
-            .iter()
-            .map(|n| crate::github::Repo {
-                owner: "acme".to_string(),
-                name: (*n).to_string(),
-                updated_at: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .collect();
-        RepoModel::new(repos, PathBuf::from("/nonexistent-root"))
-    }
-
     fn scanned_entry(repo: &str, slug: &str) -> ScannedEntry {
         ScannedEntry {
             repo: repo.to_string(),
             slug: slug.to_string(),
-            path: PathBuf::from(format!("/tmp/{repo}/{slug}")),
+            path: PathBuf::from(format!("/nonexistent-root/{repo}/{slug}")),
             mtime: SystemTime::now(),
         }
     }
@@ -462,44 +390,461 @@ mod tests {
             .collect()
     }
 
-    // --- Filter-then-Esc / Ctrl-C ------------------------------------
+    fn config_with_agents(names: &[&str]) -> Config {
+        Config {
+            agents: agents_map(names),
+            ..Config::default()
+        }
+    }
+
+    /// Same as `config_with_agents`, plus a `post_clone_hook` so
+    /// `DashboardModel::checkpoint` has something to actually check —
+    /// `resolve_post_clone_hook` only needs `Some(path)` to resolve (it
+    /// joins the path, it doesn't stat it), so this never touches the
+    /// filesystem.
+    fn config_with_clone_hook(names: &[&str]) -> Config {
+        Config {
+            post_clone_hook: Some(PathBuf::from("hook.sh")),
+            ..config_with_agents(names)
+        }
+    }
+
+    /// Shared fixture: a `DashboardModel` in `Scope::AllWorktrees`, with a
+    /// tempdir-backed hook-consent path — never `config::hook_consent_path()`
+    /// (the real `~/.cache/cw` store), so a test that reaches
+    /// `resolve_hook_consent`'s `save_consent` call never touches the user's
+    /// actual machine state.
+    fn all_worktrees_model(entries: Vec<ScannedEntry>, delete_mode: bool) -> DashboardModel {
+        let consent_dir = tempfile::tempdir().expect("tempdir");
+        let mut model = DashboardModel::new_all_worktrees(
+            PathBuf::from("/nonexistent-root"),
+            config_with_agents(&["claude", "grok"]),
+            HookConsent::new(),
+            consent_dir.path().join("hook-consent.json"),
+            false,
+            delete_mode,
+            false,
+        );
+        // Leak the tempdir for the model's lifetime — test-only, avoids a
+        // dangling consent path once `consent_dir` would otherwise drop.
+        std::mem::forget(consent_dir);
+        model.apply_worktrees_load(Ok(super::super::msg::WorktreesLoad {
+            entries,
+            dirty: HashMap::new(),
+        }));
+        model
+    }
+
+    // --- Esc nesting: delete-mode -> filter -> cancel -------------------
 
     #[test]
-    fn repo_filter_then_esc_clears_then_cancels() {
-        let mut model = repo_model(&["alpha", "beta"]);
-        assert!(update_repo(&mut model, key(KeyCode::Char('a'))).is_none());
-        assert_eq!(model.list.query, "a");
+    fn esc_exits_delete_mode_before_clearing_filter() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")], true);
+        model.worktrees.query.push_str("abc");
+        model.worktrees.refilter(|r| r.filter_text.as_str());
 
-        // First Esc: clears the filter, does not cancel.
-        assert!(update_repo(&mut model, key(KeyCode::Esc)).is_none());
-        assert_eq!(model.list.query, "");
+        assert!(update_dashboard(&mut model, key(KeyCode::Esc)).is_none());
+        assert!(!model.delete_mode, "first Esc must exit delete-mode");
+        assert_eq!(
+            model.worktrees.query, "abc",
+            "delete-mode exit must not also clear the filter"
+        );
 
-        // Second Esc, with an empty filter: cancels.
-        match update_repo(&mut model, key(KeyCode::Esc)) {
-            Some(RepoOutcome::Cancelled) => {}
-            _ => panic!("expected Cancelled on Esc with an empty filter"),
+        assert!(update_dashboard(&mut model, key(KeyCode::Esc)).is_none());
+        assert_eq!(model.worktrees.query, "", "second Esc clears the filter");
+
+        match update_dashboard(&mut model, key(KeyCode::Esc)) {
+            Some(DashboardOutcome::Cancelled) => {}
+            _ => panic!("third Esc, with delete-mode off and filter empty, must cancel"),
         }
     }
 
     #[test]
-    fn repo_ctrl_c_cancels_immediately_with_filter_text_present() {
-        let mut model = repo_model(&["alpha", "beta"]);
-        update_repo(&mut model, key(KeyCode::Char('c')));
-        assert_eq!(model.list.query, "c", "plain 'c' must still type");
-
-        match update_repo(&mut model, ctrl_c()) {
-            Some(RepoOutcome::Cancelled) => {}
-            _ => panic!("Ctrl-C must cancel even with filter text present"),
+    fn ctrl_c_cancels_immediately_regardless_of_state() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")], true);
+        model.worktrees.query.push('c');
+        match update_dashboard(&mut model, ctrl_c()) {
+            Some(DashboardOutcome::Cancelled) => {}
+            _ => panic!("Ctrl-C must cancel even with filter text and delete-mode active"),
         }
     }
 
-    // --- Mouse hit-testing (row_at is covered directly in widgets.rs;
-    //     this exercises it wired through update_repo's mouse handling) --
+    // --- Per-pane query isolation across Tab -----------------------------
 
     #[test]
-    fn repo_mouse_click_focuses_without_activating() {
-        let mut model = repo_model(&["alpha", "beta", "gamma"]);
-        model.list.table_rect.set(Rect::new(0, 0, 20, 4)); // header + 3 rows
+    fn tab_swaps_focus_without_clearing_either_panes_query() {
+        let repos = vec![crate::github::Repo {
+            owner: "acme".to_string(),
+            name: "proj".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+        let consent_dir = tempfile::tempdir().expect("tempdir");
+        let mut model = DashboardModel::new_browse(
+            repos,
+            PathBuf::from("/nonexistent-root"),
+            config_with_agents(&["claude"]),
+            HookConsent::new(),
+            consent_dir.path().join("hook-consent.json"),
+            false,
+            None,
+        );
+        std::mem::forget(consent_dir);
+        model.apply_worktrees_load(Ok(super::super::msg::WorktreesLoad {
+            entries: vec![scanned_entry("acme/proj", "one")],
+            dirty: HashMap::new(),
+        }));
+
+        assert_eq!(model.focus, Focus::Repos);
+        update_dashboard(&mut model, key(KeyCode::Char('a')));
+        assert_eq!(model.focus, Focus::Repos);
+
+        update_dashboard(&mut model, key(KeyCode::Tab));
+        assert_eq!(model.focus, Focus::Worktrees);
+        update_dashboard(&mut model, key(KeyCode::Char('z')));
+
+        update_dashboard(&mut model, key(KeyCode::Tab));
+        assert_eq!(model.focus, Focus::Repos);
+
+        let Scope::Browse { repos } = &model.scope else {
+            panic!("expected Browse scope");
+        };
+        assert_eq!(repos.query, "a", "repo pane's own query must survive Tab");
+        assert_eq!(
+            model.worktrees.query, "z",
+            "worktree pane's own query must survive Tab"
+        );
+    }
+
+    // --- Worktree pane rebuilds purely from dirty_cache, no I/O ----------
+
+    #[test]
+    fn worktree_pane_reflects_dirty_cache_with_no_live_io() {
+        // Both paths are nonexistent — a real `gitstatus::is_dirty` call
+        // against either would error. A passing assertion here is real
+        // evidence the pane never calls it: only `dirty_cache` (populated by
+        // `apply_worktrees_load`/`apply_dirty_refresh`, never by a live
+        // `is_dirty` read inside `refresh_worktree_pane`) decides the flag.
+        let consent_dir = tempfile::tempdir().expect("tempdir");
+        let mut model = DashboardModel::new_all_worktrees(
+            PathBuf::from("/nonexistent-root"),
+            config_with_agents(&["claude"]),
+            HookConsent::new(),
+            consent_dir.path().join("hook-consent.json"),
+            false,
+            false,
+            false,
+        );
+        std::mem::forget(consent_dir);
+
+        let clean_entry = scanned_entry("acme/proj", "clean-one");
+        let dirty_entry = scanned_entry("acme/proj", "dirty-one");
+        let mut dirty = HashMap::new();
+        dirty.insert(dirty_entry.path.clone(), true);
+
+        update_dashboard(
+            &mut model,
+            Msg::WorktreesLoaded(Ok(super::super::msg::WorktreesLoad {
+                entries: vec![clean_entry.clone(), dirty_entry.clone()],
+                dirty,
+            })),
+        );
+
+        let dirty_row = model
+            .worktrees
+            .items
+            .iter()
+            .find(|r| matches!(&r.selection, WorktreeSelection::Existing(e) if e.path == dirty_entry.path))
+            .expect("dirty entry must be present");
+        assert!(dirty_row.dirty);
+
+        let clean_row = model
+            .worktrees
+            .items
+            .iter()
+            .find(|r| matches!(&r.selection, WorktreeSelection::Existing(e) if e.path == clean_entry.path))
+            .expect("clean entry must be present");
+        assert!(!clean_row.dirty);
+
+        // A later background refresh flips one entry's flag purely via
+        // `Msg::DirtyRefreshed` — still no I/O inside `update_dashboard`.
+        update_dashboard(
+            &mut model,
+            Msg::DirtyRefreshed(clean_entry.path.clone(), Ok(true)),
+        );
+        let flipped = model
+            .worktrees
+            .items
+            .iter()
+            .find(|r| matches!(&r.selection, WorktreeSelection::Existing(e) if e.path == clean_entry.path))
+            .unwrap();
+        assert!(flipped.dirty, "DirtyRefreshed must update the cached flag");
+    }
+
+    // --- Delete three-state toggle ---------------------------------------
+
+    #[test]
+    fn d_three_state_toggle_enter_confirm_back_out() {
+        let mut model = all_worktrees_model(
+            vec![
+                scanned_entry("acme/proj", "one"),
+                scanned_entry("acme/proj", "two"),
+            ],
+            false,
+        );
+
+        // State 1: not in delete-mode, nothing checked -> `d` enters it.
+        assert!(update_dashboard(&mut model, key(KeyCode::Char('d'))).is_none());
+        assert!(model.delete_mode);
+        assert!(model.modal.is_none());
+
+        // State 2: in delete-mode, focused row checked -> `d` opens confirm.
+        update_dashboard(&mut model, key(KeyCode::Char(' ')));
+        assert_eq!(model.checked.len(), 1);
+        assert!(update_dashboard(&mut model, key(KeyCode::Char('d'))).is_none());
+        assert!(
+            matches!(model.modal, Some(Modal::ConfirmDelete { .. })),
+            "d with something checked must open the confirm modal"
+        );
+
+        // Back out of the modal without confirming, uncheck, then `d` with
+        // nothing checked while still in delete-mode backs all the way out.
+        update_dashboard(&mut model, key(KeyCode::Esc));
+        assert!(model.modal.is_none());
+        update_dashboard(&mut model, key(KeyCode::Char(' '))); // uncheck
+        assert!(model.checked.is_empty());
+        assert!(update_dashboard(&mut model, key(KeyCode::Char('d'))).is_none());
+        assert!(
+            !model.delete_mode,
+            "d with nothing checked while already in delete-mode must back out"
+        );
+    }
+
+    #[test]
+    fn d_gated_on_active_filter_types_instead_of_toggling() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")], true);
+        model.worktrees.query.push_str("abc");
+        model.worktrees.refilter(|r| r.filter_text.as_str());
+
+        assert!(update_dashboard(&mut model, key(KeyCode::Char('d'))).is_none());
+        assert_eq!(
+            model.worktrees.query, "abcd",
+            "'d' with an active filter must type into the query, not toggle delete-mode"
+        );
+        assert!(model.delete_mode, "delete-mode must be unaffected");
+    }
+
+    #[test]
+    fn confirm_delete_modal_yes_removes_only_checked() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")], true);
+        update_dashboard(&mut model, key(KeyCode::Char(' '))); // check the only row
+        update_dashboard(&mut model, key(KeyCode::Char('d'))); // opens confirm
+        assert!(matches!(model.modal, Some(Modal::ConfirmDelete { .. })));
+
+        // 'n' backs out without removing anything or touching all_entries.
+        update_dashboard(&mut model, key(KeyCode::Char('n')));
+        assert!(model.modal.is_none());
+        assert_eq!(model.all_entries.len(), 1);
+    }
+
+    // --- Hook-consent-once-per-repo ---------------------------------------
+
+    #[test]
+    fn hook_consent_declined_is_recorded_and_not_reprompted() {
+        let mut model = all_worktrees_model(vec![], false);
+        model.pending = Some(super::super::model::PendingLaunch {
+            ctx: super::super::model::LaunchContext {
+                repo_label: "acme/proj".to_string(),
+                owner: String::new(),
+                name: String::new(),
+                slug: "feature".to_string(),
+                agent: "claude".to_string(),
+            },
+            repo_root: PathBuf::from("/nonexistent-root/acme/proj"),
+            worktree_path: Some(PathBuf::from(
+                "/nonexistent-root/acme/proj/.claude/worktrees/feature",
+            )),
+            stage: super::super::model::Stage::CloneHook,
+            freshly_created: false,
+        });
+        model.modal = Some(Modal::HookConsent {
+            resolved: crate::hooks::ResolvedHook {
+                program: "true".to_string(),
+                args: vec![],
+                cwd: PathBuf::from("/nonexistent-root"),
+            },
+            kind: super::super::model::HookKind::Clone,
+        });
+
+        update_dashboard(&mut model, key(KeyCode::Char('n')));
+        assert!(model.modal.is_none(), "declining must close the modal");
+
+        // Recorded durably — `hooks::gate`'s own unit tests
+        // (`gate_prompts_once_per_repo`) cover the analogous non-dashboard
+        // consent store; what this test adds is that routing a decline
+        // through `update_dashboard`'s modal key handling actually reaches
+        // `resolve_hook_consent` and persists the answer.
+        assert_eq!(model.hook_consent.get("acme/proj"), Some(&false));
+
+        // The "not reprompted" half: a second worktree from the SAME repo
+        // hits `Stage::CloneHook`'s `checkpoint` again — this time it must
+        // consult the map entry just recorded (`Some(false)` ->
+        // `HookCheckpoint::Skip`) instead of opening a fresh
+        // `Modal::HookConsent`. `checkpoint`/`advance_pending` are private to
+        // `tui::model`, so this drives it the only way reachable from here:
+        // a real `Msg::CloneDone(Cloned)` for a config that actually has a
+        // `post_clone_hook` configured (`config_with_clone_hook` — the
+        // shared fixture above has none, so its clone-hook checkpoint would
+        // `Skip` before ever consulting `hook_consent` either way). `config`
+        // itself is private to `DashboardModel`, so this rebuilds the model
+        // instead of mutating it in place, carrying the already-recorded
+        // decline forward via the same `hook_consent` map.
+        let consent_dir = tempfile::tempdir().expect("tempdir");
+        let mut model = DashboardModel::new_all_worktrees(
+            PathBuf::from("/nonexistent-root"),
+            config_with_clone_hook(&["claude"]),
+            model.hook_consent,
+            consent_dir.path().join("hook-consent.json"),
+            false,
+            false,
+            false,
+        );
+        std::mem::forget(consent_dir);
+        model.pending = Some(super::super::model::PendingLaunch {
+            ctx: super::super::model::LaunchContext {
+                repo_label: "acme/proj".to_string(),
+                owner: "acme".to_string(),
+                name: "proj".to_string(),
+                slug: "second".to_string(),
+                agent: "claude".to_string(),
+            },
+            repo_root: PathBuf::from("/nonexistent-root/acme/proj"),
+            worktree_path: None,
+            stage: super::super::model::Stage::Cloning,
+            freshly_created: false,
+        });
+
+        update_dashboard(
+            &mut model,
+            Msg::CloneDone(Ok(super::super::msg::CloneOutcome {
+                repo_label: "acme/proj".to_string(),
+                pull_outcome: crate::sync::PullOutcome::Cloned,
+            })),
+        );
+        assert!(
+            model.modal.is_none(),
+            "a repo with a recorded decline must not reopen Modal::HookConsent on a later checkpoint"
+        );
+        assert_eq!(
+            model.hook_consent.get("acme/proj"),
+            Some(&false),
+            "checkpoint must consult the existing entry, not overwrite it"
+        );
+    }
+
+    // --- PendingLaunch stage advancement on a resumed hook -----------------
+    //
+    // `resume_after_hook` is the driver-triggered counterpart to
+    // `Msg::CloneDone` below: `dashboard.rs`'s suspend/resume loop calls it
+    // directly (not through a `Msg`) once a suspended `hooks::exec_hook` run
+    // returns. Both cases pin `Stage::CreateHook`'s mapping via
+    // `HookKind::Create` (`stage_after_hook(Create) == Stage::Launching`),
+    // which then flows straight into the `Stage::Launching` arm — resolving
+    // the agent and yielding `Suspend(LaunchAgent)` without touching the
+    // filesystem, unlike the Clone-hook case (`Stage::CreatingWorktree`
+    // opens a real `git2::Repository`, which a nonexistent-root fixture
+    // can't exercise here).
+
+    #[test]
+    fn resume_after_hook_ok_advances_stage_and_continues_the_pipeline() {
+        let mut model = all_worktrees_model(vec![], false);
+        model.pending = Some(super::super::model::PendingLaunch {
+            ctx: super::super::model::LaunchContext {
+                repo_label: "acme/proj".to_string(),
+                owner: String::new(),
+                name: String::new(),
+                slug: "feature".to_string(),
+                agent: "claude".to_string(),
+            },
+            repo_root: PathBuf::from("/nonexistent-root/acme/proj"),
+            worktree_path: Some(PathBuf::from(
+                "/nonexistent-root/acme/proj/.claude/worktrees/feature",
+            )),
+            stage: super::super::model::Stage::CreateHook,
+            freshly_created: true,
+        });
+
+        let outcome = model.resume_after_hook(super::super::model::HookKind::Create, Ok(()));
+        assert!(
+            model.status.is_none(),
+            "a successful hook run must not set an error status"
+        );
+        match outcome {
+            Some(DashboardOutcome::Suspend(super::super::model::SuspendReq::LaunchAgent {
+                ..
+            })) => {}
+            other => panic!(
+                "CreateHook -> Ok must map to Stage::Launching (stage_after_hook) and suspend \
+                 into a launch, got {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn resume_after_hook_err_records_status_but_still_advances() {
+        let mut model = all_worktrees_model(vec![], false);
+        model.pending = Some(super::super::model::PendingLaunch {
+            ctx: super::super::model::LaunchContext {
+                repo_label: "acme/proj".to_string(),
+                owner: String::new(),
+                name: String::new(),
+                slug: "feature".to_string(),
+                agent: "claude".to_string(),
+            },
+            repo_root: PathBuf::from("/nonexistent-root/acme/proj"),
+            worktree_path: Some(PathBuf::from(
+                "/nonexistent-root/acme/proj/.claude/worktrees/feature",
+            )),
+            stage: super::super::model::Stage::CreateHook,
+            freshly_created: true,
+        });
+
+        let outcome = model.resume_after_hook(
+            super::super::model::HookKind::Create,
+            Err("permission denied".to_string()),
+        );
+        assert_eq!(
+            model.status.as_deref(),
+            Some("hook failed: permission denied")
+        );
+        // Warn-and-continue, matching `hooks::exec_hook`'s own philosophy
+        // (a failed setup script must not block getting into the agent
+        // session): the pipeline still advances to a launch, it doesn't
+        // stall on `pending`.
+        match outcome {
+            Some(DashboardOutcome::Suspend(super::super::model::SuspendReq::LaunchAgent {
+                ..
+            })) => {}
+            other => panic!(
+                "a failed hook must still advance the pipeline, got {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    // --- Mouse: click focuses without activating --------------------------
+
+    #[test]
+    fn mouse_click_focuses_worktree_row_without_activating() {
+        let mut model = all_worktrees_model(
+            vec![
+                scanned_entry("acme/proj", "one"),
+                scanned_entry("acme/proj", "two"),
+                scanned_entry("acme/proj", "three"),
+            ],
+            false,
+        );
+        model.worktrees.table_rect.set(Rect::new(0, 0, 40, 4)); // header + 3 rows
 
         let click = Msg::Mouse(MouseEvent {
             kind: MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
@@ -507,200 +852,132 @@ mod tests {
             row: 2, // second visible row (row 1 is the header)
             modifiers: KeyModifiers::NONE,
         });
-        let outcome = update_repo(&mut model, click);
+        let outcome = update_dashboard(&mut model, click);
         assert!(outcome.is_none(), "a click must never activate a row");
-        assert_eq!(model.list.selected_index(), Some(1));
+        assert_eq!(model.worktrees.selected_index(), Some(1));
+        assert_eq!(model.focus, Focus::Worktrees);
     }
 
-    // --- Multi-select: Space toggles, dirty-without-force still returned -
+    // --- PendingLaunch stage advancement on synthetic CloneDone -----------
 
     #[test]
-    fn multi_select_space_toggles_checkbox() {
-        let mut model = WorktreeModel::new_multi(
-            vec![
-                scanned_entry("acme/proj", "one"),
-                scanned_entry("acme/proj", "two"),
-            ],
-            14,
+    fn clone_done_up_to_date_skips_clone_hook_goes_to_launching() {
+        let mut model = all_worktrees_model(vec![], false);
+        model.pending = Some(super::super::model::PendingLaunch {
+            ctx: super::super::model::LaunchContext {
+                repo_label: "acme/proj".to_string(),
+                owner: "acme".to_string(),
+                name: "proj".to_string(),
+                slug: "feature".to_string(),
+                agent: "claude".to_string(),
+            },
+            repo_root: PathBuf::from("/nonexistent-root/acme/proj"),
+            worktree_path: Some(PathBuf::from(
+                "/nonexistent-root/acme/proj/.claude/worktrees/feature",
+            )),
+            stage: super::super::model::Stage::Cloning,
+            freshly_created: false,
+        });
+
+        let outcome = update_dashboard(
+            &mut model,
+            Msg::CloneDone(Ok(super::super::msg::CloneOutcome {
+                repo_label: "acme/proj".to_string(),
+                pull_outcome: crate::sync::PullOutcome::UpToDate,
+            })),
         );
-        assert!(model.checked.is_empty());
-        update_worktree(&mut model, key(KeyCode::Char(' ')));
-        assert_eq!(model.checked.len(), 1, "Space toggles the focused row on");
-        update_worktree(&mut model, key(KeyCode::Char(' ')));
-        assert!(model.checked.is_empty(), "Space toggles it back off");
-    }
-
-    #[test]
-    fn multi_select_delete_types_into_active_filter_instead_of_deleting() {
-        let mut model = WorktreeModel::new_multi(vec![scanned_entry("acme/proj", "one")], 14);
-        update_worktree(&mut model, key(KeyCode::Char(' ')));
-        assert_eq!(model.checked.len(), 1, "row is checked going in");
-
-        model.list.query.push_str("abc");
-        model.list.refilter(|r| r.filter_text.as_str());
-        assert!(
-            update_worktree(&mut model, key(KeyCode::Char('d'))).is_none(),
-            "'d' with an active filter must type into the query, not delete"
-        );
-        assert_eq!(
-            model.list.query, "abcd",
-            "'d' must append to the filter, same as any other letter"
-        );
-        assert_eq!(
-            model.checked.len(),
-            1,
-            "checked rows must survive an in-filter 'd' untouched"
-        );
-    }
-
-    #[test]
-    fn multi_select_delete_with_nothing_checked_cancels() {
-        let mut model = WorktreeModel::new_multi(vec![scanned_entry("acme/proj", "one")], 14);
-        match update_worktree(&mut model, key(KeyCode::Char('d'))) {
-            Some(WorktreeOutcome::Cancelled) => {}
-            _ => panic!("'d' with nothing checked must cancel, not return an empty Vec"),
-        }
-    }
-
-    #[test]
-    fn multi_select_delete_returns_dirty_flag_unfiltered() {
-        // `dirty` here is set directly (bypassing `gitstatus::is_dirty`,
-        // which needs a real repo) to drive the outcome-shape assertion:
-        // the TUI itself must never drop/skip a dirty row — that gating
-        // lives in `clean.rs::run_clean`, unchanged by this rewrite.
-        let mut model = WorktreeModel::new_multi(vec![scanned_entry("acme/proj", "dirty-one")], 14);
-        model.list.items[0].dirty = true;
-
-        update_worktree(&mut model, key(KeyCode::Char(' ')));
-        match update_worktree(&mut model, key(KeyCode::Char('d'))) {
-            Some(WorktreeOutcome::Multi(candidates)) => {
-                assert_eq!(candidates.len(), 1);
-                assert!(
-                    candidates[0].dirty,
-                    "dirty flag must ride along, not be filtered out"
-                );
-            }
-            other => panic!("expected Multi outcome, got {}", describe(&other)),
-        }
-    }
-
-    fn describe(outcome: &Option<WorktreeOutcome>) -> &'static str {
         match outcome {
-            Some(WorktreeOutcome::Single { .. }) => "Single",
-            Some(WorktreeOutcome::Multi(_)) => "Multi",
-            Some(WorktreeOutcome::Cancelled) => "Cancelled",
-            None => "None",
-        }
-    }
-
-    // --- agent_needed = false never shows the agent panel -------------
-
-    #[test]
-    fn agent_not_needed_never_opens_or_returns_agent_panel() {
-        let mut model = WorktreeModel::new_single(
-            vec![scanned_entry("acme/proj", "one")],
-            14,
-            true,
-            &agents_map(&["claude"]),
-            false, // agent_needed
-        );
-
-        match update_worktree(&mut model, key(KeyCode::Enter)) {
-            Some(WorktreeOutcome::Single { agent, .. }) => {
-                assert!(
-                    agent.is_none(),
-                    "agent_needed=false must never resolve an agent via the picker"
-                );
-            }
+            Some(DashboardOutcome::Suspend(super::super::model::SuspendReq::LaunchAgent {
+                ..
+            })) => {}
             other => panic!(
-                "expected an immediate Single outcome, got {}",
+                "an UpToDate pull with a known worktree_path must advance straight to \
+                 launching, got {}",
                 describe(&other)
             ),
         }
+    }
 
-        // Confirm the overlay flag itself never flips true, independent of
-        // the outcome above (regression guard against a future change that
-        // opens the overlay but forgets to also skip returning an agent).
-        let mut model2 = WorktreeModel::new_single(
-            vec![scanned_entry("acme/proj", "one")],
-            14,
-            true,
-            &agents_map(&["claude"]),
+    #[test]
+    fn clone_done_failure_clears_pending_and_sets_status() {
+        let mut model = all_worktrees_model(vec![], false);
+        model.pending = Some(super::super::model::PendingLaunch {
+            ctx: super::super::model::LaunchContext {
+                repo_label: "acme/proj".to_string(),
+                owner: "acme".to_string(),
+                name: "proj".to_string(),
+                slug: "feature".to_string(),
+                agent: "claude".to_string(),
+            },
+            repo_root: PathBuf::from("/nonexistent-root/acme/proj"),
+            worktree_path: None,
+            stage: super::super::model::Stage::Cloning,
+            freshly_created: false,
+        });
+
+        let outcome = update_dashboard(
+            &mut model,
+            Msg::CloneDone(Err("network unreachable".to_string())),
+        );
+        assert!(outcome.is_none());
+        assert!(model.pending.is_none());
+        assert!(model.status.as_deref().unwrap_or("").contains("failed"));
+    }
+
+    // --- start_pending must not clobber an already in-flight pending ------
+
+    #[test]
+    fn enter_while_pending_in_flight_does_not_overwrite_it() {
+        let mut model = all_worktrees_model(
+            vec![
+                scanned_entry("acme/first", "one"),
+                scanned_entry("acme/second", "two"),
+            ],
             false,
         );
-        update_worktree(&mut model2, key(KeyCode::Enter));
-        let overlay_open = matches!(
-            model2.mode,
-            WorktreeMode::Single {
-                agent_overlay: true,
-                ..
-            }
-        );
-        assert!(
-            !overlay_open,
-            "agent_needed=false must never open the overlay"
-        );
-    }
+        model.pending = Some(super::super::model::PendingLaunch {
+            ctx: super::super::model::LaunchContext {
+                repo_label: "acme/inflight".to_string(),
+                owner: String::new(),
+                name: String::new(),
+                slug: "inflight".to_string(),
+                agent: "claude".to_string(),
+            },
+            repo_root: PathBuf::from("/nonexistent-root/acme/inflight"),
+            worktree_path: None,
+            stage: super::super::model::Stage::Cloning,
+            freshly_created: false,
+        });
 
-    #[test]
-    fn agent_needed_opens_overlay_then_enter_resolves_agent() {
-        let mut model = WorktreeModel::new_single(
-            vec![scanned_entry("acme/proj", "one")],
-            14,
-            true,
-            &agents_map(&["claude", "grok"]),
-            true, // agent_needed
-        );
+        // Move focus onto a different worktree row than whatever the
+        // in-flight pending is for, then press Enter — the exact race the
+        // finding describes: a second Enter while `Stage::Cloning`'s
+        // background thread for the first selection hasn't reported back
+        // yet.
+        model.worktrees.move_selection(1);
+        let outcome = update_dashboard(&mut model, key(KeyCode::Enter));
 
-        assert!(update_worktree(&mut model, key(KeyCode::Enter)).is_none());
-        let overlay_open = matches!(
-            model.mode,
-            WorktreeMode::Single {
-                agent_overlay: true,
-                ..
-            }
-        );
-        assert!(
-            overlay_open,
-            "Enter with agent_needed=true must open the overlay"
-        );
-
-        match update_worktree(&mut model, key(KeyCode::Enter)) {
-            Some(WorktreeOutcome::Single { agent, .. }) => {
-                assert_eq!(agent.as_deref(), Some("claude")); // first sorted name
-            }
-            other => panic!(
-                "expected Single outcome from the overlay, got {}",
-                describe(&other)
-            ),
-        }
-    }
-
-    #[test]
-    fn esc_in_overlay_backs_out_not_full_cancel() {
-        let mut model = WorktreeModel::new_single(
-            vec![scanned_entry("acme/proj", "one")],
-            14,
-            true,
-            &agents_map(&["claude"]),
-            true,
-        );
-        update_worktree(&mut model, key(KeyCode::Enter)); // opens overlay
-        let outcome = update_worktree(&mut model, key(KeyCode::Esc));
         assert!(
             outcome.is_none(),
-            "Esc on an empty overlay filter must not cancel the whole screen"
+            "Enter on a worktree row while a pipeline is already in flight must be a no-op, got {}",
+            describe(&outcome)
         );
-        let overlay_open = matches!(
-            model.mode,
-            WorktreeMode::Single {
-                agent_overlay: true,
-                ..
-            }
+        let pending = model
+            .pending
+            .as_ref()
+            .expect("the in-flight pipeline must survive an Enter on another row");
+        assert_eq!(
+            pending.ctx.repo_label, "acme/inflight",
+            "a second Enter must not clobber the original in-flight pending's identity"
         );
-        assert!(
-            !overlay_open,
-            "Esc must close the overlay, back to the worktree list"
-        );
+        assert_eq!(pending.ctx.slug, "inflight");
+    }
+
+    fn describe(outcome: &Option<DashboardOutcome>) -> &'static str {
+        match outcome {
+            Some(DashboardOutcome::Cancelled) => "Cancelled",
+            Some(DashboardOutcome::Suspend(_)) => "Suspend",
+            None => "None",
+        }
     }
 }

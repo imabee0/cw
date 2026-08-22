@@ -72,6 +72,19 @@ pub fn flatten_slug(s: &str) -> String {
     s.replace('/', "+")
 }
 
+/// Reverses `flatten_slug` on a slug read back off disk (e.g.
+/// `scan_worktrees`'s `entry.slug`, taken from the flattened directory
+/// name). Safe precisely because `validate_worktree_slug` rejects a literal
+/// `+` in any raw slug segment — no slug `create_or_resume_worktree` ever
+/// accepted could already contain the character flattening introduces, so
+/// this reversal can't misfire on a slug that legitimately contained `+`.
+/// `dashboard.rs`'s `DashboardModel::start_pending` uses this on every
+/// `WorktreeSelection::Existing` row before it ever reaches
+/// `create_or_resume_worktree`'s `validate_worktree_slug` step.
+pub fn unflatten_slug(flat: &str) -> String {
+    flat.replace('+', "/")
+}
+
 /// The on-disk path a worktree for `slug` would live at under `repo_root`,
 /// plus whether it already exists there (the fast-resume predicate). Shared
 /// by `create_or_resume_worktree` below and by callers (main.rs's
@@ -226,8 +239,15 @@ pub fn remove_worktree(repo: &git2::Repository, slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// One worktree found by `scan_worktrees`, ready for `picker.rs`'s
-/// idle/dirty annotation (§5l) and `clean.rs`'s removal flow.
+/// A timestamp-based slug for an auto-generated worktree (no explicit SLUG
+/// given) — `main.rs`/`dashboard.rs` share this so a fresh worktree's name
+/// is generated in exactly one place.
+pub fn generate_timestamp_slug() -> String {
+    chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+/// One worktree found by `scan_worktrees`, ready for `dashboard.rs`'s
+/// idle/dirty annotation and removal flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeEntry {
     /// `"owner/repo"` — matches the label `resolve_local_path` derives the
@@ -344,14 +364,34 @@ pub const SCRATCH_REPO: &str = "workspace";
 /// `.scratch/workspace` displays as `scratch` — display-label only, never
 /// affects the underlying repo/slug values `remove_worktree`/
 /// `create_or_resume_worktree` operate on. Shared by every worktree-table
-/// renderer (`tui::model`'s repo/worktree screens) so the mapping exists in
-/// exactly one place.
+/// renderer (`tui::model`'s dashboard pane) so the mapping exists in exactly
+/// one place.
 pub fn display_repo_label(repo: &str) -> String {
     if repo == format!("{SCRATCH_OWNER}/{SCRATCH_REPO}") {
         "scratch".to_string()
     } else {
         repo.to_string()
     }
+}
+
+/// One of the two rows the dashboard's worktree pane can commit: a real,
+/// previously-created worktree, or the synthetic "+ new worktree" row
+/// (offered only when the pane's scope has a concrete repo to create one
+/// under — see `tui::model::Scope`).
+#[derive(Debug, Clone)]
+pub enum WorktreeSelection {
+    Existing(WorktreeEntry),
+    New,
+}
+
+/// One worktree checked in `cw clean`'s multi-select delete mode, plus the
+/// dirty flag already computed while annotating the row — so `clean.rs`
+/// never needs to re-open the repo itself just to decide whether `--force`
+/// is required.
+#[derive(Debug, Clone)]
+pub struct CleanCandidate {
+    pub entry: WorktreeEntry,
+    pub dirty: bool,
 }
 
 /// `cw scratch` — repo-less worktrees, reusing the existing worktree
@@ -416,6 +456,52 @@ mod tests {
                 .unwrap();
         }
         repo
+    }
+
+    /// Regression guard: `scan_worktrees`'s `entry.slug` is read off the
+    /// on-disk (already flattened) directory name. Feeding that verbatim
+    /// into `create_or_resume_worktree` — whose first step is
+    /// `validate_worktree_slug`, which rejects a literal `+` by design —
+    /// would make resuming any worktree whose raw slug contained `/` fail
+    /// every time. This drives the exact round trip
+    /// `DashboardModel::start_pending`'s `Existing` arms perform, without
+    /// needing an interactive dashboard session.
+    #[test]
+    fn resumed_slug_survives_scan_and_unflatten_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo_dir = root.join("acme").join("proj");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let repo = init_repo_with_commit(&repo_dir);
+
+        let raw_slug = "myfeat/x";
+        let created = create_or_resume_worktree(&repo, raw_slug, "HEAD").unwrap();
+
+        let scanned = scan_worktrees(root).unwrap();
+        let entry = scanned
+            .into_iter()
+            .find(|e| e.repo == "acme/proj")
+            .expect("scan_worktrees must find the worktree just created");
+        // Confirms the premise: what comes back off disk IS the flattened
+        // form, not the raw slug.
+        assert_eq!(entry.slug, "myfeat+x");
+
+        let resumed_slug = unflatten_slug(&entry.slug);
+        assert_eq!(resumed_slug, raw_slug);
+        assert!(validate_worktree_slug(&resumed_slug).is_ok());
+
+        // The actual regression: feeding the unflattened slug back through
+        // `create_or_resume_worktree` must fast-resume the same path, not
+        // error on a rejected '+' segment.
+        let resumed = create_or_resume_worktree(&repo, &resumed_slug, "HEAD").unwrap();
+        assert_eq!(resumed, created);
+    }
+
+    #[test]
+    fn unflatten_slug_reverses_flatten() {
+        assert_eq!(unflatten_slug("foo+bar"), "foo/bar");
+        assert_eq!(unflatten_slug("plain"), "plain");
+        assert_eq!(unflatten_slug(&flatten_slug("a/b/c")), "a/b/c");
     }
 
     #[test]
