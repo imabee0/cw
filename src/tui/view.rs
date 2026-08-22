@@ -43,7 +43,7 @@ pub fn draw_dashboard(frame: &mut Frame, model: &DashboardModel) {
     frame.render_widget(filter_line(model), filter_area);
     draw_body(frame, model, body_area);
     frame.render_widget(agent_bar(model), agent_area);
-    frame.render_widget(Paragraph::new(status_line_text(model)), status_area);
+    frame.render_widget(Paragraph::new(status_line(model)), status_area);
 
     if let Some(modal) = &model.modal {
         draw_modal(frame, modal, area);
@@ -318,28 +318,61 @@ fn agent_segment(agent: &AgentEntry, current: bool) -> Span<'_> {
     }
 }
 
-fn status_line_text(model: &DashboardModel) -> String {
+fn status_line(model: &DashboardModel) -> Line<'static> {
     if let Some(pending) = &model.pending {
-        return match pending.stage {
+        let text = match pending.stage {
             Stage::Cloning => format!("cloning/pulling {}…", pending.ctx.repo_label),
             Stage::CloneHook | Stage::CreateHook => "running hook…".to_string(),
             Stage::CreatingWorktree => "creating worktree…".to_string(),
             Stage::Launching => format!("launching {}…", pending.ctx.agent),
         };
+        return Line::from(text);
     }
     if let Some(status) = &model.status {
-        return status.clone();
+        return Line::from(status.clone());
     }
-    help_text(model)
+    help_line(model)
 }
 
-fn help_text(model: &DashboardModel) -> String {
+/// Key tokens colored per the plan's style spec — cyan for neutral/navigation,
+/// yellow for destructive — description text plain, matching the pane
+/// borders/dirty/idle/agent-segment coloring above rather than leaving this
+/// one line as a plain unstyled string.
+fn help_line(model: &DashboardModel) -> Line<'static> {
+    let key = |k: &'static str| Span::styled(k, Style::default().fg(KEY_HINT));
+    let destructive = |k: &'static str| Span::styled(k, Style::default().fg(KEY_HINT_DESTRUCTIVE));
+    let plain = |s: &'static str| Span::raw(s);
+
     if model.delete_mode {
-        "↑/↓ move · space/click check · d confirm/back out · ctrl-a agent · esc cancel".to_string()
+        Line::from(vec![
+            key("↑/↓"),
+            plain(" move · "),
+            key("space"),
+            plain("/click check · "),
+            destructive("d"),
+            plain(" confirm/back out · "),
+            key("ctrl-a"),
+            plain(" agent · "),
+            destructive("esc"),
+            plain(" cancel"),
+        ])
     } else {
-        "↑/↓ move · tab switch pane · type to filter · enter select · d delete-mode · \
-         ctrl-a agent · q/esc quit"
-            .to_string()
+        Line::from(vec![
+            key("↑/↓"),
+            plain(" move · "),
+            key("tab"),
+            plain(" switch pane · type to filter · "),
+            key("enter"),
+            plain(" select · "),
+            destructive("d"),
+            plain(" delete-mode · "),
+            key("ctrl-a"),
+            plain(" agent · "),
+            destructive("q"),
+            plain("/"),
+            destructive("esc"),
+            plain(" quit"),
+        ])
     }
 }
 
