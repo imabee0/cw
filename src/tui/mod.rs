@@ -77,24 +77,46 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    /// `enable_raw_mode()` first, with nothing to unwind if it's the step
+    /// that fails. Only once it succeeds is `TUI_ACTIVE` set and the
+    /// remaining fallible setup (`execute!`, `Terminal::new`) attempted — if
+    /// either of those errors, `restore()` runs before returning `Err`,
+    /// because at that point no `Self` exists yet for `Drop` to clean up
+    /// after. Getting this ordering wrong left a real gap: raw mode enabled
+    /// with `TUI_ACTIVE` stuck `true` and no `Self` to `Drop`, which also
+    /// silently swallowed the setup error itself — `main.rs`'s
+    /// `tracing::error!` on the error path is stderr-gated by `TUI_ACTIVE`,
+    /// so the user would see nothing but "details logged to ...".
     fn enter() -> Result<Self> {
-        TUI_ACTIVE.store(true, Ordering::Relaxed);
         enable_raw_mode()?;
-        execute!(io::stderr(), EnterAlternateScreen, EnableMouseCapture)?;
-        let terminal = Terminal::new(CrosstermBackend::new(io::stderr()))?;
-        Ok(Self { terminal })
+        TUI_ACTIVE.store(true, Ordering::Relaxed);
+        match execute!(io::stderr(), EnterAlternateScreen, EnableMouseCapture)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| Ok(Terminal::new(CrosstermBackend::new(io::stderr()))?))
+        {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(e) => {
+                Self::restore();
+                Err(e)
+            }
+        }
+    }
+
+    /// Shared by `Drop` and the panic hook — both need the exact same
+    /// best-effort teardown. A Drop/panic-hook can't propagate an error, and
+    /// a session that's already ending is exactly the wrong place to start
+    /// one, so each call is independent: one failing (e.g. raw mode already
+    /// off) doesn't skip the others.
+    fn restore() {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stderr(), LeaveAlternateScreen, DisableMouseCapture);
+        TUI_ACTIVE.store(false, Ordering::Relaxed);
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Best-effort: a Drop can't propagate an error, and a session that's
-        // already ending is exactly the wrong place to start one. Each call
-        // is independent so one failing (e.g. raw mode already off) doesn't
-        // skip the other.
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stderr(), LeaveAlternateScreen, DisableMouseCapture);
-        TUI_ACTIVE.store(false, Ordering::Relaxed);
+        Self::restore();
     }
 }
 
@@ -110,9 +132,7 @@ fn install_panic_hook() {
     PANIC_HOOK_INIT.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stderr(), LeaveAlternateScreen, DisableMouseCapture);
-            TUI_ACTIVE.store(false, Ordering::Relaxed);
+            TerminalGuard::restore();
             previous(info);
         }));
     });
