@@ -202,7 +202,13 @@ fn handle_worktree_list_key(model: &mut WorktreeModel, key: KeyEvent) -> Option<
             return enter_worktree_row(model);
         }
         KeyCode::Char(' ') if is_multi => toggle_focused(model),
-        KeyCode::Char('d') if is_multi => return commit_multi_delete(model),
+        // Query-gated like `q` above (and for the same reason): unlike `q`,
+        // an accidental match here is destructive, so it gets the stricter
+        // treatment even though `q` itself only needs it for the "search
+        // string can contain a letter" case.
+        KeyCode::Char('d') if is_multi && model.list.query.is_empty() => {
+            return commit_multi_delete(model)
+        }
         KeyCode::Up => model.list.move_selection(-1),
         KeyCode::Down => model.list.move_selection(1),
         KeyCode::PageUp => model.list.move_selection(-PAGE),
@@ -522,6 +528,29 @@ mod tests {
         assert_eq!(model.checked.len(), 1, "Space toggles the focused row on");
         update_worktree(&mut model, key(KeyCode::Char(' ')));
         assert!(model.checked.is_empty(), "Space toggles it back off");
+    }
+
+    #[test]
+    fn multi_select_delete_types_into_active_filter_instead_of_deleting() {
+        let mut model = WorktreeModel::new_multi(vec![scanned_entry("acme/proj", "one")], 14);
+        update_worktree(&mut model, key(KeyCode::Char(' ')));
+        assert_eq!(model.checked.len(), 1, "row is checked going in");
+
+        model.list.query.push_str("abc");
+        model.list.refilter(|r| r.filter_text.as_str());
+        assert!(
+            update_worktree(&mut model, key(KeyCode::Char('d'))).is_none(),
+            "'d' with an active filter must type into the query, not delete"
+        );
+        assert_eq!(
+            model.list.query, "abcd",
+            "'d' must append to the filter, same as any other letter"
+        );
+        assert_eq!(
+            model.checked.len(),
+            1,
+            "checked rows must survive an in-filter 'd' untouched"
+        );
     }
 
     #[test]
