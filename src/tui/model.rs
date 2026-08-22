@@ -194,20 +194,20 @@ impl RepoModel {
         }
     }
 
-    /// Applies a background-thread result: replaces the item list (unless
-    /// the fetch came back empty — e.g. a total failure with no cache to
-    /// fall back to — in which case whatever's already showing is kept
-    /// rather than blanking the screen), re-applies the live filter query,
-    /// and folds any warnings into the status line.
+    /// Applies a background-thread result: replaces the item list
+    /// unconditionally (an empty `load.repos` is always a real, applicable
+    /// result here — either a live fetch that genuinely found zero repos
+    /// under the active `--org` filter, which must overwrite a stale
+    /// non-empty `initial`, or a total failure with no cache to fall back
+    /// to, where `initial` was already empty), re-applies the live filter
+    /// query, and folds any warnings into the status line.
     pub fn apply_load(&mut self, load: RepoLoad) {
         self.loading = false;
-        if !load.repos.is_empty() {
-            let rows = build_repo_rows(load.repos, &self.root);
-            let query = std::mem::take(&mut self.list.query);
-            self.list = ListState::new(rows);
-            self.list.query = query;
-            self.list.refilter(|r| r.filter_text.as_str());
-        }
+        let rows = build_repo_rows(load.repos, &self.root);
+        let query = std::mem::take(&mut self.list.query);
+        self.list = ListState::new(rows);
+        self.list.query = query;
+        self.list.refilter(|r| r.filter_text.as_str());
 
         let mut messages = Vec::new();
         if let Some(w) = load.stale_warning {
@@ -439,5 +439,30 @@ mod tests {
         assert_eq!(relative_time(&two_hours_ago, now), "2h ago");
         assert_eq!(relative_time(&three_days_ago, now), "3d ago");
         assert_eq!(relative_time("not-a-timestamp", now), "not-a-timestamp");
+    }
+
+    #[test]
+    fn apply_load_with_genuinely_empty_result_replaces_stale_list() {
+        let stale = vec![Repo {
+            owner: "acme".to_string(),
+            name: "old-repo".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+        let mut model = RepoModel::new(stale, PathBuf::from("/nonexistent-root"));
+        assert_eq!(model.list.items.len(), 1);
+
+        // A live fetch that legitimately found zero repos (e.g. an --org
+        // filter matching an org with none) must overwrite the stale cached
+        // list, not be mistaken for "the fetch hasn't landed yet".
+        model.apply_load(RepoLoad {
+            repos: Vec::new(),
+            warnings: Vec::new(),
+            stale_warning: None,
+        });
+        assert!(
+            model.list.items.is_empty(),
+            "a genuinely empty fetch result must replace a stale non-empty list, not be ignored"
+        );
+        assert!(!model.loading);
     }
 }
