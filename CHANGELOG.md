@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/imabee0/cw/compare/v0.1.7...v0.1.8) - 2026-08-22
+
+### Fixed
+
+- verify x86_64-apple-darwin via Rosetta on macos-14, drop hung macos-13 leg ([#17](https://github.com/imabee0/cw/pull/17))
+
 ## [0.1.7](https://github.com/imabee0/cw/compare/v0.1.6...v0.1.7) - 2026-08-22
 
 ### Fixed
