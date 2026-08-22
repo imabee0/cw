@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
@@ -56,6 +56,18 @@ fn credentials_callback(
     git2::Cred::credential_helper(&cfg, url, username_from_url)
 }
 
+/// Which stdio a `gh repo clone` subprocess should use — `Inherit` for the
+/// plain-terminal fast path (unchanged today's behavior: the user sees raw
+/// `gh` output directly), `Capture` for the dashboard's background clone
+/// thread, where inherited stdio would corrupt the active alt-screen.
+/// `Capture` also sets `GH_PROMPT_DISABLED=1` (confirmed via `gh help
+/// environment`) so a `gh` that would otherwise block on an interactive
+/// prompt fails fast instead of hanging a background thread forever.
+pub enum CloneStdio {
+    Inherit,
+    Capture,
+}
+
 /// Clones `owner/name` under `root` via `gh repo clone` if it isn't present
 /// locally yet, otherwise opens the existing clone and — unless `pull` is
 /// `false` (cli.rs's `--no-pull`, §4: "on an already-cloned repo, skip
@@ -66,6 +78,21 @@ pub fn clone_or_pull(
     owner: &str,
     name: &str,
     pull: bool,
+) -> Result<(git2::Repository, PullOutcome)> {
+    clone_or_pull_ex(root, owner, name, pull, CloneStdio::Inherit)
+}
+
+/// `clone_or_pull`'s captured-stdio sibling — same clone/pull decision and
+/// return shape, but the `gh repo clone` subprocess's stdio is controlled by
+/// `stdio` instead of always inheriting the caller's terminal. `fetch_and_ff`
+/// (the pull path) never shells out — it's pure `git2` — so `stdio` only
+/// affects the fresh-clone branch below.
+pub fn clone_or_pull_ex(
+    root: &Path,
+    owner: &str,
+    name: &str,
+    pull: bool,
+    stdio: CloneStdio,
 ) -> Result<(git2::Repository, PullOutcome)> {
     let path = resolve_local_path(root, owner, name);
 
@@ -91,14 +118,35 @@ pub fn clone_or_pull(
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
     let slug = format!("{owner}/{name}");
-    let status = Command::new("gh")
-        .args(["repo", "clone", &slug, &path.to_string_lossy()])
-        .status()
-        .context(
-            "launching `gh repo clone` — is `gh` on PATH and authenticated? run `gh auth login`",
-        )?;
-    if !status.success() {
-        bail!("`gh repo clone {slug}` exited with {status}");
+    let mut cmd = Command::new("gh");
+    cmd.args(["repo", "clone", &slug, &path.to_string_lossy()]);
+
+    match stdio {
+        CloneStdio::Inherit => {
+            let status = cmd.status().context(
+                "launching `gh repo clone` — is `gh` on PATH and authenticated? run `gh auth login`",
+            )?;
+            if !status.success() {
+                bail!("`gh repo clone {slug}` exited with {status}");
+            }
+        }
+        // `.output()`, not `.status()` with piped stdio left unread — a
+        // subprocess with a full pipe buffer and nobody draining it can
+        // deadlock. Mirrors `github.rs`'s existing convention for a
+        // subprocess run concurrently with an active TUI.
+        CloneStdio::Capture => {
+            cmd.env("GH_PROMPT_DISABLED", "1").stdin(Stdio::null());
+            let output = cmd.output().context(
+                "launching `gh repo clone` — is `gh` on PATH and authenticated? run `gh auth login`",
+            )?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!(
+                    "`gh repo clone {slug}` exited with {}: {stderr}",
+                    output.status
+                );
+            }
+        }
     }
 
     let repo = git2::Repository::open(&path)

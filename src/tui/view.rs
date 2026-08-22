@@ -1,8 +1,8 @@
-//! Pure rendering — `draw_repo`/`draw_worktree` take `&Model` and paint one
-//! frame. Never mutate model state directly (see `Screen::draw`'s doc
-//! comment): geometry a later click needs is cached through the `Model`'s
-//! own interior mutability (`ListState::table`/`table_rect`), not by
-//! widening these signatures.
+//! Pure rendering — `draw_dashboard` takes `&DashboardModel` and paints one
+//! frame. Never mutates model state directly (see `Screen::draw`'s doc
+//! comment): geometry a later click needs is cached through the model's own
+//! interior mutability (`ListState::table`/`table_rect`), not by widening
+//! this signature.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -11,33 +11,52 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use super::model::{
-    relative_time, AgentModel, AgentRow, ListState, RepoModel, WorktreeMode, WorktreeModel,
+    is_recently_updated, relative_time, AgentEntry, DashboardModel, Focus, ListState, Modal,
+    RepoRow, Scope, Stage, WorktreeRow,
 };
-use crate::picker::WorktreeSelection;
+use crate::worktree::WorktreeSelection;
 
-const HELP_PICK: &str = "↑/↓ move · type to filter · Enter select · Esc cancel · Ctrl-C quit";
-const HELP_MULTI: &str = "↑/↓ move · Space/click toggle · d delete checked · Esc cancel";
-const HELP_AGENT: &str = "↑/↓ move · type to filter · Enter choose agent · Esc back · Ctrl-C quit";
+const DIRTY: Color = Color::Yellow;
+const IDLE: Color = Color::DarkGray;
+const FOCUSED_BORDER: Color = Color::Cyan;
+const UNFOCUSED_BORDER: Color = Color::DarkGray;
+const RECENT: Color = Color::Green;
+const KEY_HINT: Color = Color::Cyan;
+const KEY_HINT_DESTRUCTIVE: Color = Color::Yellow;
 
-/// Splits the full frame into title / filter-box / table / status rows.
-fn chrome(area: Rect) -> [Rect; 4] {
-    let chunks = Layout::default()
+pub fn draw_dashboard(frame: &mut Frame, model: &DashboardModel) {
+    let area = frame.area();
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(1),
+            Constraint::Length(1), // title
+            Constraint::Length(1), // filter line
+            Constraint::Min(3),    // body: repo/worktree panes
+            Constraint::Length(1), // agent footer
+            Constraint::Length(1), // status/help line
         ])
         .split(area);
-    [chunks[0], chunks[1], chunks[2], chunks[3]]
+    let (title_area, filter_area, body_area, agent_area, status_area) =
+        (rows[0], rows[1], rows[2], rows[3], rows[4]);
+
+    frame.render_widget(Paragraph::new(title(model)), title_area);
+    frame.render_widget(filter_line(model), filter_area);
+    draw_body(frame, model, body_area);
+    frame.render_widget(agent_bar(model), agent_area);
+    frame.render_widget(Paragraph::new(status_line_text(model)), status_area);
+
+    if let Some(modal) = &model.modal {
+        draw_modal(frame, modal, area);
+    }
 }
 
-fn filter_line(query: &str) -> Paragraph<'_> {
-    Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(query),
-    ]))
+fn title(model: &DashboardModel) -> &'static str {
+    match &model.scope {
+        Scope::Browse { .. } => "cw — pick a repo, then a worktree",
+        Scope::AllWorktrees if model.delete_mode => "cw clean — select worktrees to remove",
+        Scope::AllWorktrees => "cw resume — pick a worktree",
+        Scope::SingleRepo { .. } => "cw scratch — pick a worktree",
+    }
 }
 
 fn header_style() -> Style {
@@ -48,107 +67,135 @@ fn selected_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
-pub fn draw_repo(frame: &mut Frame, model: &RepoModel) {
-    let [title_area, filter_area, table_area, status_area] = chrome(frame.area());
-
-    let title = if model.loading {
-        if model.list.items.is_empty() {
-            "cw — loading repos…"
-        } else {
-            "cw — pick a repo (refreshing…)"
-        }
+fn pane_border_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(FOCUSED_BORDER)
+            .add_modifier(Modifier::BOLD)
     } else {
-        "cw — pick a repo"
+        Style::default().fg(UNFOCUSED_BORDER)
+    }
+}
+
+fn filter_line(model: &DashboardModel) -> Paragraph<'_> {
+    let (label, query) = match model.focus {
+        Focus::Repos => match &model.scope {
+            Scope::Browse { repos } => ("repos", repos.query.as_str()),
+            _ => ("", ""),
+        },
+        Focus::Worktrees => ("worktrees", model.worktrees.query.as_str()),
     };
-    frame.render_widget(Paragraph::new(title), title_area);
-    frame.render_widget(filter_line(&model.list.query), filter_area);
+    Paragraph::new(Line::from(vec![
+        Span::styled(format!("{label}> "), Style::default().fg(Color::Cyan)),
+        Span::raw(query),
+    ]))
+}
 
-    model.list.table_rect.set(table_area);
+fn draw_body(frame: &mut Frame, model: &DashboardModel, area: Rect) {
+    match &model.scope {
+        Scope::Browse { repos } => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(area);
+            draw_repo_pane(
+                frame,
+                repos,
+                model.focus == Focus::Repos,
+                model.loading,
+                cols[0],
+            );
+            draw_worktree_pane(frame, model, cols[1]);
+        }
+        Scope::AllWorktrees | Scope::SingleRepo { .. } => {
+            draw_worktree_pane(frame, model, area);
+        }
+    }
+}
 
-    if model.list.items.is_empty() {
-        let msg = if model.loading {
-            ""
+fn draw_repo_pane(
+    frame: &mut Frame,
+    repos: &ListState<RepoRow>,
+    focused: bool,
+    loading: bool,
+    area: Rect,
+) {
+    let block = Block::default()
+        .title(" repos ")
+        .borders(Borders::ALL)
+        .border_style(pane_border_style(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    repos.table_rect.set(inner);
+
+    if repos.items.is_empty() {
+        let msg = if loading {
+            "loading repos…"
         } else {
             "no repos found — check `gh auth status` or your --org filter"
         };
-        frame.render_widget(Paragraph::new(msg), table_area);
-    } else {
-        let now = chrono::Utc::now();
-        let header = Row::new(vec!["NAME", "OWNER", "UPDATED", "LOCAL"]).style(header_style());
-        let rows: Vec<Row> = model
-            .list
-            .filtered
-            .iter()
-            .filter_map(|&idx| model.list.items.get(idx))
-            .map(|row| {
-                Row::new(vec![
-                    row.repo.name.clone(),
-                    row.repo.owner.clone(),
-                    relative_time(&row.repo.updated_at, now),
-                    if row.local {
-                        "✓".to_string()
-                    } else {
-                        String::new()
-                    },
-                ])
-            })
-            .collect();
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Percentage(40),
-                Constraint::Percentage(25),
-                Constraint::Percentage(20),
-                Constraint::Percentage(15),
-            ],
-        )
-        .header(header)
-        .row_highlight_style(selected_style())
-        .highlight_symbol("> ");
-
-        let mut table_state = model.list.table.borrow_mut();
-        frame.render_stateful_widget(table, table_area, &mut table_state);
-    }
-
-    let status = model.status.as_deref().unwrap_or(HELP_PICK);
-    frame.render_widget(Paragraph::new(status), status_area);
-}
-
-pub fn draw_worktree(frame: &mut Frame, model: &WorktreeModel) {
-    let [title_area, filter_area, table_area, status_area] = chrome(frame.area());
-    let is_multi = matches!(model.mode, WorktreeMode::Multi);
-
-    let title = if is_multi {
-        "cw clean — select worktrees to remove"
-    } else {
-        "cw — pick a worktree"
-    };
-    frame.render_widget(Paragraph::new(title), title_area);
-    frame.render_widget(filter_line(&model.list.query), filter_area);
-
-    model.list.table_rect.set(table_area);
-    draw_worktree_table(frame, model, table_area, is_multi);
-
-    let help = if is_multi { HELP_MULTI } else { HELP_PICK };
-    let status = model.status.as_deref().unwrap_or(help);
-    frame.render_widget(Paragraph::new(status), status_area);
-
-    if let WorktreeMode::Single {
-        agent_overlay: true,
-        agents,
-        ..
-    } = &model.mode
-    {
-        draw_agent_overlay(frame, agents, frame.area());
-    }
-}
-
-fn draw_worktree_table(frame: &mut Frame, model: &WorktreeModel, area: Rect, is_multi: bool) {
-    if model.list.items.is_empty() {
-        frame.render_widget(Paragraph::new("no worktrees yet"), area);
+        frame.render_widget(Paragraph::new(msg), inner);
         return;
     }
 
+    let now = chrono::Utc::now();
+    let header = Row::new(vec!["NAME", "OWNER", "UPDATED", "LOCAL"]).style(header_style());
+    let rows: Vec<Row> = repos
+        .filtered
+        .iter()
+        .filter_map(|&idx| repos.items.get(idx))
+        .map(|row| {
+            let name = if is_recently_updated(&row.repo.updated_at, now) {
+                format!("★ {}", row.repo.name)
+            } else {
+                row.repo.name.clone()
+            };
+            let name_style = if is_recently_updated(&row.repo.updated_at, now) {
+                Style::default().fg(RECENT)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                Span::styled(name, name_style),
+                Span::raw(row.repo.owner.clone()),
+                Span::raw(relative_time(&row.repo.updated_at, now)),
+                Span::raw(if row.local { "✓" } else { "" }),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(40),
+            Constraint::Percentage(25),
+            Constraint::Percentage(20),
+            Constraint::Percentage(15),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(selected_style())
+    .highlight_symbol("> ");
+
+    let mut table_state = repos.table.borrow_mut();
+    frame.render_stateful_widget(table, inner, &mut table_state);
+}
+
+fn draw_worktree_pane(frame: &mut Frame, model: &DashboardModel, area: Rect) {
+    let focused = model.focus == Focus::Worktrees;
+    let block = Block::default()
+        .title(" worktrees ")
+        .borders(Borders::ALL)
+        .border_style(pane_border_style(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    model.worktrees.table_rect.set(inner);
+
+    if model.worktrees.items.is_empty() {
+        frame.render_widget(Paragraph::new("no worktrees yet"), inner);
+        return;
+    }
+
+    let is_multi = model.delete_mode;
     let mut header_cells = vec!["REPO", "SLUG", "IDLE", "STATUS"];
     if is_multi {
         header_cells.insert(0, "");
@@ -156,42 +203,11 @@ fn draw_worktree_table(frame: &mut Frame, model: &WorktreeModel, area: Rect, is_
     let header = Row::new(header_cells).style(header_style());
 
     let rows: Vec<Row> = model
-        .list
+        .worktrees
         .filtered
         .iter()
-        .filter_map(|&idx| model.list.items.get(idx).map(|row| (idx, row)))
-        .map(|(idx, row)| {
-            let (repo_cell, slug_cell) = match &row.selection {
-                WorktreeSelection::Existing(entry) => (row.repo_label.clone(), entry.slug.clone()),
-                WorktreeSelection::New => (String::new(), "+ new worktree".to_string()),
-            };
-            let idle_cell = row.idle_label.clone().unwrap_or_default();
-            let status_cell = if row.dirty {
-                "dirty".to_string()
-            } else {
-                String::new()
-            };
-
-            let mut cells = vec![repo_cell, slug_cell, idle_cell, status_cell];
-            if is_multi {
-                let mark = if model.checked.contains(&idx) {
-                    "[x]"
-                } else {
-                    "[ ]"
-                };
-                cells.insert(0, mark.to_string());
-            }
-
-            let built = Row::new(cells);
-            if row.dirty {
-                // Marked up front — the multi-select "why didn't this
-                // delete" case is visible before the user ever presses `d`,
-                // not only reported after the fact by `clean.rs`.
-                built.style(Style::default().fg(Color::Red))
-            } else {
-                built
-            }
-        })
+        .filter_map(|&idx| model.worktrees.items.get(idx).map(|row| (idx, row)))
+        .map(|(idx, row)| build_worktree_row(row, idx, is_multi, &model.checked))
         .collect();
 
     let widths: Vec<Constraint> = if is_multi {
@@ -216,80 +232,170 @@ fn draw_worktree_table(frame: &mut Frame, model: &WorktreeModel, area: Rect, is_
         .row_highlight_style(selected_style())
         .highlight_symbol("> ");
 
-    let mut table_state = model.list.table.borrow_mut();
-    frame.render_stateful_widget(table, area, &mut table_state);
+    let mut table_state = model.worktrees.table.borrow_mut();
+    frame.render_stateful_widget(table, inner, &mut table_state);
 }
 
-/// Inline agent sub-panel: a centered popup over the (still-visible-behind-
-/// it) worktree table, rather than tearing this screen down and relaunching
-/// a second full-screen picker.
-fn draw_agent_overlay(frame: &mut Frame, agents: &ListState<AgentRow>, full: Rect) {
-    let area = centered_rect(60, 50, full);
-    frame.render_widget(Clear, area);
+fn build_worktree_row<'a>(
+    row: &'a WorktreeRow,
+    idx: usize,
+    is_multi: bool,
+    checked: &std::collections::HashSet<usize>,
+) -> Row<'a> {
+    let (repo_cell, slug_cell) = match &row.selection {
+        WorktreeSelection::Existing(entry) => (row.repo_label.clone(), entry.slug.clone()),
+        WorktreeSelection::New => (String::new(), "+ new worktree".to_string()),
+    };
+    let idle_cell = row.idle_label.clone().unwrap_or_default();
+    let status_cell = if row.dirty { "dirty" } else { "" };
 
-    let block = Block::default()
-        .title(" choose an agent ")
-        .borders(Borders::ALL);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let idle_style = if row.idle_label.is_some() {
+        Style::default().fg(IDLE)
+    } else {
+        Style::default()
+    };
+    let row_style = if row.dirty {
+        Style::default().fg(DIRTY)
+    } else {
+        Style::default()
+    };
 
-    let overlay_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    let (filter_area, table_area, status_area) =
-        (overlay_chunks[0], overlay_chunks[1], overlay_chunks[2]);
-
-    frame.render_widget(filter_line(&agents.query), filter_area);
-    agents.table_rect.set(table_area);
-    draw_agent_list(frame, agents, table_area);
-
-    frame.render_widget(Paragraph::new(HELP_AGENT), status_area);
-}
-
-/// `picker::pick_agent`'s standalone top-level screen — the fallback used
-/// when agent resolution is needed independently of a worktree choice (see
-/// that function's doc comment). Same row rendering as the worktree
-/// screen's inline sub-panel (`draw_agent_list`), just full-frame instead
-/// of a centered popup, and Esc cancels outright rather than backing out to
-/// a parent screen (there is no parent here).
-pub fn draw_agent(frame: &mut Frame, model: &AgentModel) {
-    let [title_area, filter_area, table_area, status_area] = chrome(frame.area());
-    frame.render_widget(Paragraph::new("cw — pick an agent"), title_area);
-    frame.render_widget(filter_line(&model.list.query), filter_area);
-    model.list.table_rect.set(table_area);
-    draw_agent_list(frame, &model.list, table_area);
-    frame.render_widget(Paragraph::new(HELP_PICK), status_area);
-}
-
-fn draw_agent_list(frame: &mut Frame, agents: &ListState<AgentRow>, area: Rect) {
-    if agents.items.is_empty() {
-        frame.render_widget(
-            Paragraph::new("no agents configured — check [agents] in config.toml"),
-            area,
-        );
-        return;
+    let mut cells = vec![
+        Span::styled(repo_cell, row_style),
+        Span::styled(slug_cell, row_style),
+        Span::styled(idle_cell, idle_style),
+        Span::styled(status_cell.to_string(), row_style),
+    ];
+    if is_multi {
+        let mark = if checked.contains(&idx) { "[x]" } else { "[ ]" };
+        cells.insert(0, Span::styled(mark, row_style));
     }
-    let header = Row::new(vec!["NAME", "COMMAND"]).style(header_style());
-    let rows: Vec<Row> = agents
-        .filtered
-        .iter()
-        .filter_map(|&idx| agents.items.get(idx))
-        .map(|row| Row::new(vec![row.name.clone(), row.cmd_preview.clone()]))
-        .collect();
-    let table = Table::new(
-        rows,
-        [Constraint::Percentage(40), Constraint::Percentage(60)],
-    )
-    .header(header)
-    .row_highlight_style(selected_style())
-    .highlight_symbol("> ");
-    let mut table_state = agents.table.borrow_mut();
-    frame.render_stateful_widget(table, area, &mut table_state);
+    Row::new(cells)
+}
+
+fn agent_bar(model: &DashboardModel) -> Paragraph<'_> {
+    if model.agents.is_empty() {
+        return Paragraph::new(Span::styled(
+            "no agents configured",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let mut spans = vec![Span::styled(
+        "agent: ",
+        Style::default().fg(Color::DarkGray),
+    )];
+    for (i, agent) in model.agents.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(agent_segment(agent, i == model.agent_index));
+    }
+    if let Some(current) = model.agents.get(model.agent_index) {
+        spans.push(Span::styled(
+            format!("  ({})", current.cmd_preview),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans.push(Span::styled(
+        "  ctrl-a to cycle",
+        Style::default().fg(Color::DarkGray),
+    ));
+    Paragraph::new(Line::from(spans))
+}
+
+fn agent_segment(agent: &AgentEntry, current: bool) -> Span<'_> {
+    let text = format!(" {} ", agent.name);
+    if current {
+        Span::styled(
+            text,
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(text, Style::default().fg(Color::DarkGray))
+    }
+}
+
+fn status_line_text(model: &DashboardModel) -> String {
+    if let Some(pending) = &model.pending {
+        return match pending.stage {
+            Stage::Cloning => format!("cloning/pulling {}…", pending.ctx.repo_label),
+            Stage::CloneHook | Stage::CreateHook => "running hook…".to_string(),
+            Stage::CreatingWorktree => "creating worktree…".to_string(),
+            Stage::Launching => format!("launching {}…", pending.ctx.agent),
+        };
+    }
+    if let Some(status) = &model.status {
+        return status.clone();
+    }
+    help_text(model)
+}
+
+fn help_text(model: &DashboardModel) -> String {
+    if model.delete_mode {
+        "↑/↓ move · space/click check · d confirm/back out · ctrl-a agent · esc cancel".to_string()
+    } else {
+        "↑/↓ move · tab switch pane · type to filter · enter select · d delete-mode · \
+         ctrl-a agent · q/esc quit"
+            .to_string()
+    }
+}
+
+fn draw_modal(frame: &mut Frame, modal: &Modal, full: Rect) {
+    match modal {
+        Modal::HookConsent { resolved, .. } => {
+            let area = centered_rect(60, 30, full);
+            frame.render_widget(Clear, area);
+            let block = Block::default().title(" run hook? ").borders(Borders::ALL);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let lines = vec![
+                Line::from(format!("{} {}", resolved.program, resolved.args.join(" "))),
+                Line::from(format!("cwd: {}", resolved.cwd.display())),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("y", Style::default().fg(KEY_HINT)),
+                    Span::raw(" run   "),
+                    Span::styled("n", Style::default().fg(KEY_HINT_DESTRUCTIVE)),
+                    Span::raw("/esc skip"),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        Modal::ConfirmDelete {
+            total_count,
+            dirty_count,
+            force,
+        } => {
+            let area = centered_rect(50, 30, full);
+            frame.render_widget(Clear, area);
+            let block = Block::default()
+                .title(" remove worktrees? ")
+                .borders(Borders::ALL);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let dirty_note = if *dirty_count == 0 {
+                String::new()
+            } else if *force {
+                format!(" ({dirty_count} dirty, --force will remove anyway)")
+            } else {
+                format!(" ({dirty_count} dirty — will be skipped, not --force)")
+            };
+            let lines = vec![
+                Line::from(format!("remove {total_count} worktree(s)?{dirty_note}")),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("y", Style::default().fg(KEY_HINT_DESTRUCTIVE)),
+                    Span::raw("/enter confirm   "),
+                    Span::styled("n", Style::default().fg(KEY_HINT)),
+                    Span::raw("/esc cancel"),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

@@ -3,11 +3,11 @@ mod cache;
 mod clean;
 mod cli;
 mod config;
+mod dashboard;
 mod doctor;
 mod github;
 mod gitstatus;
 mod hooks;
-mod picker;
 mod sync;
 mod tui;
 mod worktree;
@@ -18,7 +18,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -27,6 +27,7 @@ use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Cmd};
 use config::Config;
+use dashboard::Entry;
 
 fn main() -> ExitCode {
     // Bound in main's own scope for the whole process lifetime (§5m) — a
@@ -152,7 +153,7 @@ fn run(cli: Cli) -> Result<()> {
     match &cli.cmd {
         Some(Cmd::Doctor) => run_doctor_cmd(&config),
         Some(Cmd::Resume) => run_resume(&cli, &config, &root),
-        Some(Cmd::Clean { force }) => clean::run_clean(&config, &root, *force),
+        Some(Cmd::Clean { force }) => clean::run_clean(&cli, &config, &root, *force),
         Some(Cmd::Scratch { slug, dry_run }) => {
             run_scratch(&cli, &config, &root, slug.clone(), *dry_run)
         }
@@ -182,10 +183,6 @@ fn expand_tilde(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn generate_timestamp_slug() -> String {
-    chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string()
-}
-
 fn parse_owner_repo(spec: &str) -> Result<github::Repo> {
     let (owner, name) = spec
         .split_once('/')
@@ -211,11 +208,11 @@ fn worktree_precheck(repo_root: &Path, slug: &str) -> (PathBuf, bool) {
     worktree::worktree_path_and_exists(repo_root, slug)
 }
 
-/// Whether `--agent`/`default_agent` need the interactive picker at all
-/// (§5l, F15): only when `--agent` was NOT passed AND `default_agent`
+/// Whether `--agent`/`default_agent` need the dashboard's interactive agent
+/// footer at all: only when `--agent` was NOT passed AND `default_agent`
 /// doesn't name a real entry in `config.agents` — never simply "more than
 /// one agent is configured" (§3 ships three by default, which would
-/// otherwise make the picker fire on every single invocation).
+/// otherwise make the dashboard mandatory on every single invocation).
 fn agent_picker_needed(explicit: Option<&str>, cfg: &Config) -> bool {
     if explicit.is_some() {
         return false;
@@ -223,122 +220,66 @@ fn agent_picker_needed(explicit: Option<&str>, cfg: &Config) -> bool {
     !cfg.agents.contains_key(&cfg.default_agent)
 }
 
-/// Resolves which agent NAME to launch, prompting interactively only when
-/// `agent_picker_needed` says so. `Ok(None)` means the user cancelled out of
-/// the picker — callers print a "cancelled" message and stop, rather than
-/// falling back to a default the user never confirmed.
-fn resolve_agent_name(explicit: Option<&str>, config: &Config) -> Result<Option<String>> {
-    if let Some(name) = explicit {
-        return Ok(Some(name.to_string()));
-    }
-    if !agent_picker_needed(explicit, config) {
-        return Ok(Some(config.default_agent.clone()));
-    }
-    match picker::pick_agent(&config.agents)? {
-        picker::Pick::Selected(name) => Ok(Some(name)),
-        picker::Pick::Empty | picker::Pick::Cancelled => Ok(None),
-    }
-}
-
-/// §0a combined with agent resolution (per the TUI redesign's "Worktree
-/// (+agent) screen": a picker that offers existing worktrees + "+ new
-/// worktree" also resolves the agent inline, in the same screen, when one
-/// still needs picking).
-///
-/// With an explicit slug, or no worktrees yet for `repo_label`, there is no
-/// worktree *choice* to make — `pick_worktree_and_agent` never fires, and
-/// agent resolution is the same independent `resolve_agent_name` step it
-/// always was (falling back to the standalone `picker::pick_agent` only if
-/// still needed). Only when a real "pick an existing worktree, or start a
-/// new one" choice exists does one TUI screen resolve both together.
-/// `Ok(None)` means the user cancelled whichever picker fired.
-fn determine_slug_and_agent(
-    explicit_slug: Option<&str>,
-    explicit_agent: Option<&str>,
-    root: &Path,
-    repo_label: &str,
-    config: &Config,
-) -> Result<Option<(String, String)>> {
-    if let Some(s) = explicit_slug {
-        return Ok(resolve_agent_name(explicit_agent, config)?.map(|a| (s.to_string(), a)));
-    }
-
-    let same_repo: Vec<worktree::WorktreeEntry> = worktree::scan_worktrees(root)?
-        .into_iter()
-        .filter(|e| e.repo == repo_label)
-        .collect();
-    if same_repo.is_empty() {
-        return Ok(
-            resolve_agent_name(explicit_agent, config)?.map(|a| (generate_timestamp_slug(), a))
-        );
-    }
-
-    let agent_needed = agent_picker_needed(explicit_agent, config);
-    match picker::pick_worktree_and_agent(
-        same_repo,
-        config.idle_threshold_days,
-        true,
-        &config.agents,
-        agent_needed,
-    )? {
-        picker::Pick::Selected((picker::WorktreeSelection::Existing(entry), agent)) => {
-            // MUST unflatten here: `entry.slug` is the on-disk (flattened)
-            // directory name, and the caller passes this straight to
-            // `create_or_resume_worktree`, whose first step
-            // (`validate_worktree_slug`) rejects a literal '+'. Regression
-            // test: `tests::resumed_slug_survives_scan_and_unflatten_round_trip`
-            // — that test exercises `unflatten_slug` directly, not this match
-            // arm (which requires a TTY to reach via `pick_worktree_and_agent`),
-            // so it will NOT catch a revert of this line back to `entry.slug`
-            // alone.
-            let slug = unflatten_slug(&entry.slug);
-            Ok(agent_from_pick_or_resolve(agent, explicit_agent, config)?.map(|a| (slug, a)))
+/// Whether the given invocation needs the dashboard at all, computed BEFORE
+/// any clone/pull happens. `needs_dashboard` is designed to be `false` in
+/// exactly the cases today's non-dashboard code already resolves without
+/// opening any TUI: `cw doctor`/`cw completions` (handled before this is
+/// ever called), `--dry-run`, and — for the default flow and `cw scratch`,
+/// which both share the same "no worktree choice with an explicit SLUG"
+/// shortcut — a fully resolvable repo/slug/agent triple. `cw resume`/
+/// `cw clean` always open the dashboard: neither ever had a non-interactive
+/// path before this rewrite either.
+fn needs_dashboard(cli: &Cli, config: &Config, root: &Path) -> Result<bool> {
+    match &cli.cmd {
+        Some(Cmd::Resume) | Some(Cmd::Clean { .. }) => Ok(true),
+        Some(Cmd::Scratch { slug, dry_run }) => {
+            if *dry_run {
+                return Ok(false);
+            }
+            if agent_picker_needed(cli.agent.as_deref(), config) {
+                return Ok(true);
+            }
+            let repo_label = format!("{}/{}", worktree::SCRATCH_OWNER, worktree::SCRATCH_REPO);
+            slug_choice_needs_dashboard(root, &repo_label, slug.as_deref())
         }
-        picker::Pick::Selected((picker::WorktreeSelection::New, agent)) => {
-            Ok(agent_from_pick_or_resolve(agent, explicit_agent, config)?
-                .map(|a| (generate_timestamp_slug(), a)))
+        Some(Cmd::Doctor) | Some(Cmd::Completions { .. }) => Ok(false), // unreachable — handled earlier in `run`
+        None => {
+            if cli.dry_run {
+                return Ok(false);
+            }
+            let Some(spec) = &cli.repo else {
+                return Ok(true); // no --repo at all: the repo pane itself is the picker
+            };
+            if agent_picker_needed(cli.agent.as_deref(), config) {
+                return Ok(true);
+            }
+            let repo_label = parse_owner_repo(spec)?.full_name();
+            slug_choice_needs_dashboard(root, &repo_label, cli.slug.as_deref())
         }
-        picker::Pick::Empty => unreachable!(
-            "pick_worktree_and_agent is only called here with a non-empty `same_repo` list"
-        ),
-        picker::Pick::Cancelled => Ok(None),
     }
 }
 
-/// Fills in the agent name when `pick_worktree_and_agent`'s agent sub-panel
-/// never opened (`agent: None` — `agent_needed` was `false`, meaning
-/// `resolve_agent_name` below takes its own no-picker fast path and never
-/// invokes `picker::pick_agent` a second time).
-fn agent_from_pick_or_resolve(
-    agent: Option<String>,
-    explicit_agent: Option<&str>,
-    config: &Config,
-) -> Result<Option<String>> {
-    match agent {
-        Some(a) => Ok(Some(a)),
-        None => resolve_agent_name(explicit_agent, config),
+/// With an explicit SLUG there is no worktree *choice* to make (mirrors the
+/// pre-dashboard `determine_slug_and_agent`'s `if let Some(s) = explicit_slug`
+/// shortcut). Without one, the dashboard is needed only when `repo_label`
+/// already has at least one worktree to pick between or resume — a repo
+/// with none yet auto-generates a fresh timestamp slug with no picker
+/// either, exactly as it always has.
+fn slug_choice_needs_dashboard(root: &Path, repo_label: &str, slug: Option<&str>) -> Result<bool> {
+    if slug.is_some() {
+        return Ok(false);
     }
-}
-
-/// Reverses `worktree::flatten_slug` on a slug read back off disk (e.g.
-/// `scan_worktrees`'s `entry.slug`, taken from the flattened directory
-/// name). Safe precisely because `validate_worktree_slug` rejects a literal
-/// `+` in any raw slug segment (§5d) — no slug `create_or_resume_worktree`
-/// ever accepted could already contain the character flattening introduces,
-/// so this reversal can't misfire on a slug that legitimately contained `+`.
-/// Without this, §0a's existing-worktrees picker fed a flattened slug
-/// straight back into `create_or_resume_worktree`, whose first step
-/// (`validate_worktree_slug`) then rejected it — resuming any worktree whose
-/// raw slug contained `/` was unreachable through the picker.
-fn unflatten_slug(flat: &str) -> String {
-    flat.replace('+', "/")
+    let has_existing = worktree::scan_worktrees(root)?
+        .iter()
+        .any(|e| e.repo == repo_label);
+    Ok(has_existing)
 }
 
 fn interactive_confirm(resolved: &hooks::ResolvedHook) -> bool {
     // Never block on a piped/absent stdin: no controlling terminal means
     // decline, not hang — the same non-interactive discipline §5j's picker
     // prechecks apply, extended to this y/N prompt.
-    if !picker::is_interactive() {
+    if !tui::is_interactive() {
         return false;
     }
     println!(
@@ -376,7 +317,9 @@ fn report_hook_outcome(label: &str, outcome: hooks::HookOutcome) {
 /// Runs `post_clone_hook` if configured, gated by the confirm-once-per-repo
 /// consent store (§5h). Only ever called right after a fresh `gh repo
 /// clone` — never on a pull of an already-cloned repo, and never for
-/// `cw scratch` (there's no clone event to trigger it).
+/// `cw scratch` (there's no clone event to trigger it). Used only by the
+/// fully non-interactive fast paths — the dashboard's equivalent path is
+/// `DashboardModel`'s `Modal::HookConsent` + `advance_pending`.
 #[allow(clippy::too_many_arguments)]
 fn run_post_clone_hook_step(
     config: &Config,
@@ -419,7 +362,9 @@ fn run_post_clone_hook_step(
 /// dirs (§5c-note), copies `.worktreeinclude` matches (§5f), then runs
 /// `post_create_hook` if configured (§5h). Never called on a fast-resumed
 /// worktree — callers only invoke this when `worktree_precheck` reported
-/// `existed == false`.
+/// `existed == false`. Used only by the fully non-interactive fast paths —
+/// the dashboard's equivalent is `DashboardModel::do_create_worktree` +
+/// `Modal::HookConsent`.
 #[allow(clippy::too_many_arguments)]
 fn finish_worktree_creation(
     config: &Config,
@@ -485,120 +430,53 @@ fn report_pull_outcome(repo_label: &str, outcome: sync::PullOutcome) {
     }
 }
 
-/// Opens the repo screen immediately against whatever's cached (`initial`,
-/// possibly empty on a cold cache) while a background thread runs the real
-/// `cache::refresh_if_needed` + `github::discover_repos` fetch and streams
-/// the result back — the fetch no longer blocks before any picker window
-/// appears (Screens: "Repo screen"). Per-org discovery warnings and a
-/// stale-cache notice route into `tui::RepoLoad` instead of
-/// `tracing::warn!`/`eprintln!`, which would otherwise corrupt an
-/// in-progress frame (Rendering conflicts) — both are only ever emitted from
-/// inside this thread now, replacing the old synchronous version's direct
-/// logging entirely.
-fn pick_repo_interactive(
-    cli: &Cli,
-    config: &Config,
-    root: &Path,
-) -> Result<picker::Pick<github::Repo>> {
-    // Checked here, before spawning the fetch thread, so a non-interactive
-    // environment (e.g. a piped/no-TTY invocation missing `--repo`) fails
-    // fast without ever starting a `gh` subprocess in the background —
-    // `picker::pick_repo` re-checks this itself too (every `pick_*`
-    // function is self-contained about its own precondition), but that
-    // second check would only fire after the thread below is already
-    // running.
-    if !picker::is_interactive() {
-        return Err(anyhow!(
-            "no interactive terminal available to pick a repo — pass --repo OWNER/NAME instead"
-        ));
-    }
-
-    let cache_path = config::cache_path()?;
-    let initial = cache::load(&cache_path)?
-        .map(|c| c.sorted_repos())
-        .unwrap_or_default();
-
-    let org_filter = cli.org.clone();
-    let ttl = config.cache_ttl_minutes;
-    let force_refresh = cli.refresh;
-    let thread_cache_path = cache_path.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let warnings = std::cell::RefCell::new(Vec::new());
-        let result = cache::refresh_if_needed(&thread_cache_path, ttl, force_refresh, || {
-            let discovered = github::discover_repos(&org_filter)?;
-            *warnings.borrow_mut() = discovered.warnings;
-            Ok(discovered.repos)
-        });
-
-        let load = match result {
-            Ok((repos, outcome)) => {
-                // `sorted_repos()` does the most-recent-first ordering
-                // (§5a/§5k) — reuse it here rather than re-sorting inline,
-                // `fetched_at` is irrelevant to that method and only needed
-                // to satisfy the struct's shape.
-                let repos = cache::RepoCache {
-                    repos,
-                    fetched_at: chrono::Utc::now(),
-                }
-                .sorted_repos();
-                let stale_warning = match outcome {
-                    cache::RefreshOutcome::Stale { warning } => Some(warning),
-                    cache::RefreshOutcome::Cached | cache::RefreshOutcome::Fresh => None,
-                };
-                tui::RepoLoad {
-                    repos,
-                    warnings: warnings.into_inner(),
-                    stale_warning,
-                }
-            }
-            // No usable cache and the live fetch failed outright — shown in
-            // the screen's status line rather than propagated as a hard
-            // process error, since by this point the TUI already owns the
-            // screen (possibly with an empty "loading…" list) on a
-            // background thread with no way to report back through `?`.
-            Err(e) => tui::RepoLoad {
-                repos: Vec::new(),
-                warnings: Vec::new(),
-                stale_warning: Some(format!("repo discovery failed: {e:#}")),
-            },
-        };
-        let _ = tx.send(load);
-    });
-
-    picker::pick_repo(root, initial, rx)
-}
-
 fn run_default(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
     if cli.dry_run {
         return run_dry_run(cli, config, root);
     }
+    if !needs_dashboard(cli, config, root)? {
+        return run_default_fast_path(cli, config, root);
+    }
 
-    let repo_choice = if let Some(spec) = &cli.repo {
-        parse_owner_repo(spec)?
-    } else {
-        match pick_repo_interactive(cli, config, root)? {
-            picker::Pick::Selected(r) => r,
-            picker::Pick::Empty | picker::Pick::Cancelled => return Ok(()),
-        }
-    };
+    let forced_repo = cli.repo.as_deref().map(parse_owner_repo).transpose()?;
+    dashboard::run(
+        Entry::Browse {
+            forced_repo,
+            forced_slug: cli.slug.clone(),
+        },
+        cli,
+        config,
+        root,
+    )
+}
+
+/// The fully non-interactive path: `--repo OWNER/NAME` + a resolvable agent
+/// — `needs_dashboard` guarantees both before this is ever called, so the
+/// `--repo` `.expect()` below documents that precondition rather than being
+/// a real panic risk. SLUG itself is NOT guaranteed: `slug_choice_needs_
+/// dashboard` also takes this path when the repo has no existing worktrees
+/// yet, in which case there's no worktree *choice* to make even without an
+/// explicit SLUG — same auto-generated-timestamp fallback `start_pending`
+/// uses for the dashboard's "+ new worktree" row.
+fn run_default_fast_path(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
+    let repo_choice = parse_owner_repo(
+        cli.repo
+            .as_deref()
+            .expect("needs_dashboard guarantees --repo is set on this path"),
+    )?;
     let repo_label = repo_choice.full_name();
+    let slug = cli
+        .slug
+        .clone()
+        .unwrap_or_else(worktree::generate_timestamp_slug);
+    let agent_name = cli
+        .agent
+        .clone()
+        .unwrap_or_else(|| config.default_agent.clone());
 
     let (git_repo, pull_outcome) =
         sync::clone_or_pull(root, &repo_choice.owner, &repo_choice.name, !cli.no_pull)?;
     report_pull_outcome(&repo_label, pull_outcome);
-
-    let Some((slug, agent_name)) = determine_slug_and_agent(
-        cli.slug.as_deref(),
-        cli.agent.as_deref(),
-        root,
-        &repo_label,
-        config,
-    )?
-    else {
-        println!("cancelled");
-        return Ok(());
-    };
 
     let repo_root = git_repo
         .workdir()
@@ -638,9 +516,8 @@ fn run_default(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
 
 /// `--dry-run` (requires `--repo` AND an explicit SLUG, F17): prints the
 /// clone-vs-pull decision, resolved worktree path, which hook(s) would run,
-/// and which agent would launch — performs no mutation whatsoever. Neither
-/// the interactive repo picker nor §0a's existing-worktrees picker nor the
-/// agent picker is ever invoked on this path.
+/// and which agent would launch — performs no mutation whatsoever. The
+/// dashboard is never opened on this path.
 fn run_dry_run(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
     let repo_spec = cli
         .repo
@@ -710,28 +587,7 @@ fn print_create_hook_preview(hook: &Option<String>, repo_root: &Path) {
 }
 
 fn run_resume(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
-    let entries = worktree::scan_worktrees(root)?;
-    let agent_needed = agent_picker_needed(cli.agent.as_deref(), config);
-    let (entry, agent) = match picker::pick_worktree_and_agent(
-        entries,
-        config.idle_threshold_days,
-        false,
-        &config.agents,
-        agent_needed,
-    )? {
-        picker::Pick::Selected((picker::WorktreeSelection::Existing(e), agent)) => (e, agent),
-        picker::Pick::Selected((picker::WorktreeSelection::New, _)) => {
-            unreachable!("pick_worktree_and_agent(include_new=false) never returns New")
-        }
-        picker::Pick::Empty | picker::Pick::Cancelled => return Ok(()),
-    };
-
-    let Some(agent_name) = agent_from_pick_or_resolve(agent, cli.agent.as_deref(), config)? else {
-        println!("cancelled");
-        return Ok(());
-    };
-    let agent_cfg = config::resolve_agent(Some(&agent_name), config)?;
-    agent::launch(&agent_cfg, &entry.path)
+    dashboard::run(Entry::Resume, cli, config, root)
 }
 
 fn run_scratch(
@@ -744,30 +600,40 @@ fn run_scratch(
     if dry_run {
         return run_scratch_dry_run(cli, config, root, slug.as_deref());
     }
+    if !needs_dashboard(cli, config, root)? {
+        return run_scratch_fast_path(cli, config, root, slug);
+    }
+    dashboard::run(Entry::Scratch { forced_slug: slug }, cli, config, root)
+}
 
+/// The fully non-interactive `cw scratch [SLUG]` path — `needs_dashboard`
+/// guarantees a resolvable agent before this is ever called, but NOT an
+/// explicit SLUG: the scratch repo having no existing worktrees yet also
+/// takes this path (same `slug_choice_needs_dashboard` rule `run_default_
+/// fast_path` documents), so a missing SLUG falls back to an auto-generated
+/// timestamp exactly as the dashboard's "+ new worktree" row does. Never
+/// runs `post_clone_hook` — there is no `gh repo clone` event for a scratch
+/// worktree.
+fn run_scratch_fast_path(
+    cli: &Cli,
+    config: &Config,
+    root: &Path,
+    slug: Option<String>,
+) -> Result<()> {
     let repo_root = worktree::ensure_scratch_repo(root)?;
     let git_repo = git2::Repository::open(&repo_root)
         .with_context(|| format!("opening scratch repo at {}", repo_root.display()))?;
     let repo_label = format!("{}/{}", worktree::SCRATCH_OWNER, worktree::SCRATCH_REPO);
-
-    let Some((slug, agent_name)) = determine_slug_and_agent(
-        slug.as_deref(),
-        cli.agent.as_deref(),
-        root,
-        &repo_label,
-        config,
-    )?
-    else {
-        println!("cancelled");
-        return Ok(());
-    };
+    let slug = slug.unwrap_or_else(worktree::generate_timestamp_slug);
+    let agent_name = cli
+        .agent
+        .clone()
+        .unwrap_or_else(|| config.default_agent.clone());
 
     let (_, was_existing) = worktree_precheck(&repo_root, &slug);
     let worktree_path = worktree::create_or_resume_worktree(&git_repo, &slug, "HEAD")?;
 
     if !was_existing {
-        // `post_clone_hook` never fires here — there is no `gh repo clone`
-        // event for a scratch worktree (§3, §5n).
         finish_worktree_creation(
             config,
             cli.yes,
@@ -783,10 +649,10 @@ fn run_scratch(
     agent::launch(&agent_cfg, &worktree_path)
 }
 
-/// Same rationale as the top-level `--dry-run` (F17): the existing-
-/// worktrees-first picker (§0a applies to scratch too, per §4) is
-/// interactive, so a dry-run preview requires an explicit SLUG to bypass it
-/// rather than blocking a TTY-less invocation.
+/// Same rationale as the top-level `--dry-run` (F17): a real invocation of
+/// this path is interactive (the dashboard opens for a worktree choice), so
+/// a dry-run preview requires an explicit SLUG to bypass it rather than
+/// blocking a TTY-less invocation.
 fn run_scratch_dry_run(cli: &Cli, config: &Config, root: &Path, slug: Option<&str>) -> Result<()> {
     let slug = slug.context("cw scratch --dry-run requires an explicit SLUG")?;
     worktree::validate_worktree_slug(slug)?;
@@ -888,64 +754,6 @@ mod tests {
     }
 
     #[test]
-    fn unflatten_slug_reverses_flatten() {
-        assert_eq!(unflatten_slug("foo+bar"), "foo/bar");
-        assert_eq!(unflatten_slug("plain"), "plain");
-        assert_eq!(unflatten_slug(&worktree::flatten_slug("a/b/c")), "a/b/c");
-    }
-
-    /// Regression guard for the bug the advisor pass caught: §0a's
-    /// existing-worktrees picker returns `entry.slug` straight off
-    /// `scan_worktrees`, which reads it from the on-disk (already flattened)
-    /// directory name. Feeding that verbatim into
-    /// `create_or_resume_worktree` — whose first step is
-    /// `validate_worktree_slug`, which rejects a literal `+` by design — made
-    /// resuming any worktree whose raw slug contained `/` fail every time
-    /// `determine_slug` picked it back up. This drives the exact round trip
-    /// `determine_slug`'s Existing arm performs, without needing an
-    /// interactive picker.
-    #[test]
-    fn resumed_slug_survives_scan_and_unflatten_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let repo_dir = root.join("acme").join("proj");
-        fs::create_dir_all(&repo_dir).unwrap();
-        let repo = git2::Repository::init(&repo_dir).unwrap();
-        let sig = git2::Signature::now("test", "test@example.com").unwrap();
-        fs::write(repo_dir.join("README.md"), "hi").unwrap();
-        {
-            let mut index = repo.index().unwrap();
-            index.add_path(Path::new("README.md")).unwrap();
-            index.write().unwrap();
-            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
-                .unwrap();
-        }
-
-        let raw_slug = "myfeat/x";
-        let created = worktree::create_or_resume_worktree(&repo, raw_slug, "HEAD").unwrap();
-
-        let scanned = worktree::scan_worktrees(root).unwrap();
-        let entry = scanned
-            .into_iter()
-            .find(|e| e.repo == "acme/proj")
-            .expect("scan_worktrees must find the worktree just created");
-        // Confirms the premise: what comes back off disk IS the flattened
-        // form, not the raw slug.
-        assert_eq!(entry.slug, "myfeat+x");
-
-        let resumed_slug = unflatten_slug(&entry.slug);
-        assert_eq!(resumed_slug, raw_slug);
-        assert!(worktree::validate_worktree_slug(&resumed_slug).is_ok());
-
-        // The actual regression: feeding the unflattened slug back through
-        // `create_or_resume_worktree` must fast-resume the same path, not
-        // error on a rejected '+' segment.
-        let resumed = worktree::create_or_resume_worktree(&repo, &resumed_slug, "HEAD").unwrap();
-        assert_eq!(resumed, created);
-    }
-
-    #[test]
     fn parse_owner_repo_rejects_malformed_spec() {
         assert!(parse_owner_repo("imabee0/cw").is_ok());
         assert!(parse_owner_repo("no-slash").is_err());
@@ -963,5 +771,100 @@ mod tests {
         let unchanged = expand_tilde(Path::new("/already/absolute")).unwrap();
         assert_eq!(unchanged, PathBuf::from("/already/absolute"));
         unsafe { std::env::remove_var("HOME") };
+    }
+
+    #[test]
+    fn slug_choice_needs_dashboard_false_with_explicit_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!slug_choice_needs_dashboard(dir.path(), "acme/proj", Some("feature")).unwrap());
+    }
+
+    #[test]
+    fn slug_choice_needs_dashboard_false_when_repo_has_no_worktrees_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!slug_choice_needs_dashboard(dir.path(), "acme/proj", None).unwrap());
+    }
+
+    #[test]
+    fn slug_choice_needs_dashboard_true_when_repo_has_existing_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wt = root.join("acme/proj/.claude/worktrees/feature");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join(".git"), "gitdir: ../../.git/worktrees/feature\n").unwrap();
+
+        assert!(slug_choice_needs_dashboard(root, "acme/proj", None).unwrap());
+        // A different repo with none of its own is unaffected.
+        assert!(!slug_choice_needs_dashboard(root, "other/repo", None).unwrap());
+    }
+
+    #[test]
+    fn needs_dashboard_true_for_resume_and_clean_unconditionally() {
+        let cfg = cfg_with_agents("claude", &["claude"]);
+        let dir = tempfile::tempdir().unwrap();
+        let cli_resume = Cli {
+            slug: None,
+            agent: None,
+            root: None,
+            org: vec![],
+            refresh: false,
+            no_pull: false,
+            dry_run: false,
+            repo: None,
+            yes: false,
+            cmd: Some(Cmd::Resume),
+        };
+        assert!(needs_dashboard(&cli_resume, &cfg, dir.path()).unwrap());
+
+        let cli_clean = Cli {
+            cmd: Some(Cmd::Clean { force: false }),
+            ..cli_resume
+        };
+        assert!(needs_dashboard(&cli_clean, &cfg, dir.path()).unwrap());
+    }
+
+    #[test]
+    fn needs_dashboard_false_for_fully_specified_default_flow() {
+        let cfg = cfg_with_agents("claude", &["claude"]);
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            slug: Some("feature".to_string()),
+            agent: None,
+            root: None,
+            org: vec![],
+            refresh: false,
+            no_pull: false,
+            dry_run: false,
+            repo: Some("acme/proj".to_string()),
+            yes: false,
+            cmd: None,
+        };
+        assert!(
+            !needs_dashboard(&cli, &cfg, dir.path()).unwrap(),
+            "--repo + explicit SLUG + a resolvable agent must never open the dashboard"
+        );
+    }
+
+    #[test]
+    fn needs_dashboard_true_when_repo_given_without_slug_and_worktrees_exist() {
+        let cfg = cfg_with_agents("claude", &["claude"]);
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("acme/proj/.claude/worktrees/feature");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join(".git"), "gitdir: ../../.git/worktrees/feature\n").unwrap();
+
+        let cli = Cli {
+            slug: None,
+            agent: None,
+            root: None,
+            org: vec![],
+            refresh: false,
+            no_pull: false,
+            dry_run: false,
+            repo: Some("acme/proj".to_string()),
+            yes: false,
+            cmd: None,
+        };
+        assert!(needs_dashboard(&cli, &cfg, dir.path()).unwrap());
     }
 }

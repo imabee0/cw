@@ -66,7 +66,7 @@ fn check_credential_helper() -> Result<()> {
 }
 
 fn check_terminal() -> Result<()> {
-    if crate::picker::is_interactive() {
+    if crate::tui::is_interactive() {
         Ok(())
     } else {
         bail!("no interactive terminal detected (not a TTY, or /dev/tty is unavailable)")

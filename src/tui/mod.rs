@@ -1,9 +1,9 @@
-//! Model/Msg/Update/View TUI subsystem (bubbletea-shaped) that replaces
-//! `skim` for every interactive `cw` picker. `run` owns the terminal
-//! lifecycle for exactly one screen at a time — `cw`'s flow opens at most
-//! two in sequence (repo screen, then the worktree+agent screen), never
-//! both at once, so there is no persistent app-long dashboard here (out of
-//! scope per the design).
+//! Model/Msg/Update/View TUI subsystem (bubbletea-shaped) backing `cw`'s
+//! single persistent dashboard (`dashboard.rs`). `run` owns the terminal
+//! lifecycle for one screen at a time, but a screen now survives a
+//! suspend/resume round trip (e.g. to run a hook or launch an agent with
+//! inherited stdio) instead of being torn down for good — see `run`'s
+//! `(S, S::Outcome)` return shape and `dashboard.rs`'s driver loop.
 
 pub mod event;
 pub mod model;
@@ -12,7 +12,7 @@ pub mod update;
 pub mod view;
 pub mod widgets;
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
@@ -26,6 +26,17 @@ use ratatui::crossterm::terminal::{
 use ratatui::{Frame, Terminal};
 
 pub use msg::{Msg, RepoLoad};
+
+/// Gate on `/dev/tty`, not `stdin().is_terminal()` — the TUI backend renders
+/// straight to `/dev/stderr`, not through stdin/stdout (see `TerminalGuard`
+/// below), so a piped stdin plausibly still reaches a real controlling
+/// terminal; the case that actually matters is no controlling terminal at
+/// all, e.g. a workflow agent. Moved here from the old `picker.rs` (now
+/// `dashboard.rs`) — this is the TUI backend's own precondition, not a
+/// picker-specific one, so it belongs next to the backend it gates.
+pub fn is_interactive() -> bool {
+    std::fs::File::open("/dev/tty").is_ok() && io::stderr().is_terminal()
+}
 
 /// Set for the lifetime of any `run()` call, cleared on every return path
 /// (including panic). `main.rs::init_logging`'s stderr writer checks this
@@ -70,8 +81,9 @@ pub trait Screen {
 /// on **stderr**, restored on every return path (`?`-early-return included)
 /// via `Drop` — same idiom `main.rs` already uses for `WorkerGuard` around
 /// the log appender. Rendering to stderr, not stdout, keeps `cw | cat`'s
-/// stdout free of UI escape codes and matches `picker::is_interactive()`'s
-/// documented `stderr().is_terminal()` invariant (CLAUDE.md).
+/// stdout free of UI escape codes and matches this module's own
+/// `is_interactive()`'s documented `stderr().is_terminal()` invariant
+/// (CLAUDE.md).
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stderr>>,
 }
@@ -143,16 +155,28 @@ fn install_panic_hook() {
 /// Background-thread results (`poll_background`) are drained before every
 /// blocking read so a repo-discovery result already sitting in the channel
 /// is applied — and redrawn — without waiting a full tick.
-pub fn run<S: Screen>(mut screen: S) -> Result<S::Outcome> {
+///
+/// Returns the screen back alongside the outcome (not just the outcome) —
+/// `dashboard.rs`'s driver loop needs it to survive a suspend/resume round
+/// trip: an `Outcome::Suspend` means the caller is about to run a hook or
+/// launch an agent with inherited stdio (tearing this terminal down via
+/// `TerminalGuard`'s `Drop`), then call `run` again on the SAME screen once
+/// that's done, rather than losing all accumulated model state.
+pub fn run<S: Screen>(mut screen: S) -> Result<(S, S::Outcome)> {
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;
+    // Forces a full repaint on entry — including a resume after a suspend,
+    // where ratatui's diff buffer from before the alt-screen toggle would
+    // otherwise think large parts of the frame are already correct and skip
+    // redrawing them.
+    guard.terminal.clear()?;
 
     loop {
         guard.terminal.draw(|frame| screen.draw(frame))?;
 
         if let Some(msg) = screen.poll_background() {
             if let Some(outcome) = screen.update(msg) {
-                return Ok(outcome);
+                return Ok((screen, outcome));
             }
             continue;
         }
@@ -160,12 +184,12 @@ pub fn run<S: Screen>(mut screen: S) -> Result<S::Outcome> {
         match event::poll_next()? {
             Some(msg) => {
                 if let Some(outcome) = screen.update(msg) {
-                    return Ok(outcome);
+                    return Ok((screen, outcome));
                 }
             }
             None => {
                 if let Some(outcome) = screen.update(Msg::Tick) {
-                    return Ok(outcome);
+                    return Ok((screen, outcome));
                 }
             }
         }

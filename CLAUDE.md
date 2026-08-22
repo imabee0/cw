@@ -22,26 +22,26 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 
 | File | Responsibility |
 |---|---|
-| `main.rs` | CLI dispatch, default-flow orchestration, tracing/log init |
+| `main.rs` | CLI dispatch, default-flow orchestration, `needs_dashboard` fast-path gate, tracing/log init |
 | `cli.rs` | clap-derive `Cli`/`Cmd` (`resume`, `clean`, `scratch`, `doctor`, `completions`) |
 | `config.rs` | `Config` TOML load/save, `~/.config/cw`/`~/.cache/cw` path resolution, `resolve_agent()` |
 | `github.rs` | `gh` subprocess wrappers: repo/org discovery, per-org failure isolation |
 | `cache.rs` | `RepoCache`, atomic save (tmp+rename), corrupt-file-tolerant load |
-| `picker.rs` | assembles a `tui` screen per picker (`pick_repo`, `pick_worktree_and_agent`, `pick_worktrees_multi`, `pick_agent`), `Pick<T>`/`is_interactive` |
-| `tui/mod.rs` | `Screen` trait, `run()` event loop, terminal lifecycle (raw mode/alt screen/mouse capture on stderr), panic-hook restore, `TUI_ACTIVE` |
-| `tui/msg.rs` | `Msg` enum, `RepoLoad` (background repo-discovery result) |
-| `tui/model.rs` | `RepoModel`/`WorktreeModel`/`AgentModel`, shared `ListState<T>`, idle/relative-time formatting |
-| `tui/update.rs` | pure `update_repo`/`update_worktree`/`update_agent` — terminal-free, unit tested directly |
-| `tui/view.rs` | pure `draw_repo`/`draw_worktree`/`draw_agent` — `ratatui::widgets::Table`/`Paragraph` rendering |
+| `dashboard.rs` | the single `tui::run()` entry point: builds the initial `DashboardModel` per `Entry` (bare `cw`/`resume`/`clean`/`scratch`), spawns every background thread (repo discovery, one-shot worktree scan, the reactive clone/pull thread), and drives the suspend/resume loop around hook runs and agent launches |
+| `tui/mod.rs` | `Screen` trait, `run()` event loop returning `(Screen, Outcome)` so a screen survives a suspend/resume round trip, terminal lifecycle (raw mode/alt screen/mouse capture on stderr), panic-hook restore, `TUI_ACTIVE`, `is_interactive()` |
+| `tui/msg.rs` | `Msg` enum, `RepoLoad`/`WorktreesLoad`/`CloneOutcome` (background-thread results) |
+| `tui/model.rs` | `DashboardModel` (composite split-pane state: repo pane, worktree pane, agent footer, delete-mode, the clone/hook/create/launch `PendingLaunch` pipeline), shared `ListState<T>`, idle/relative-time formatting |
+| `tui/update.rs` | pure `update_dashboard` — terminal-free, unit tested directly |
+| `tui/view.rs` | pure `draw_dashboard` — `ratatui::widgets::Table`/`Paragraph` split-pane rendering |
 | `tui/event.rs` | crossterm event polling + tick cadence |
 | `tui/widgets.rs` | `row_at` mouse hit-testing, frizbee-backed `filter_indices` |
 | `gitstatus.rs` | `is_dirty`/`is_dirty_repo` — shared by sync.rs's pull guard and clean.rs |
-| `sync.rs` | clone/pull, `gh`-credential-helper wiring, dirty-tree guard before force-checkout |
-| `worktree.rs` | slug validation/flattening, worktree create-or-resume, `scan_worktrees`, `remove_worktree`, `display_repo_label` |
+| `sync.rs` | clone/pull (`clone_or_pull_ex`'s `CloneStdio::Capture` variant backs the dashboard's background clone thread), `gh`-credential-helper wiring, dirty-tree guard before force-checkout |
+| `worktree.rs` | slug validation/flattening/`unflatten_slug`, worktree create-or-resume, `scan_worktrees`, `remove_worktree`, `display_repo_label`, `WorktreeSelection`/`CleanCandidate`, `generate_timestamp_slug` |
 | `worktreeinclude.rs` | `.worktreeinclude` copy: symlink-preserving, CRLF/BOM-tolerant, continue-on-error |
 | `hooks.rs` | `post_clone_hook`/`post_create_hook` execution, confirm-once-per-repo consent |
 | `agent.rs` | launches the resolved agent CLI in the worktree, distinguishes exit outcomes |
-| `clean.rs` | `cw clean`: scan, dirty/idle annotate, multi-select, prune |
+| `clean.rs` | `cw clean`: thin `dashboard::run(Entry::Clean)` entry point; `remove_one` (git2 prune + branch delete), shared with the dashboard's in-TUI delete flow |
 | `doctor.rs` | `cw doctor`: gh auth, credential helper, terminal, each configured agent on PATH |
 
 ## Conventions
@@ -58,14 +58,14 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 - **`create_or_resume_worktree`** appends `/.claude/worktrees/` to the cloned repo's `.git/info/exclude` on first create — removing this reopens a dirty-tree false-positive that silently blocks every future pull on that repo (plan §5d, the single most consequential fix in the design).
 - **Hooks (`post_clone_hook`/`post_create_hook`) default to unset.** They execute code the cloned repo supplies, not code the user wrote — never flip either default on, never skip the confirm-once-per-repo consent gate in `hooks.rs`.
 - **`gh repo list` must always carry `--limit 1000`** (`github.rs::repo_list_args`) — `gh`'s own default of 30 silently truncates discovery.
-- **`--org` only takes effect on a cache miss or with `--refresh`** — `pick_repo_interactive` serves a warm `repos.json` (age < `cache_ttl_minutes`) before the org-filter closure ever runs, so `--org` alone against a warm cache silently returns the unfiltered full list. Pair it with `--refresh` when testing or scripting against a specific org.
-- **Picker non-interactivity is gated on `/dev/tty` + `stderr().is_terminal()`, never on `stdin().is_terminal()`** — crossterm's unix backend opens `/dev/tty` directly for its event source (`tty_fd()`, falling back to a std fd only if `/dev/tty` is unavailable — confirmed in crossterm 0.29's source, not assumed), and `tui::mod`'s `CrosstermBackend` renders to stderr, not stdout, so a piped stdin over a real controlling terminal must still reach the picker, and `cw | cat` must never receive UI escape codes. `script -q /dev/null cw` allocates a real pty for local testing of this path — no automated pass has driven the TUI interactively to confirm it against this backend (no controlling terminal in that environment either), so this still wants a real-terminal check before being trusted.
-- **Any `tracing::warn!`/`error!` firing while a `tui::run` session owns the screen would corrupt the frame** — `main.rs::init_logging` gates the stderr half of its tee behind `tui::TUI_ACTIVE` (an `AtomicBool` set for the duration of every `run()` call) so log lines still reach the day log file but never interleave with in-progress terminal escape codes. Route anything a screen needs the user to see into that `Model`'s status line instead of logging it directly (`pick_repo_interactive`'s background thread does this for per-org discovery warnings and a stale-cache notice).
+- **`--org` only takes effect on a cache miss or with `--refresh`** — `dashboard.rs`'s `spawn_repo_thread` serves a warm `repos.json` (age < `cache_ttl_minutes`) before the org-filter closure ever runs, so `--org` alone against a warm cache silently returns the unfiltered full list. Pair it with `--refresh` when testing or scripting against a specific org.
+- **Dashboard non-interactivity is gated on `/dev/tty` + `stderr().is_terminal()`, never on `stdin().is_terminal()`** — crossterm's unix backend opens `/dev/tty` directly for its event source (`tty_fd()`, falling back to a std fd only if `/dev/tty` is unavailable — confirmed in crossterm 0.29's source, not assumed), and `tui::mod`'s `CrosstermBackend` renders to stderr, not stdout, so a piped stdin over a real controlling terminal must still reach the dashboard, and `cw | cat` must never receive UI escape codes. `script -q /dev/null cw` allocates a real pty for local testing of this path — no automated pass has driven the TUI interactively to confirm it against this backend (no controlling terminal in that environment either), so this still wants a real-terminal check before being trusted.
+- **Any `tracing::warn!`/`error!` firing while a `tui::run` session owns the screen would corrupt the frame** — `main.rs::init_logging` gates the stderr half of its tee behind `tui::TUI_ACTIVE` (an `AtomicBool` set for the duration of every `run()` call) so log lines still reach the day log file but never interleave with in-progress terminal escape codes. Route anything the dashboard needs the user to see into `DashboardModel::status` instead of logging it directly (`dashboard.rs::spawn_repo_thread`'s background thread does this for per-org discovery warnings and a stale-cache notice).
 - **`tracing_appender`'s `WorkerGuard` must stay a named local bound in `main()`** — dropping it early silently loses buffered log lines.
 - Config/cache paths are fixed at `~/.config/cw/config.toml` and `~/.cache/cw/{repos.json,cw.log.*}` on both macOS and Linux — not `directories::ProjectDirs`, deliberately, to avoid diverging per platform.
 - `cw` shells out to `gh` for all GitHub API access (repo/org listing, clone auth) — `gh auth status` must be green; `cw doctor` checks this.
-- **A mouse click in `tui` only ever focuses a row (`TableState::select`), never activates it** — outside multi-select mode a click and a keyboard arrow key are the same operation, both funneling through Enter to actually commit. `tui::update`'s mouse handlers never return an `Outcome` from a `MouseEventKind::Down`; only multi-select mode additionally toggles a checkbox on click (still not a commit — `d` is).
-- **Any single-char key binding that doubles as filter text must be gated on `model.list.query.is_empty()`**, same as `q`-quit — `d` (multi-select delete, `tui/update.rs`) is gated this way because an ungated destructive binding is worse than an ungated quit. `j`/`k` are the deliberate exception: always navigation, never typable, so they're never gated.
+- **A mouse click in `tui` only ever focuses a row (`TableState::select`), never activates it** — outside delete-mode a click and a keyboard arrow key are the same operation, both funneling through Enter to actually commit. `tui::update`'s mouse handlers never return an `Outcome` from a `MouseEventKind::Down`; only delete-mode additionally toggles a checkbox on click (still not a commit — `d` is).
+- **Any single-char key binding that doubles as filter text must be gated on the *focused pane's* `query.is_empty()`**, same as `q`-quit — `d` (delete-mode toggle/confirm, `tui/update.rs`) is gated this way because an ungated destructive binding is worse than an ungated quit. Each pane (`Scope::Browse`'s repo `ListState`, the worktree `ListState`) owns its own query, and gating always checks whichever pane `DashboardModel::focus` currently points at, never a single global query. `j`/`k` are the deliberate exception: always navigation, never typable, so they're never gated.
 
 ## Standards exceptions
 
