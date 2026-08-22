@@ -56,7 +56,7 @@ args = []
 
 ## Usage
 
-**Default flow** — pick a repo, clone/pull, create or resume a worktree, launch the default agent:
+**Default flow** — pick a repo, clone/pull, create or resume a worktree, launch the default agent. Every picker screen supports arrow keys/`j`/`k`, live fuzzy filtering, and mouse click/scroll (a click focuses a row; Enter still commits it):
 
 ```bash
 cw
