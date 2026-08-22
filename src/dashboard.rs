@@ -60,10 +60,30 @@ pub enum Entry {
 /// (Esc/Ctrl-C with nothing left to back out of).
 pub fn run(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result<()> {
     if !tui::is_interactive() {
-        bail!(
-            "no interactive terminal available for cw's dashboard — pass --repo OWNER/NAME and \
-             an explicit SLUG instead"
-        );
+        // Per-Entry hint — `--repo OWNER/NAME` + an explicit SLUG is real
+        // advice for `Browse`/`Scratch` (both have a non-interactive fast
+        // path) but wrong for `Resume`/`Clean`, which take no such flags and
+        // have no non-interactive form at all.
+        let hint = match &entry {
+            Entry::Browse { .. } => {
+                "no interactive terminal available for cw's dashboard — pass --repo OWNER/NAME \
+                 and an explicit SLUG instead"
+            }
+            Entry::Resume => {
+                "no interactive terminal available for `cw resume` — it has no non-interactive \
+                 form; use the default `cw --repo OWNER/NAME SLUG` flow instead"
+            }
+            Entry::Clean { .. } => {
+                "no interactive terminal available for `cw clean` — it has no non-interactive \
+                 form; remove a worktree by hand (git worktree remove) or run `cw clean` from a \
+                 real terminal"
+            }
+            Entry::Scratch { .. } => {
+                "no interactive terminal available for `cw scratch` — pass an explicit SLUG \
+                 (and --dry-run to preview) instead"
+            }
+        };
+        bail!("{hint}");
     }
 
     let mut screen = build_screen(entry, cli, config, root)?;

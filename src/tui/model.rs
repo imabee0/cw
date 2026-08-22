@@ -936,7 +936,15 @@ impl DashboardModel {
         };
         let repo_label = self.pending.as_ref()?.ctx.repo_label.clone();
         self.hook_consent.insert(repo_label, accepted);
-        let _ = hooks::save_consent(&self.hook_consent_path, &self.hook_consent);
+        // In-memory consent (just above) still governs this session even if
+        // the disk write fails, so this is non-fatal — but silently
+        // discarding the error means a permissions/disk problem would
+        // re-prompt every future session with zero visibility into why.
+        if let Err(e) = hooks::save_consent(&self.hook_consent_path, &self.hook_consent) {
+            self.status = Some(format!(
+                "failed to save hook consent to disk: {e:#} (will re-prompt next run)"
+            ));
+        }
 
         if !accepted {
             if let Some(p) = self.pending.as_mut() {
@@ -1125,17 +1133,22 @@ impl DashboardModel {
         pending.freshly_created = !was_existing;
 
         if !was_existing {
-            let _ =
-                worktree::symlink_shared_dirs(&pending.repo_root, &path, &self.config.symlink_dirs);
-            if let Ok(failures) = worktreeinclude::apply_worktreeinclude(&pending.repo_root, &path)
-            {
-                for f in &failures {
-                    tracing::warn!(
-                        file = %f.path.display(),
-                        error = %f.error,
-                        "worktreeinclude: failed to copy file, continuing"
-                    );
-                }
+            // `?`, not `let _ =`/`if let Ok(..)` — matches main.rs's
+            // `finish_worktree_creation` fast path exactly: a hard failure in
+            // either call surfaces via `advance_pending`'s `Err(e) =>
+            // self.status = ...` branch instead of being silently discarded.
+            // Per-file copy failures inside a successful `apply_worktreeinclude`
+            // call remain non-fatal, logged as warnings — that's the
+            // deliberate continue-on-error behavior `worktreeinclude.rs`
+            // documents, not part of what this propagates.
+            worktree::symlink_shared_dirs(&pending.repo_root, &path, &self.config.symlink_dirs)?;
+            let failures = worktreeinclude::apply_worktreeinclude(&pending.repo_root, &path)?;
+            for f in &failures {
+                tracing::warn!(
+                    file = %f.path.display(),
+                    error = %f.error,
+                    "worktreeinclude: failed to copy file, continuing"
+                );
             }
         }
         Ok(())

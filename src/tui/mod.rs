@@ -69,9 +69,10 @@ pub trait Screen {
     /// widening this signature to `&mut self`.
     fn draw(&self, frame: &mut Frame);
 
-    /// Non-blocking poll for work that isn't a terminal event — currently
-    /// only the repo screen's background discovery thread. Default: no
-    /// background work, so most screens never override this.
+    /// Non-blocking poll for work that isn't a terminal event — the
+    /// dashboard's background threads (repo discovery, the one-shot worktree
+    /// scan, the reactive clone/pull thread). Default: no background work,
+    /// for a `Screen` implementor with none of these.
     fn poll_background(&mut self) -> Option<Msg> {
         None
     }
@@ -137,9 +138,10 @@ static PANIC_HOOK_INIT: Once = Once::new();
 /// Wraps the previous panic hook with one that restores the terminal first —
 /// a panic mid-render must never leave the user's shell in raw
 /// mode/alternate-screen. Installed at most once per process: `run()` is
-/// called twice per `cw` invocation in the common case (repo screen, then
-/// the worktree+agent screen), and re-wrapping on every call would nest an
-/// unbounded chain of hooks.
+/// called repeatedly per `cw` invocation — once initially, then again after
+/// every `dashboard.rs` suspend/resume round trip (running a hook, launching
+/// an agent) — and re-wrapping on every call would nest an unbounded chain
+/// of hooks.
 fn install_panic_hook() {
     PANIC_HOOK_INIT.call_once(|| {
         let previous = std::panic::take_hook();
