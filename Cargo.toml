@@ -45,15 +45,20 @@ git2 = { version = "0.21", features = ["https"] }
   # vendored-openssl on Linux — that's a separate, still-unresolved
   # question (system-openssl-missing contingency); this macOS fix is
   # narrower and doesn't touch it.
-skim = { version = "=5.6.5", default-features = false, features = ["frizbee"] }
-  # Exact pin — API churns fast across majors. Non-default features (Opus-audit-caught, F21):
-  # skim's *default* feature set pulls in a whole CLI stack cw never uses — clap_mangen,
-  # clap_complete_nushell, env_logger, image, ratatui-image, ron — on top of mandatory deps
-  # (tokio, portable-pty, ratatui, nix, mimalloc, which, shell-quote, roff). That inflates
-  # build time and blows past deny.toml's license allowlist (§9). `frizbee` is skim's fuzzy-
-  # match backend and the only default feature cw actually needs. Verify this trims correctly
-  # in the §6 step 2 spike — if `frizbee` alone doesn't build/behave right, fall back to full
-  # defaults and widen deny.toml's allowlist instead of fighting it further.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+  # `crossterm` is ratatui's own backend-integration feature — it re-exports the exact
+  # crossterm version ratatui was built against as `ratatui::crossterm`, so cw imports
+  # `ratatui::crossterm::{event, execute, terminal}` everywhere instead of adding a second,
+  # independently-versioned `crossterm` dependency (mismatched `KeyEvent`/`MouseEvent` types
+  # across two crossterm majors don't unify). `default-features = false` drops `all-widgets`/
+  # `widget-calendar` (extra widgets + a `time` dependency cw's Table-only UI never uses) —
+  # the base `Table`/`Paragraph`/`Block` widgets this crate actually renders aren't gated
+  # behind that feature.
+frizbee = "0.13"
+  # Fuzzy-match backend for the TUI's live filter box — skim's own matcher, verified usable
+  # standalone via its docs.rs API (`Matcher::new`/`match_list` return pre-sorted, pre-
+  # filtered `Match{score,index,exact}`), so the `nucleo-matcher` fallback noted in the design
+  # wasn't needed.
 ignore = "0.4"           # GitignoreBuilder for .worktreeinclude — same crate ripgrep uses, don't hand-roll
 chrono = { version = "0.4", features = ["serde"] }
   # `features = ["serde"]` is required, not optional (Opus-audit-caught, F8) — RepoCache{fetched_at:
