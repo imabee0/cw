@@ -11,9 +11,9 @@ ci = "github"
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 # Windows and Linux-arm64 deliberately excluded: cw has no Windows support
-# (skim/hooks/logging all assume Unix — /dev/tty, chmod +x, unix file modes)
-# and no known arm64 Linux users yet; cheap to add later since dist uses
-# native arm64 Linux runners, not cross-compilation.
+# (hooks/logging/the TUI backend all assume Unix — /dev/tty, chmod +x, unix
+# file modes) and no known arm64 Linux users yet; cheap to add later since
+# dist uses native arm64 Linux runners, not cross-compilation.
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"

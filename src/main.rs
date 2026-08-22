@@ -9,6 +9,7 @@ mod gitstatus;
 mod hooks;
 mod picker;
 mod sync;
+mod tui;
 mod worktree;
 mod worktreeinclude;
 
@@ -17,7 +18,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -106,9 +107,19 @@ fn init_logging() -> Result<WorkerGuard> {
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
+    // The stderr half of the tee is suppressed for the duration of any
+    // `tui::run` session (`tui::TUI_ACTIVE`): the TUI's `CrosstermBackend`
+    // renders straight to stderr (see `tui::mod`'s doc comment), so a
+    // `tracing::warn!`/`error!` firing mid-session would interleave raw log
+    // text with in-progress terminal escape codes and corrupt the frame.
+    // The file writer is never gated — every log line still reaches the
+    // day's log file regardless.
+    let gated_stderr =
+        io::stderr.with_filter(|_meta| !tui::TUI_ACTIVE.load(std::sync::atomic::Ordering::Relaxed));
+
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
-        .with_writer(io::stderr.and(file_writer))
+        .with_writer(gated_stderr.and(file_writer))
         .with_ansi(false)
         .without_time()
         .with_target(false)
@@ -229,19 +240,27 @@ fn resolve_agent_name(explicit: Option<&str>, config: &Config) -> Result<Option<
     }
 }
 
-/// §0a: with an explicit slug this is a pure pass-through. Otherwise, scan
-/// worktrees already belonging to `repo_label` — if any exist, offer a
-/// picker (existing worktrees + "+ new worktree"); only auto-generate a
-/// fresh timestamp slug when none exist yet, or the user explicitly picks
-/// "new". `Ok(None)` means the user cancelled the picker.
-fn determine_slug(
-    explicit: Option<&str>,
+/// §0a combined with agent resolution (per the TUI redesign's "Worktree
+/// (+agent) screen": a picker that offers existing worktrees + "+ new
+/// worktree" also resolves the agent inline, in the same screen, when one
+/// still needs picking).
+///
+/// With an explicit slug, or no worktrees yet for `repo_label`, there is no
+/// worktree *choice* to make — `pick_worktree_and_agent` never fires, and
+/// agent resolution is the same independent `resolve_agent_name` step it
+/// always was (falling back to the standalone `picker::pick_agent` only if
+/// still needed). Only when a real "pick an existing worktree, or start a
+/// new one" choice exists does one TUI screen resolve both together.
+/// `Ok(None)` means the user cancelled whichever picker fired.
+fn determine_slug_and_agent(
+    explicit_slug: Option<&str>,
+    explicit_agent: Option<&str>,
     root: &Path,
     repo_label: &str,
     config: &Config,
-) -> Result<Option<String>> {
-    if let Some(s) = explicit {
-        return Ok(Some(s.to_string()));
+) -> Result<Option<(String, String)>> {
+    if let Some(s) = explicit_slug {
+        return Ok(resolve_agent_name(explicit_agent, config)?.map(|a| (s.to_string(), a)));
     }
 
     let same_repo: Vec<worktree::WorktreeEntry> = worktree::scan_worktrees(root)?
@@ -249,28 +268,55 @@ fn determine_slug(
         .filter(|e| e.repo == repo_label)
         .collect();
     if same_repo.is_empty() {
-        return Ok(Some(generate_timestamp_slug()));
+        return Ok(
+            resolve_agent_name(explicit_agent, config)?.map(|a| (generate_timestamp_slug(), a))
+        );
     }
 
-    match picker::pick_worktree(same_repo, config.idle_threshold_days, true)? {
-        picker::Pick::Selected(picker::WorktreeSelection::Existing(entry)) => {
+    let agent_needed = agent_picker_needed(explicit_agent, config);
+    match picker::pick_worktree_and_agent(
+        same_repo,
+        config.idle_threshold_days,
+        true,
+        &config.agents,
+        agent_needed,
+    )? {
+        picker::Pick::Selected((picker::WorktreeSelection::Existing(entry), agent)) => {
             // MUST unflatten here: `entry.slug` is the on-disk (flattened)
             // directory name, and the caller passes this straight to
             // `create_or_resume_worktree`, whose first step
             // (`validate_worktree_slug`) rejects a literal '+'. Regression
             // test: `tests::resumed_slug_survives_scan_and_unflatten_round_trip`
             // — that test exercises `unflatten_slug` directly, not this match
-            // arm (which requires a TTY to reach via `pick_worktree`), so it
-            // will NOT catch a revert of this line back to `entry.slug` alone.
-            Ok(Some(unflatten_slug(&entry.slug)))
+            // arm (which requires a TTY to reach via `pick_worktree_and_agent`),
+            // so it will NOT catch a revert of this line back to `entry.slug`
+            // alone.
+            let slug = unflatten_slug(&entry.slug);
+            Ok(agent_from_pick_or_resolve(agent, explicit_agent, config)?.map(|a| (slug, a)))
         }
-        picker::Pick::Selected(picker::WorktreeSelection::New) => {
-            Ok(Some(generate_timestamp_slug()))
+        picker::Pick::Selected((picker::WorktreeSelection::New, agent)) => {
+            Ok(agent_from_pick_or_resolve(agent, explicit_agent, config)?
+                .map(|a| (generate_timestamp_slug(), a)))
         }
-        picker::Pick::Empty => {
-            unreachable!("pick_worktree is only called here with a non-empty `same_repo` list")
-        }
+        picker::Pick::Empty => unreachable!(
+            "pick_worktree_and_agent is only called here with a non-empty `same_repo` list"
+        ),
         picker::Pick::Cancelled => Ok(None),
+    }
+}
+
+/// Fills in the agent name when `pick_worktree_and_agent`'s agent sub-panel
+/// never opened (`agent: None` — `agent_needed` was `false`, meaning
+/// `resolve_agent_name` below takes its own no-picker fast path and never
+/// invokes `picker::pick_agent` a second time).
+fn agent_from_pick_or_resolve(
+    agent: Option<String>,
+    explicit_agent: Option<&str>,
+    config: &Config,
+) -> Result<Option<String>> {
+    match agent {
+        Some(a) => Ok(Some(a)),
+        None => resolve_agent_name(explicit_agent, config),
     }
 }
 
@@ -439,30 +485,88 @@ fn report_pull_outcome(repo_label: &str, outcome: sync::PullOutcome) {
     }
 }
 
-fn pick_repo_interactive(cli: &Cli, config: &Config) -> Result<picker::Pick<github::Repo>> {
+/// Opens the repo screen immediately against whatever's cached (`initial`,
+/// possibly empty on a cold cache) while a background thread runs the real
+/// `cache::refresh_if_needed` + `github::discover_repos` fetch and streams
+/// the result back — the fetch no longer blocks before any picker window
+/// appears (Screens: "Repo screen"). Per-org discovery warnings and a
+/// stale-cache notice route into `tui::RepoLoad` instead of
+/// `tracing::warn!`/`eprintln!`, which would otherwise corrupt an
+/// in-progress frame (Rendering conflicts) — both are only ever emitted from
+/// inside this thread now, replacing the old synchronous version's direct
+/// logging entirely.
+fn pick_repo_interactive(
+    cli: &Cli,
+    config: &Config,
+    root: &Path,
+) -> Result<picker::Pick<github::Repo>> {
+    // Checked here, before spawning the fetch thread, so a non-interactive
+    // environment (e.g. a piped/no-TTY invocation missing `--repo`) fails
+    // fast without ever starting a `gh` subprocess in the background —
+    // `picker::pick_repo` re-checks this itself too (every `pick_*`
+    // function is self-contained about its own precondition), but that
+    // second check would only fire after the thread below is already
+    // running.
+    if !picker::is_interactive() {
+        return Err(anyhow!(
+            "no interactive terminal available to pick a repo — pass --repo OWNER/NAME instead"
+        ));
+    }
+
     let cache_path = config::cache_path()?;
+    let initial = cache::load(&cache_path)?
+        .map(|c| c.sorted_repos())
+        .unwrap_or_default();
+
     let org_filter = cli.org.clone();
-    let (repos, outcome) =
-        cache::refresh_if_needed(&cache_path, config.cache_ttl_minutes, cli.refresh, || {
-            let result = github::discover_repos(&org_filter)?;
-            for w in &result.warnings {
-                tracing::warn!("{w}");
+    let ttl = config.cache_ttl_minutes;
+    let force_refresh = cli.refresh;
+    let thread_cache_path = cache_path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let result = cache::refresh_if_needed(&thread_cache_path, ttl, force_refresh, || {
+            let discovered = github::discover_repos(&org_filter)?;
+            *warnings.borrow_mut() = discovered.warnings;
+            Ok(discovered.repos)
+        });
+
+        let load = match result {
+            Ok((repos, outcome)) => {
+                // `sorted_repos()` does the most-recent-first ordering
+                // (§5a/§5k) — reuse it here rather than re-sorting inline,
+                // `fetched_at` is irrelevant to that method and only needed
+                // to satisfy the struct's shape.
+                let repos = cache::RepoCache {
+                    repos,
+                    fetched_at: chrono::Utc::now(),
+                }
+                .sorted_repos();
+                let stale_warning = match outcome {
+                    cache::RefreshOutcome::Stale { warning } => Some(warning),
+                    cache::RefreshOutcome::Cached | cache::RefreshOutcome::Fresh => None,
+                };
+                tui::RepoLoad {
+                    repos,
+                    warnings: warnings.into_inner(),
+                    stale_warning,
+                }
             }
-            Ok(result.repos)
-        })?;
-    match &outcome {
-        cache::RefreshOutcome::Cached | cache::RefreshOutcome::Fresh => {}
-        cache::RefreshOutcome::Stale { warning } => eprintln!("warning: {warning}"),
-    }
-    // `sorted_repos()` does the most-recent-first ordering (§5a/§5k) — reuse
-    // it here rather than re-sorting inline, `fetched_at` is irrelevant to
-    // that method and only needed to satisfy the struct's shape.
-    let repos = cache::RepoCache {
-        repos,
-        fetched_at: chrono::Utc::now(),
-    }
-    .sorted_repos();
-    picker::pick_repo(repos)
+            // No usable cache and the live fetch failed outright — shown in
+            // the screen's status line rather than propagated as a hard
+            // process error, since by this point the TUI already owns the
+            // screen (possibly with an empty "loading…" list) on a
+            // background thread with no way to report back through `?`.
+            Err(e) => tui::RepoLoad {
+                repos: Vec::new(),
+                warnings: Vec::new(),
+                stale_warning: Some(format!("repo discovery failed: {e:#}")),
+            },
+        };
+        let _ = tx.send(load);
+    });
+
+    picker::pick_repo(root, initial, rx)
 }
 
 fn run_default(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
@@ -473,7 +577,7 @@ fn run_default(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
     let repo_choice = if let Some(spec) = &cli.repo {
         parse_owner_repo(spec)?
     } else {
-        match pick_repo_interactive(cli, config)? {
+        match pick_repo_interactive(cli, config, root)? {
             picker::Pick::Selected(r) => r,
             picker::Pick::Empty | picker::Pick::Cancelled => return Ok(()),
         }
@@ -484,12 +588,14 @@ fn run_default(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
         sync::clone_or_pull(root, &repo_choice.owner, &repo_choice.name, !cli.no_pull)?;
     report_pull_outcome(&repo_label, pull_outcome);
 
-    let Some(slug) = determine_slug(cli.slug.as_deref(), root, &repo_label, config)? else {
-        println!("cancelled");
-        return Ok(());
-    };
-
-    let Some(agent_name) = resolve_agent_name(cli.agent.as_deref(), config)? else {
+    let Some((slug, agent_name)) = determine_slug_and_agent(
+        cli.slug.as_deref(),
+        cli.agent.as_deref(),
+        root,
+        &repo_label,
+        config,
+    )?
+    else {
         println!("cancelled");
         return Ok(());
     };
@@ -605,18 +711,22 @@ fn print_create_hook_preview(hook: &Option<String>, repo_root: &Path) {
 
 fn run_resume(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
     let entries = worktree::scan_worktrees(root)?;
-    let selection = match picker::pick_worktree(entries, config.idle_threshold_days, false)? {
-        picker::Pick::Selected(s) => s,
+    let agent_needed = agent_picker_needed(cli.agent.as_deref(), config);
+    let (entry, agent) = match picker::pick_worktree_and_agent(
+        entries,
+        config.idle_threshold_days,
+        false,
+        &config.agents,
+        agent_needed,
+    )? {
+        picker::Pick::Selected((picker::WorktreeSelection::Existing(e), agent)) => (e, agent),
+        picker::Pick::Selected((picker::WorktreeSelection::New, _)) => {
+            unreachable!("pick_worktree_and_agent(include_new=false) never returns New")
+        }
         picker::Pick::Empty | picker::Pick::Cancelled => return Ok(()),
     };
-    let entry = match selection {
-        picker::WorktreeSelection::Existing(e) => e,
-        picker::WorktreeSelection::New => {
-            unreachable!("pick_worktree(include_new=false) never returns New")
-        }
-    };
 
-    let Some(agent_name) = resolve_agent_name(cli.agent.as_deref(), config)? else {
+    let Some(agent_name) = agent_from_pick_or_resolve(agent, cli.agent.as_deref(), config)? else {
         println!("cancelled");
         return Ok(());
     };
@@ -640,12 +750,14 @@ fn run_scratch(
         .with_context(|| format!("opening scratch repo at {}", repo_root.display()))?;
     let repo_label = format!("{}/{}", worktree::SCRATCH_OWNER, worktree::SCRATCH_REPO);
 
-    let Some(slug) = determine_slug(slug.as_deref(), root, &repo_label, config)? else {
-        println!("cancelled");
-        return Ok(());
-    };
-
-    let Some(agent_name) = resolve_agent_name(cli.agent.as_deref(), config)? else {
+    let Some((slug, agent_name)) = determine_slug_and_agent(
+        slug.as_deref(),
+        cli.agent.as_deref(),
+        root,
+        &repo_label,
+        config,
+    )?
+    else {
         println!("cancelled");
         return Ok(());
     };

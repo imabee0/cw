@@ -341,6 +341,19 @@ pub fn symlink_shared_dirs(repo_root: &Path, worktree_path: &Path, dirs: &[Strin
 pub const SCRATCH_OWNER: &str = ".scratch";
 pub const SCRATCH_REPO: &str = "workspace";
 
+/// `.scratch/workspace` displays as `scratch` — display-label only, never
+/// affects the underlying repo/slug values `remove_worktree`/
+/// `create_or_resume_worktree` operate on. Shared by every worktree-table
+/// renderer (`tui::model`'s repo/worktree screens) so the mapping exists in
+/// exactly one place.
+pub fn display_repo_label(repo: &str) -> String {
+    if repo == format!("{SCRATCH_OWNER}/{SCRATCH_REPO}") {
+        "scratch".to_string()
+    } else {
+        repo.to_string()
+    }
+}
+
 /// `cw scratch` — repo-less worktrees, reusing the existing worktree
 /// machinery unchanged. Lazily creates a synthetic repo at
 /// `<root>/.scratch/workspace` with one empty commit (so
@@ -380,6 +393,12 @@ pub fn ensure_scratch_repo(root: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_repo_label_maps_scratch() {
+        assert_eq!(display_repo_label(".scratch/workspace"), "scratch");
+        assert_eq!(display_repo_label("imabee0/cw"), "imabee0/cw");
+    }
 
     /// Inits a non-bare repo at `path` with one commit on its default
     /// branch, so `create_worktree`'s `find_reference("HEAD")?.peel_to_commit()`
