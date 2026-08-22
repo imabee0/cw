@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/imabee0/cw/compare/v0.1.6...v0.1.7) - 2026-08-22
+
+### Fixed
+
+- stop release-plz cascade and wire release-verify to fire ([#15](https://github.com/imabee0/cw/pull/15))
+
 ## [0.1.6](https://github.com/imabee0/cw/compare/v0.1.5...v0.1.6) - 2026-08-22
 
 ### Added
