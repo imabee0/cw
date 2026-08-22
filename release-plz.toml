@@ -4,3 +4,9 @@ git_release_enable = false
 git_tag_enable = true
 changelog_update = true
 semver_check = false
+# publish = false alone leaves release-plz's "is this version already out?"
+# check pointed at the crates.io registry, where this unpublished package
+# always looks unreleased, so it re-proposes a bump on every push to main
+# regardless of new commits. git_only=true switches that check to the git
+# tags this workflow actually creates. https://release-plz.dev/docs/config#the-git_only-field
+git_only = true

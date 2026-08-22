@@ -7,9 +7,20 @@ name: release-verify
 # before a user ever saw it -- checksum + attestation alone only prove the
 # archive is authentic and untampered, not that the binary inside it works,
 # so every OS in the matrix actually extracts and executes it.
+#
+# Triggered on the Release workflow's completion, not `on: release: types:
+# [published]`: release.yml's cargo-dist "host" job creates the GitHub
+# Release using the default GITHUB_TOKEN, and GitHub's anti-recursion rule
+# means a GITHUB_TOKEN-authored event never fires other workflows' `release`
+# listeners. release.yml's own trigger is `push: tags:
+# '**[0-9]+.[0-9]+.[0-9]+*'` with no other event, so head_branch on its
+# completed run is always the pushed tag name, never an actual branch --
+# GitHub's workflow_run payload reuses head_branch to carry the triggering
+# ref name for both branch and tag pushes.
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -22,6 +33,7 @@ permissions:
 
 jobs:
   verify:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     name: verify (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -41,7 +53,7 @@ jobs:
       attestations: read  # gh attestation verify
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+      TAG: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.tag }}
       ASSET: cw-${{ matrix.target }}.tar.xz
     steps:
       - name: Download release asset + checksum

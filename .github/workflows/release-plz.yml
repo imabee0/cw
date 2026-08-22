@@ -50,8 +50,14 @@ jobs:
 
   # Opens or updates the version-bump PR from unreleased conventional
   # commits, then arms auto-merge on it so it lands itself once CI passes.
+  #
+  # needs: release -- without this, GitHub starts both jobs together and
+  # this job's checkout can complete before `release`'s tag push lands, so
+  # it anchors on the stale prior tag and misclassifies the already-released
+  # commit as new, unreleased work (confirmed via run logs, v0.1.2 cascade).
   release-pr:
     name: Release PR
+    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: write
