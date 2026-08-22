@@ -110,4 +110,20 @@ mod tests {
         let none = filter_indices(&items, |s| s, "zzz-nomatch-zzz");
         assert!(none.is_empty());
     }
+
+    #[test]
+    fn filter_indices_matches_noncontiguous_subsequence() {
+        // Pins frizbee::Config::default() to actual fuzzy (subsequence)
+        // matching, not plain substring matching — "orc" has no contiguous
+        // occurrence in "owner/repo-cw" but is a subsequence of it. This is
+        // the entire UX skim provided; a config change that narrows it to
+        // substring-only would pass every other test here silently.
+        let items = vec!["owner/repo-cw"];
+        let hits = filter_indices(&items, |s| s, "orc");
+        assert_eq!(
+            hits,
+            vec![0],
+            "must match a non-contiguous subsequence, not just a substring"
+        );
+    }
 }
