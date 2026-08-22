@@ -65,6 +65,7 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 - Config/cache paths are fixed at `~/.config/cw/config.toml` and `~/.cache/cw/{repos.json,cw.log.*}` on both macOS and Linux — not `directories::ProjectDirs`, deliberately, to avoid diverging per platform.
 - `cw` shells out to `gh` for all GitHub API access (repo/org listing, clone auth) — `gh auth status` must be green; `cw doctor` checks this.
 - **A mouse click in `tui` only ever focuses a row (`TableState::select`), never activates it** — outside multi-select mode a click and a keyboard arrow key are the same operation, both funneling through Enter to actually commit. `tui::update`'s mouse handlers never return an `Outcome` from a `MouseEventKind::Down`; only multi-select mode additionally toggles a checkbox on click (still not a commit — `d` is).
+- **Any single-char key binding that doubles as filter text must be gated on `model.list.query.is_empty()`**, same as `q`-quit — `d` (multi-select delete, `tui/update.rs`) is gated this way because an ungated destructive binding is worse than an ungated quit. `j`/`k` are the deliberate exception: always navigation, never typable, so they're never gated.
 
 ## Standards exceptions
 
