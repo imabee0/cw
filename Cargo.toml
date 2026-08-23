@@ -1,6 +1,6 @@
 [package]
 name = "cw"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"   # `cargo init` on rustc 1.95 defaults to 2024 — scaffold agent must explicitly set this, not assume it (Opus-audit-caught, F39)
 license = "MIT"
 repository = "https://github.com/imabee0/cw"
