@@ -1,6 +1,6 @@
 # cw
 
-Rust CLI: fuzzy-pick a GitHub repo (personal + every org, most-recent-first), clone/pull it, create-or-resume a git worktree, launch an agent CLI inside it. Full design in `~/.claude/plans/cw-rust-shiny-frog.md` — read it before any non-trivial change, it is the source of truth for every decision below.
+Rust CLI: fuzzy-pick a GitHub repo (personal + every org, most-recent-first), clone/pull it, create-or-resume a git worktree, launch an agent CLI inside it.
 
 ## Commands
 
@@ -14,7 +14,7 @@ cw completions zsh                   # source only after `autoload -U compinit &
 cw --repo OWNER/NAME --root PATH --dry-run SLUG   # only non-interactive way to preview clone/pull + worktree + agent decision with zero mutation
 ```
 
-`cargo test` alone does not need `cargo deny`; `scripts/check.sh` is the full local gate CI mirrors (§9 of the plan).
+`cargo test` alone does not need `cargo deny`; `scripts/check.sh` is the full local gate CI mirrors.
 
 ## File map
 
@@ -30,7 +30,7 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 | `dashboard.rs` | the single `tui::run()` entry point: builds the initial `DashboardModel` per `Entry` (bare `cw`/`resume`/`clean`/`scratch`), spawns every background thread (repo discovery, one-shot worktree scan, the reactive clone/pull thread), and drives the suspend/resume loop around hook runs and agent launches |
 | `tui/mod.rs` | `Screen` trait, `run()` event loop returning `(Screen, Outcome)` so a screen survives a suspend/resume round trip, terminal lifecycle (raw mode/alt screen/mouse capture on stderr), panic-hook restore, `TUI_ACTIVE`, `is_interactive()` |
 | `tui/msg.rs` | `Msg` enum, `RepoLoad`/`WorktreesLoad`/`CloneOutcome` (background-thread results) |
-| `tui/model.rs` | `DashboardModel` (composite split-pane state: repo pane, worktree pane, agent footer, delete-mode, the clone/hook/create/launch `PendingLaunch` pipeline), shared `ListState<T>`, idle/relative-time formatting |
+| `tui/model.rs` | `DashboardModel` (composite split-pane state: repo pane, worktree pane, agent footer, the checked-for-removal set, the clone/hook/create/launch `PendingLaunch` pipeline), shared `ListState<T>`, idle/relative-time formatting |
 | `tui/update.rs` | pure `update_dashboard` — terminal-free, unit tested directly |
 | `tui/view.rs` | pure `draw_dashboard` — `ratatui::widgets::Table`/`Paragraph` split-pane rendering |
 | `tui/event.rs` | crossterm event polling + tick cadence |
@@ -43,6 +43,7 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 | `agent.rs` | launches the resolved agent CLI in the worktree, distinguishes exit outcomes |
 | `clean.rs` | `cw clean`: thin `dashboard::run(Entry::Clean)` entry point; `remove_one` (git2 prune + branch delete), shared with the dashboard's in-TUI delete flow |
 | `doctor.rs` | `cw doctor`: gh auth, credential helper, terminal, each configured agent on PATH |
+| `selfupdate.rs` | background self-update check (`spawn_check`) + apply (`apply_update`, the dashboard's `u` key), also backing `cw doctor`'s stale-binary diagnostic; every failure (no install receipt, offline, rate-limited) degrades silently, never an error |
 
 ## Conventions
 
@@ -55,7 +56,7 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 
 - **Worktree/branch naming exactly mirrors Claude Code's own scheme** (`flatten_slug`, `.claude/worktrees/<flat>`, branch `worktree-<flat>`) — required for interop with `EnterWorktree`/subagent tooling. Do not change this shape without checking `worktree.ts` first.
 - **`cw` always creates worktrees itself** via git2, never shells out to the agent CLI's own worktree flag — this is what makes resume/clean work identically across every configured agent.
-- **`create_or_resume_worktree`** appends `/.claude/worktrees/` to the cloned repo's `.git/info/exclude` on first create — removing this reopens a dirty-tree false-positive that silently blocks every future pull on that repo (plan §5d, the single most consequential fix in the design).
+- **`create_or_resume_worktree`** appends `/.claude/worktrees/` to the cloned repo's `.git/info/exclude` on first create — removing this reopens a dirty-tree false-positive that silently blocks every future pull on that repo.
 - **Hooks (`post_clone_hook`/`post_create_hook`) default to unset.** They execute code the cloned repo supplies, not code the user wrote — never flip either default on, never skip the confirm-once-per-repo consent gate in `hooks.rs`.
 - **`gh repo list` must always carry `--limit 1000`** (`github.rs::repo_list_args`) — `gh`'s own default of 30 silently truncates discovery.
 - **`--org` only takes effect on a cache miss or with `--refresh`** — `dashboard.rs`'s `spawn_repo_thread` serves a warm `repos.json` (age < `cache_ttl_minutes`) before the org-filter closure ever runs, so `--org` alone against a warm cache silently returns the unfiltered full list. Pair it with `--refresh` when testing or scripting against a specific org.
@@ -64,10 +65,14 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 - **`tracing_appender`'s `WorkerGuard` must stay a named local bound in `main()`** — dropping it early silently loses buffered log lines.
 - Config/cache paths are fixed at `~/.config/cw/config.toml` and `~/.cache/cw/{repos.json,cw.log.*}` on both macOS and Linux — not `directories::ProjectDirs`, deliberately, to avoid diverging per platform.
 - `cw` shells out to `gh` for all GitHub API access (repo/org listing, clone auth) — `gh auth status` must be green; `cw doctor` checks this.
-- **A mouse click in `tui` only ever focuses a row (`TableState::select`), never activates it** — outside delete-mode a click and a keyboard arrow key are the same operation, both funneling through Enter to actually commit. `tui::update`'s mouse handlers never return an `Outcome` from a `MouseEventKind::Down`; only delete-mode additionally toggles a checkbox on click (still not a commit — `d` is).
-- **Any single-char key binding that doubles as filter text must be gated on the *focused pane's* `query.is_empty()`**, same as `q`-quit — `d` (delete-mode toggle/confirm, `tui/update.rs`) is gated this way because an ungated destructive binding is worse than an ungated quit. Each pane (`Scope::Browse`'s repo `ListState`, the worktree `ListState`) owns its own query, and gating always checks whichever pane `DashboardModel::focus` currently points at, never a single global query. `j`/`k` are the deliberate exception: always navigation, never typable, so they're never gated.
+- **`RELEASE_PLZ_TOKEN` (a PAT, not the default `GITHUB_TOKEN`) backs every `release-plz` step in `release-plz.yml`** — GitHub's anti-recursion rule means a tag push or PR authored with the default `GITHUB_TOKEN` never triggers other workflows' listeners, so without it `release.yml`'s tag-push trigger and the release PR's own CI checks would silently never fire.
+- **`release-plz.toml` sets `git_release_enable = false`** — `release.yml`'s cargo-dist host job already creates the GitHub Release for each tag; two creators racing on the same release would duplicate or fail it.
+- **`release-verify.yml` is a separate workflow file, not folded into `release.yml`** — `release.yml` is cargo-dist-generated (`dist generate`) and must never be hand-edited; it triggers on the Release workflow's completion instead.
+- **Self-update degrades completely silently when no install receipt is present** — a `cargo install --path .` (from-source) build has no `~/.config/cw/cw-receipt.json`, so `selfupdate`'s check and apply fail quietly to a `tracing::debug!` line and the dashboard's `u` key never activates; by design, not a bug, but a from-source install never learns about updates.
+- **A mouse click in `tui` only ever focuses a row (`TableState::select`), never activates or marks it** — a click and a keyboard arrow key are the same operation, both funneling through Enter to commit and Space to mark. `tui::update`'s mouse handlers never return an `Outcome` from a `MouseEventKind::Down`.
+- **Any single-char key binding that doubles as filter text must be gated on the *focused pane's* `query.is_empty()`**, same as `q`-quit. There is no delete-mode toggle: `Space` always marks/unmarks the focused worktree row and never types (`toggle_checked_focused`), and `d` always opens the removal confirm for the checked set, or the focused row alone when nothing is checked — both gated in `tui/update.rs` because an ungated destructive binding is worse than an ungated quit. `r` (rescan) and `u` (apply a pending self-update) are gated the same way. Each pane (repo `ListState`, worktree `ListState`) owns its own query, and gating always checks whichever pane `DashboardModel::focus` currently points at, never a single global query. `j`/`k` are the deliberate exception: always navigation, never typable, so they're never gated.
 
 ## Standards exceptions
 
-- **This repo's own source is hosted on GitHub** (`imabee0/cw`, public, ruleset + auto-merge on `main`) instead of the house Gitea-only default (global CLAUDE.md § Structure and forge). Explicit, repeated user direction for this one project — see plan §0's "GitHub via `gh`" and "CI/CD + merge policy" rows for the full decision record. Do not migrate this to Gitea without the same explicit direction.
+- **This repo's own source is hosted on GitHub** (`imabee0/cw`, public, ruleset + auto-merge on `main`) instead of the house Gitea-only default (global CLAUDE.md § Structure and forge). Explicit, repeated user direction for this one project. Do not migrate this to Gitea without the same explicit direction.
 - **`.github/workflows/release.yml` is generated and owned by `cargo-dist`** (`dist generate`, config in `dist-workspace.toml`) — do not hand-edit it; change `dist-workspace.toml` and regenerate. It's exempt from `ci.yml`'s manual SHA-pin-with-`# vX.Y.Z`-comment convention: dist 0.32.0's generated output pins its four `actions/*` steps (`checkout`, `upload-artifact`, `download-artifact`, `attest`) to floating major-version tags (`@v6`/`@v7`/`@v8`/`@v4`), not commit SHAs — confirmed by inspecting the actual generated file, not assumed from dist's docs. Accepted rather than hand-patched because (a) all four are first-party `actions/*`, the lower-risk category the SHA-pinning policy exists to distinguish from third-party actions like `dtolnay/rust-toolchain`, and (b) hand-patched pins would be silently lost on every `dist generate`. `dist` has no config flag for this (checked `dist generate --help`); revisit if a future dist version adds one.
