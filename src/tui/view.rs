@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table};
@@ -45,7 +45,7 @@ pub fn draw_dashboard(frame: &mut Frame, model: &DashboardModel) {
     frame.render_widget(Paragraph::new(title()), title_area);
     frame.render_widget(filter_line(model), filter_area);
     draw_body(frame, model, body_area);
-    frame.render_widget(agent_bar(model), agent_area);
+    draw_agent_bar(frame, model, agent_area);
     frame.render_widget(Paragraph::new(status_line(model)), status_area);
 
     if let Some(modal) = &model.modal {
@@ -281,6 +281,31 @@ fn build_worktree_row<'a>(
         cells.insert(0, Span::styled(mark, row_style));
     }
     Row::new(cells)
+}
+
+/// Splits the agent-footer row so a pending self-update gets its own
+/// right-aligned yellow segment alongside the agent selector, instead of
+/// competing with it for the same `Paragraph`'s single alignment.
+fn draw_agent_bar(frame: &mut Frame, model: &DashboardModel, area: Rect) {
+    let Some(version) = &model.update_available else {
+        frame.render_widget(agent_bar(model), area);
+        return;
+    };
+    let text = format!("update available: {version} — press u");
+    // `.chars().count()`, not `.len()` — the em dash is 3 UTF-8 bytes but
+    // one rendered column; byte length would over-reserve the segment's
+    // width by 2 columns.
+    let width = text.chars().count() as u16;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(width)])
+        .split(area);
+    frame.render_widget(agent_bar(model), cols[0]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(text, Style::default().fg(Color::Yellow)))
+            .alignment(Alignment::Right),
+        cols[1],
+    );
 }
 
 fn agent_bar(model: &DashboardModel) -> Paragraph<'_> {

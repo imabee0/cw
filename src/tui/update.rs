@@ -10,7 +10,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use super::model::{DashboardModel, DashboardOutcome, Focus, Modal};
+use super::model::{DashboardModel, DashboardOutcome, Focus, Modal, SuspendReq};
 use super::msg::Msg;
 use super::widgets;
 
@@ -46,6 +46,10 @@ pub fn update_dashboard(model: &mut DashboardModel, msg: Msg) -> Option<Dashboar
         Msg::CloneDone(result) => model.apply_clone_done(result),
         Msg::DirtyRefreshed(path, result) => {
             model.apply_dirty_refresh(path, result);
+            None
+        }
+        Msg::UpdateChecked(pending) => {
+            model.apply_update_checked(pending);
             None
         }
     }
@@ -132,6 +136,13 @@ fn handle_pane_key(model: &mut DashboardModel, key: KeyEvent) -> Option<Dashboar
         KeyCode::Char('r') if model.focus == Focus::Worktrees && focused_query_empty(model) => {
             model.rescan_requested = true;
             None
+        }
+        // Same query-gating discipline as `d`/`r` above. Additionally only
+        // live once a background check has actually found something pending
+        // (`model.update_available`) — otherwise 'u' is just filter text,
+        // same as any other letter with nothing bound to it.
+        KeyCode::Char('u') if focused_query_empty(model) && model.update_available.is_some() => {
+            Some(DashboardOutcome::Suspend(SuspendReq::ApplyUpdate))
         }
         KeyCode::Up => {
             move_focused(model, -1);
@@ -791,6 +802,60 @@ mod tests {
         assert!(
             model.modal.is_none(),
             "a gated 'd' must not open the confirm modal"
+        );
+    }
+
+    // --- Self-update: Msg::UpdateChecked and the `u` key ------------------
+
+    #[test]
+    fn update_checked_msg_sets_and_clears_update_available() {
+        let mut model = all_worktrees_model(vec![]);
+        assert_eq!(model.update_available, None);
+
+        update_dashboard(&mut model, Msg::UpdateChecked(Some("9.9.9".to_string())));
+        assert_eq!(model.update_available, Some("9.9.9".to_string()));
+
+        update_dashboard(&mut model, Msg::UpdateChecked(None));
+        assert_eq!(model.update_available, None);
+    }
+
+    #[test]
+    fn u_is_a_no_op_without_a_pending_update() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        assert!(model.update_available.is_none());
+
+        assert!(update_dashboard(&mut model, key(KeyCode::Char('u'))).is_none());
+        assert_eq!(
+            model.worktrees.query, "u",
+            "with nothing pending, 'u' must just be ordinary filter text"
+        );
+    }
+
+    #[test]
+    fn u_suspends_to_apply_update_when_one_is_pending() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        model.apply_update_checked(Some("9.9.9".to_string()));
+
+        match update_dashboard(&mut model, key(KeyCode::Char('u'))) {
+            Some(DashboardOutcome::Suspend(super::super::model::SuspendReq::ApplyUpdate)) => {}
+            other => panic!(
+                "'u' with a pending update must suspend into ApplyUpdate, got {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn u_gated_on_active_filter_types_instead_of_suspending() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        model.apply_update_checked(Some("9.9.9".to_string()));
+        model.worktrees.query.push_str("ab");
+        model.worktrees.refilter(|r| r.filter_text.as_str());
+
+        assert!(update_dashboard(&mut model, key(KeyCode::Char('u'))).is_none());
+        assert_eq!(
+            model.worktrees.query, "abu",
+            "'u' with an active filter must type into the query, not suspend"
         );
     }
 

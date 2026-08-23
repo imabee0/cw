@@ -27,6 +27,7 @@ use crate::config::{self, Config};
 use crate::github;
 use crate::gitstatus;
 use crate::hooks;
+use crate::selfupdate;
 use crate::sync::{self, CloneStdio};
 use crate::tui::model::{DashboardModel, DashboardOutcome, Stage, SuspendReq};
 use crate::tui::msg::{CloneOutcome, WorktreesLoad};
@@ -93,7 +94,18 @@ pub fn run(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result<()> 
         screen = returned;
         match outcome {
             DashboardOutcome::Cancelled => return Ok(()),
-            DashboardOutcome::Suspend(req) => run_suspend_chain(&mut screen, req)?,
+            DashboardOutcome::Suspend(req) => {
+                // `true` means the chain ended in `ApplyUpdate`: the process
+                // is meant to end here (a freshly-installed binary is on
+                // disk, the running one is stale), so this returns straight
+                // out to `main` instead of looping back into `tui::run` —
+                // deliberately not a raw `std::process::exit` here, which
+                // would skip `main`'s `WorkerGuard` drop and lose any
+                // buffered log lines (CLAUDE.md's §5m invariant).
+                if run_suspend_chain(&mut screen, req)? {
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -102,9 +114,10 @@ pub fn run(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result<()> 
 /// immediately chains into (e.g. a clone-hook decline that lands straight on
 /// a create-hook checkpoint with its own consent already on file) — without
 /// re-entering `tui::run()` in between, since none of that needs the
-/// terminal back. Only `LaunchAgent` is ever terminal in this chain: it's
-/// always the pipeline's last stage.
-fn run_suspend_chain(screen: &mut DashboardScreen, mut req: SuspendReq) -> Result<()> {
+/// terminal back. `LaunchAgent`/`ApplyUpdate` are the only terminal stages
+/// in this chain. Returns whether the whole dashboard session should end
+/// now (`ApplyUpdate` only) rather than resume `tui::run`.
+fn run_suspend_chain(screen: &mut DashboardScreen, mut req: SuspendReq) -> Result<bool> {
     loop {
         match req {
             SuspendReq::RunHook {
@@ -118,7 +131,7 @@ fn run_suspend_chain(screen: &mut DashboardScreen, mut req: SuspendReq) -> Resul
                     .map_err(|e| format!("{e:#}"));
                 match screen.model.resume_after_hook(kind, result) {
                     Some(DashboardOutcome::Suspend(next)) => req = next,
-                    _ => return Ok(()),
+                    _ => return Ok(false),
                 }
             }
             SuspendReq::LaunchAgent {
@@ -138,7 +151,16 @@ fn run_suspend_chain(screen: &mut DashboardScreen, mut req: SuspendReq) -> Resul
                     Msg::DirtyRefreshed(worktree_path.clone(), dirty),
                 );
                 screen.model.resume_after_launch();
-                return result;
+                result?;
+                return Ok(false);
+            }
+            SuspendReq::ApplyUpdate => {
+                if selfupdate::apply_update()? {
+                    println!("cw has been updated — restart it to use the new version.");
+                } else {
+                    println!("cw is already up to date — no update was applied.");
+                }
+                return Ok(true);
             }
         }
     }
@@ -162,6 +184,11 @@ struct DashboardScreen {
     /// reused.
     worktrees_rx: Option<mpsc::Receiver<Result<WorktreesLoad, String>>>,
     clone_rx: Option<mpsc::Receiver<Result<CloneOutcome, String>>>,
+    /// One-shot, like `repo_rx` — never reset to `None` after yielding (see
+    /// `Screen::update`'s comment on `clone_rx`/`worktrees_rx` for the
+    /// contrast): the self-update check never re-arms within a session, so
+    /// a drained channel just harmlessly returns `Empty` on every later poll.
+    update_rx: mpsc::Receiver<Option<String>>,
 }
 
 impl tui::Screen for DashboardScreen {
@@ -206,6 +233,9 @@ impl tui::Screen for DashboardScreen {
             if let Ok(result) = rx.try_recv() {
                 return Some(Msg::CloneDone(result));
             }
+        }
+        if let Ok(pending) = self.update_rx.try_recv() {
+            return Some(Msg::UpdateChecked(pending));
         }
         None
     }
@@ -354,12 +384,24 @@ fn build_screen(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result
         }
     }
 
+    // Spawned here (not passed in from `main.rs`) so this session's
+    // `poll_background` can turn its result into a live `Msg::UpdateChecked`
+    // instead of only ever landing in the cache file for a later launch to
+    // read — the non-dashboard fast paths (`main.rs::run_default_fast_path`/
+    // `run_scratch_fast_path`) spawn their own separate, fire-and-forget
+    // check for the same reason, since they never reach this function at
+    // all.
+    let update_rx = config::log_dir()
+        .map(selfupdate::spawn_check)
+        .unwrap_or_else(|_| mpsc::channel().1); // no $HOME — same silent-degrade contract
+
     Ok(DashboardScreen {
         model,
         no_pull: cli.no_pull,
         repo_rx,
         worktrees_rx: Some(spawn_worktrees_thread(root.to_path_buf())),
         clone_rx: None,
+        update_rx,
     })
 }
 

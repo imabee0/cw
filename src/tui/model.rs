@@ -415,6 +415,9 @@ pub enum SuspendReq {
         agent: AgentConfig,
         worktree_path: PathBuf,
     },
+    /// `u`: apply the pending self-update and end the session — see
+    /// `dashboard.rs::run_suspend_chain`'s `ApplyUpdate` arm.
+    ApplyUpdate,
 }
 
 pub enum DashboardOutcome {
@@ -454,6 +457,11 @@ pub struct DashboardModel {
     pub modal: Option<Modal>,
     pub pending: Option<PendingLaunch>,
     pub status: Option<String>,
+    /// The pending version string from a completed background self-update
+    /// check (`Msg::UpdateChecked`), or `None` when unchecked/up to date.
+    /// Drives the agent bar's "update available" segment (`view.rs`) and
+    /// gates the `u` key (`tui/update.rs`).
+    pub update_available: Option<String>,
     pub root: PathBuf,
     pub idle_threshold_days: u64,
     pub auto_yes: bool,
@@ -517,6 +525,7 @@ impl DashboardModel {
             modal: None,
             pending: None,
             status: None,
+            update_available: None,
             root,
             idle_threshold_days,
             auto_yes,
@@ -655,6 +664,10 @@ impl DashboardModel {
     pub fn apply_dirty_refresh(&mut self, path: PathBuf, result: Result<bool, String>) {
         self.dirty_cache.insert(path, result.unwrap_or(false));
         self.refresh_worktree_pane();
+    }
+
+    pub fn apply_update_checked(&mut self, pending: Option<String>) {
+        self.update_available = pending;
     }
 
     /// Pure in-memory filter over `all_entries`/`dirty_cache` — no I/O. The
