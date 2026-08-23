@@ -68,6 +68,24 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"  # persists a copy of the run's log to ~/.cache/cw/cw.log — see §5m
 clap_complete = "4"      # `cw completions <shell>` — see §4
+axoupdater = { version = "0.10", features = ["blocking", "github_releases"] }
+  # Self-update check (selfupdate.rs) + apply (`u` in the dashboard), via
+  # cargo-dist's own updater library. `blocking` gives synchronous entry
+  # points (`is_update_needed_sync`/`run_sync`) so this codebase's plain-sync
+  # `main` never needs its own tokio runtime — `blocking` pulls tokio in as
+  # axoupdater's own internal, unexported dependency to back those two calls,
+  # not ours to drive directly (confirmed against axoupdater 0.10.2's actual
+  # source: no other method on `AxoUpdater` is both public and sync, so the
+  # exact new-version number is never available synchronously — see
+  # selfupdate.rs's `latest_release_tag` for how that gap is closed via `gh`,
+  # already this codebase's own established GitHub-API path). `github_releases`
+  # is axoupdater's own default feature anyway (kept explicit here per the
+  # task); it's what resolves releases from this repo's own GitHub source
+  # instead of axo.dev's hosted release service. Requires an install receipt
+  # (`~/.config/cw/cw-receipt.json`, written only by cargo-dist's shell/
+  # powershell installer) to do anything at all — a `cargo install --path .`
+  # build has none, and every code path here degrades that to silence, never
+  # an error.
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Vendored (not just a CI contingency anymore): a release binary that

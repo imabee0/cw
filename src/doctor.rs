@@ -1,26 +1,56 @@
 use std::env;
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
 use crate::config::{self, Config};
+use crate::selfupdate;
 
 /// Runs every configured sanity check and returns one `(label, outcome)`
 /// pair per check, in a stable, deterministic order (§5m): the fixed checks
 /// first, then one row per configured `[agents.*]`, sorted by name —
 /// `HashMap` iteration order would otherwise make `cw doctor`'s output
-/// nondeterministic run to run.
-pub fn run_doctor(config: &Config) -> Vec<(String, Result<()>)> {
-    let mut checks: Vec<(String, Result<()>)> = vec![
-        ("gh auth".to_string(), check_gh_auth()),
+/// nondeterministic run to run. `Ok` carries an informational detail string
+/// (empty for the plain pass/fail checks that had no more to say) printed
+/// alongside "ok" — `check_install_source`/`check_update_status` are never
+/// `Err`: neither a from-source build nor a stale binary blocks `cw` from
+/// working, so neither should fail `cw doctor`'s exit code the way a real
+/// blocker (unauthenticated `gh`, a missing agent binary) does.
+pub fn run_doctor(config: &Config) -> Vec<(String, Result<String>)> {
+    let mut checks: Vec<(String, Result<String>)> = vec![
+        (
+            "gh auth".to_string(),
+            check_gh_auth().map(|()| String::new()),
+        ),
         (
             "git credential helper".to_string(),
-            check_credential_helper(),
+            check_credential_helper().map(|()| String::new()),
         ),
-        ("terminal".to_string(), check_terminal()),
+        (
+            "terminal".to_string(),
+            check_terminal().map(|()| String::new()),
+        ),
+        ("install source".to_string(), check_install_source()),
     ];
+    // Read once — `check_update_status`'s neutral line and the "update
+    // available" row below both describe the same cached check result, so
+    // there's no reason to hit the cache file and re-parse it twice.
+    let pending_version = config::log_dir()
+        .ok()
+        .and_then(|dir| selfupdate::cached_pending_version(&dir));
+    checks.push((
+        "update status".to_string(),
+        Ok(update_status_message(pending_version.as_deref())),
+    ));
+    if let Some(latest) = &pending_version {
+        checks.push((
+            "update available".to_string(),
+            Ok(stale_binary_message(latest)),
+        ));
+    }
 
     let mut names: Vec<&String> = config.agents.keys().collect();
     names.sort();
@@ -33,11 +63,86 @@ pub fn run_doctor(config: &Config) -> Vec<(String, Result<()>)> {
             .unwrap_or_else(|_| config.agents[name].cmd.clone());
         checks.push((
             format!("agent: {name}"),
-            check_binary_on_path(&resolved_cmd),
+            check_binary_on_path(&resolved_cmd).map(|()| String::new()),
         ));
     }
 
     checks
+}
+
+/// Raw fields read directly off the install receipt JSON — not through
+/// `axoupdater::AxoUpdater::load_receipt()`, which only reports whether a
+/// receipt loaded, never its contents (`InstallReceipt`/`ReceiptProvider`
+/// live in axoupdater's private `receipt` module, confirmed against its
+/// 0.10.2 source — not part of its public API).
+#[derive(Deserialize)]
+struct ReceiptSummary {
+    version: String,
+    provider: ReceiptProvider,
+}
+
+#[derive(Deserialize)]
+struct ReceiptProvider {
+    source: String,
+    version: String,
+}
+
+fn receipt_path() -> Result<PathBuf> {
+    Ok(config::home_dir()?.join(".config/cw/cw-receipt.json"))
+}
+
+/// Which install method put this binary on disk — the fact that would have
+/// caught this plan's own motivating incident (a `cw` three feature-commits
+/// behind main with no visible symptom) at its actual root cause: whether
+/// there's an install receipt at all to self-update from.
+fn check_install_source() -> Result<String> {
+    let path = receipt_path()?;
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(
+            "from-source build (cargo install --path .) — no install receipt, self-update \
+             unavailable"
+                .to_string(),
+        );
+    };
+    match serde_json::from_slice::<ReceiptSummary>(&bytes) {
+        Ok(r) => Ok(format!(
+            "installed via {} {} (receipt records version {})",
+            r.provider.source, r.provider.version, r.version
+        )),
+        Err(_) => Ok(format!(
+            "install receipt at {} is present but unreadable",
+            path.display()
+        )),
+    }
+}
+
+/// Current vs. latest-known version — reuses `selfupdate.rs`'s cache
+/// (whatever the background check most recently found) rather than forcing
+/// a fresh network call here: `cw doctor` stays instant, and the dashboard/
+/// fast-path background checks already keep that cache warm (see
+/// `selfupdate.rs`'s and `main.rs`'s doc comments). Pure formatting over a
+/// value `run_doctor` reads from the cache file once, shared with
+/// `stale_binary_message` below, rather than each check re-reading it.
+fn update_status_message(pending_version: Option<&str>) -> String {
+    let current = env!("CARGO_PKG_VERSION");
+    match pending_version {
+        Some(latest) => format!("current {current}, {latest} available"),
+        None => format!(
+            "current {current} — up to date as of the last background check, or none has \
+             completed yet"
+        ),
+    }
+}
+
+/// A separate, explicit row — present only when there's actually something
+/// to warn about — so a stale binary doesn't just blend into the neutral
+/// "update status" line above.
+fn stale_binary_message(latest: &str) -> String {
+    format!(
+        "cw {latest} is available (current: {}) — run cw and press 'u', or re-run the \
+         installer script",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn check_gh_auth() -> Result<()> {

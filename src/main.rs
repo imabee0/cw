@@ -8,6 +8,7 @@ mod doctor;
 mod github;
 mod gitstatus;
 mod hooks;
+mod selfupdate;
 mod sync;
 mod tui;
 mod worktree;
@@ -450,6 +451,18 @@ fn run_default(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
     )
 }
 
+/// Shared by both non-dashboard fast paths (`run_default_fast_path`,
+/// `run_scratch_fast_path`) — neither reaches `dashboard.rs::build_screen`,
+/// which spawns its own check for the dashboard's session, so this is their
+/// only chance to keep the cache warm. Silently does nothing without a
+/// resolvable `$HOME`, same degrade-to-silence contract as every other
+/// `selfupdate` call site.
+fn spawn_update_check() {
+    if let Ok(cache_dir) = config::log_dir() {
+        selfupdate::spawn_check(cache_dir);
+    }
+}
+
 /// The fully non-interactive path: `--repo OWNER/NAME` + a resolvable agent
 /// — `needs_dashboard` guarantees both before this is ever called, so the
 /// `--repo` `.expect()` below documents that precondition rather than being
@@ -459,6 +472,15 @@ fn run_default(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
 /// explicit SLUG — same auto-generated-timestamp fallback `start_pending`
 /// uses for the dashboard's "+ new worktree" row.
 fn run_default_fast_path(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
+    // Fire-and-forget: this path never opens the dashboard (`dashboard.rs`'s
+    // `build_screen` spawns its own check for that path — see its doc
+    // comment), so this is the only chance a purely non-interactive `cw`
+    // invocation gets to keep `cw doctor`'s cache warm. The spawned agent
+    // session below normally keeps the process alive long enough for the
+    // check to finish; if it doesn't, the thread is silently abandoned on
+    // exit — same as any other detached background thread.
+    spawn_update_check();
+
     let repo_choice = parse_owner_repo(
         cli.repo
             .as_deref()
@@ -620,6 +642,9 @@ fn run_scratch_fast_path(
     root: &Path,
     slug: Option<String>,
 ) -> Result<()> {
+    // See `run_default_fast_path`'s matching comment.
+    spawn_update_check();
+
     let repo_root = worktree::ensure_scratch_repo(root)?;
     let git_repo = git2::Repository::open(&repo_root)
         .with_context(|| format!("opening scratch repo at {}", repo_root.display()))?;
@@ -691,7 +716,8 @@ fn run_doctor_cmd(config: &Config) -> Result<()> {
     let mut any_failed = false;
     for (name, result) in &checks {
         match result {
-            Ok(()) => println!("{name}: ok"),
+            Ok(msg) if msg.is_empty() => println!("{name}: ok"),
+            Ok(msg) => println!("{name}: ok — {msg}"),
             Err(e) => {
                 println!("{name}: FAIL: {e:#}");
                 any_failed = true;

@@ -32,6 +32,12 @@ pub enum Msg {
     /// than surfaced as a hard error, same tolerance idiom
     /// `WorktreeRow::existing` used before this rewrite.
     DirtyRefreshed(PathBuf, Result<bool, String>),
+    /// Background self-update check result (`selfupdate::spawn_check`) —
+    /// `Some(version)` when a newer release is pending, `None` when up to
+    /// date. Never sent at all on a failed check (no install receipt,
+    /// offline, rate-limited — see `selfupdate.rs`), so this simply never
+    /// arrives on those runs, same as if the check hadn't happened.
+    UpdateChecked(Option<String>),
     /// Fired once per event-loop tick (background-poll cadence; also drives
     /// the clone spinner and "loading…" states).
     Tick,
