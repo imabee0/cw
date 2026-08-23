@@ -8,9 +8,10 @@ use crate::dashboard::{self, Entry};
 use crate::worktree;
 
 /// `cw clean`: opens the dashboard scoped to every worktree across every
-/// repo, in delete-mode, letting the user multi-select which to remove
-/// (idle/dirty already annotated, per `tui::model::WorktreeRow`). The
-/// dashboard itself owns the scan/select/confirm/remove flow
+/// repo, letting the user mark rows with Space and remove them with `d`/`y`
+/// (idle/dirty already annotated, per `tui::model::WorktreeRow`) — renders
+/// identically to `cw resume`, just entered under a different name/`--force`
+/// default. The dashboard itself owns the scan/select/confirm/remove flow
 /// (`DashboardModel::confirm_delete`) — this is now a thin entry point, not
 /// the flow's owner.
 pub fn run_clean(cli: &Cli, config: &Config, root: &Path, force: bool) -> Result<()> {

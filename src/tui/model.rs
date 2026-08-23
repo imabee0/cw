@@ -20,7 +20,7 @@ use crate::config::{self, AgentConfig, Config};
 use crate::github::Repo;
 use crate::hooks::{self, HookConsent, HookEnv, ResolvedHook};
 use crate::sync::{self, PullOutcome};
-use crate::worktree::{self, CleanCandidate, WorktreeEntry as ScannedEntry, WorktreeSelection};
+use crate::worktree::{self, WorktreeEntry as ScannedEntry, WorktreeSelection};
 use crate::worktreeinclude;
 
 /// Idle-duration label (`"idle Nd"`), or `None` under `threshold_days` —
@@ -283,15 +283,17 @@ fn build_agent_entries(agents: &HashMap<String, AgentConfig>) -> Vec<AgentEntry>
 // Scope / Focus
 // ---------------------------------------------------------------------
 
-/// What the dashboard is showing. `Browse` is bare `cw`'s repo-picker-plus-
-/// worktree-pane split view; `AllWorktrees` backs both `cw resume` (pick to
-/// launch) and `cw clean` (`delete_mode: true`, pick to remove); `SingleRepo`
-/// backs `cw scratch`, scoped to the synthetic scratch repo with no repo
-/// pane at all.
+/// What the dashboard is showing — the semantic mode only; the repo pane
+/// itself is a top-level `DashboardModel` field (`Some` only in `Browse`,
+/// see `DashboardModel::repos`), not carried in this enum, so `update.rs`
+/// never has to re-destructure `Scope` just to reach it. `Browse` is bare
+/// `cw`'s repo-pane-plus-worktree-pane split view; `AllWorktrees` backs both
+/// `cw resume` and `cw clean` (`--force` is the only difference between
+/// them — both render identically, worktree pane only); `SingleRepo` backs
+/// `cw scratch`, scoped to the synthetic scratch repo with no repo pane at
+/// all.
 pub enum Scope {
-    Browse {
-        repos: ListState<RepoRow>,
-    },
+    Browse,
     AllWorktrees,
     SingleRepo {
         repo_label: String,
@@ -308,7 +310,6 @@ pub enum Focus {
 enum PaneRepoFilter {
     All,
     One(String),
-    NothingSelected,
 }
 
 // ---------------------------------------------------------------------
@@ -327,7 +328,12 @@ pub enum Modal {
         kind: HookKind,
     },
     ConfirmDelete {
-        total_count: usize,
+        /// The worktree paths this confirm targets — the checked set at the
+        /// moment `d` was pressed, or just the focused row's path when
+        /// nothing was checked. Resolved once here rather than re-read from
+        /// `checked` on confirm, since `checked` may have been empty the
+        /// whole time (the single-row case).
+        targets: Vec<PathBuf>,
         dirty_count: usize,
         force: bool,
     },
@@ -429,13 +435,22 @@ enum HookCheckpoint {
 pub struct DashboardModel {
     pub scope: Scope,
     pub focus: Focus,
+    /// The repo pane's own state — `Some` only in `Scope::Browse`, `None` in
+    /// `AllWorktrees`/`SingleRepo`, which have no repo pane at all. Lifted
+    /// out of `Scope` (which used to carry it inline, `Browse { repos }`) so
+    /// every focused-pane function reaches it uniformly instead of
+    /// re-destructuring `Scope` on every call.
+    pub repos: Option<ListState<RepoRow>>,
     pub worktrees: ListState<WorktreeRow>,
     pub all_entries: Vec<ScannedEntry>,
     pub dirty_cache: HashMap<PathBuf, bool>,
     pub agents: Vec<AgentEntry>,
     pub agent_index: usize,
-    pub delete_mode: bool,
-    pub checked: HashSet<usize>,
+    /// Worktree paths marked for removal — keyed by path, not list index:
+    /// an index is invalidated by every `refresh_worktree_pane` rebuild, a
+    /// path is stable across one (and across a rescan — see
+    /// `rescan_requested` below).
+    pub checked: HashSet<PathBuf>,
     pub modal: Option<Modal>,
     pub pending: Option<PendingLaunch>,
     pub status: Option<String>,
@@ -443,6 +458,12 @@ pub struct DashboardModel {
     pub idle_threshold_days: u64,
     pub auto_yes: bool,
     pub loading: bool,
+    /// Set by the `r` key (`tui/update.rs`); consumed by `dashboard.rs`'s
+    /// `DashboardScreen`, which spawns a fresh worktree-scan thread when it
+    /// sees this true and no scan is already in flight, then clears it.
+    /// `update_dashboard` itself never touches the filesystem — this flag is
+    /// the request, not the scan.
+    pub rescan_requested: bool,
 
     // Not in the plan's illustrative struct sketch, but required to make
     // the pipeline above actually work: `config` is a snapshot (not a
@@ -468,12 +489,12 @@ impl DashboardModel {
     fn base(
         scope: Scope,
         focus: Focus,
+        repos: Option<ListState<RepoRow>>,
         root: PathBuf,
         config: Config,
         hook_consent: HookConsent,
         hook_consent_path: PathBuf,
         auto_yes: bool,
-        delete_mode: bool,
         force_delete: bool,
         forced_slug: Option<String>,
     ) -> Self {
@@ -486,12 +507,12 @@ impl DashboardModel {
         Self {
             scope,
             focus,
+            repos,
             worktrees: ListState::new(Vec::new()),
             all_entries: Vec::new(),
             dirty_cache: HashMap::new(),
             agents,
             agent_index,
-            delete_mode,
             checked: HashSet::new(),
             modal: None,
             pending: None,
@@ -500,6 +521,7 @@ impl DashboardModel {
             idle_threshold_days,
             auto_yes,
             loading: true,
+            rescan_requested: false,
             config,
             force_delete,
             forced_slug,
@@ -508,6 +530,10 @@ impl DashboardModel {
         }
     }
 
+    /// Bare `cw`. Opens focused on the worktree pane, not the repo pane —
+    /// you land on everything you're working on; `Tab` reaches the repo
+    /// pane only when you want to create a new worktree under a specific
+    /// repo.
     #[allow(clippy::too_many_arguments)]
     pub fn new_browse(
         initial_repos: Vec<Repo>,
@@ -520,14 +546,14 @@ impl DashboardModel {
     ) -> Self {
         let repos = ListState::new(build_repo_rows(initial_repos, &root));
         let mut model = Self::base(
-            Scope::Browse { repos },
-            Focus::Repos,
+            Scope::Browse,
+            Focus::Worktrees,
+            Some(repos),
             root,
             config,
             hook_consent,
             hook_consent_path,
             auto_yes,
-            false,
             false,
             forced_slug,
         );
@@ -542,18 +568,17 @@ impl DashboardModel {
         hook_consent: HookConsent,
         hook_consent_path: PathBuf,
         auto_yes: bool,
-        delete_mode: bool,
         force_delete: bool,
     ) -> Self {
         let mut model = Self::base(
             Scope::AllWorktrees,
             Focus::Worktrees,
+            None,
             root,
             config,
             hook_consent,
             hook_consent_path,
             auto_yes,
-            delete_mode,
             force_delete,
             None,
         );
@@ -578,12 +603,12 @@ impl DashboardModel {
                 repo_root,
             },
             Focus::Worktrees,
+            None,
             root,
             config,
             hook_consent,
             hook_consent_path,
             auto_yes,
-            false,
             false,
             forced_slug,
         );
@@ -595,7 +620,7 @@ impl DashboardModel {
 
     pub fn apply_repo_load(&mut self, load: RepoLoad) {
         self.loading = false;
-        let Scope::Browse { repos } = &mut self.scope else {
+        let Some(repos) = self.repos.as_mut() else {
             return;
         };
         let query = std::mem::take(&mut repos.query);
@@ -632,26 +657,38 @@ impl DashboardModel {
         self.refresh_worktree_pane();
     }
 
-    /// Pure in-memory filter over `all_entries`/`dirty_cache` — no I/O.
-    /// Called on every repo-cursor move in `Scope::Browse` and whenever the
-    /// background data backing it changes; never calls `gitstatus::is_dirty`
-    /// itself (that per-keystroke storm is exactly what this rewrite fixes).
+    /// Pure in-memory filter over `all_entries`/`dirty_cache` — no I/O. The
+    /// pane shows every repo's worktrees regardless of the repo pane's
+    /// cursor (see `pane_repo_filter`) — call sites are purely data-driven:
+    /// after a worktree-scan load, a dirty-status refresh, a delete
+    /// confirmed, an agent launch resumed, a repo-list reload, or an `r`
+    /// rescan. Never called on a bare repo-cursor move any more (that used
+    /// to rebuild `self.worktrees` on every arrow key). The rebuild is
+    /// selection-stable across all of these, same reasoning as `checked`:
+    /// the focused row's path (if any) is looked up again in the new rows
+    /// and reselected, so an `r` rescan or a background dirty refresh no
+    /// longer bounces the cursor back to row zero. Never calls
+    /// `gitstatus::is_dirty` itself — that per-keystroke I/O storm is what
+    /// the split from `dashboard.rs`'s one-time scan thread fixes.
     pub fn refresh_worktree_pane(&mut self) {
-        let filter = self.pane_repo_filter();
-        let include_new = !matches!(
-            filter,
-            PaneRepoFilter::All | PaneRepoFilter::NothingSelected
-        );
-        let entries: Vec<ScannedEntry> = match &filter {
+        let selected_path = self
+            .worktrees
+            .selected()
+            .and_then(|row| match &row.selection {
+                WorktreeSelection::Existing(entry) => Some(entry.path.clone()),
+                WorktreeSelection::New => None,
+            });
+
+        let entries: Vec<ScannedEntry> = match self.pane_repo_filter() {
             PaneRepoFilter::All => self.all_entries.clone(),
             PaneRepoFilter::One(label) => self
                 .all_entries
                 .iter()
-                .filter(|e| &e.repo == label)
+                .filter(|e| e.repo == label)
                 .cloned()
                 .collect(),
-            PaneRepoFilter::NothingSelected => Vec::new(),
         };
+        let include_new = self.new_worktree_repo().is_some();
 
         let query = std::mem::take(&mut self.worktrees.query);
         let rows = build_worktree_rows(
@@ -663,17 +700,47 @@ impl DashboardModel {
         self.worktrees = ListState::new(rows);
         self.worktrees.query = query;
         self.worktrees.refilter(|r| r.filter_text.as_str());
-        self.checked.clear();
+
+        if let Some(path) = selected_path {
+            let restored = self.worktrees.filtered.iter().position(|&idx| {
+                matches!(
+                    &self.worktrees.items[idx].selection,
+                    WorktreeSelection::Existing(entry) if entry.path == path
+                )
+            });
+            if restored.is_some() {
+                self.worktrees.select(restored);
+            }
+        }
     }
 
+    /// Which worktrees the pane displays: every repo's, except in
+    /// `Scope::SingleRepo`, which is pinned to just its own repo. Note this
+    /// no longer depends on the repo pane's selection in `Scope::Browse` —
+    /// see `new_worktree_repo` for the one thing that still does (which
+    /// repo the synthetic "+ new worktree" row targets, a separate concern
+    /// from which worktrees are actually listed).
     fn pane_repo_filter(&self) -> PaneRepoFilter {
         match &self.scope {
-            Scope::Browse { repos } => match repos.selected() {
-                Some(row) => PaneRepoFilter::One(row.repo.full_name()),
-                None => PaneRepoFilter::NothingSelected,
-            },
-            Scope::AllWorktrees => PaneRepoFilter::All,
+            Scope::Browse | Scope::AllWorktrees => PaneRepoFilter::All,
             Scope::SingleRepo { repo_label, .. } => PaneRepoFilter::One(repo_label.clone()),
+        }
+    }
+
+    /// Which repo the worktree pane's synthetic "+ new worktree" row would
+    /// create under, if any. `None` when there's no concrete repo to create
+    /// one under: `Scope::AllWorktrees` (`cw resume`/`cw clean`, which never
+    /// create), or `Scope::Browse` before anything is selected in the
+    /// (top-level) repo pane yet.
+    fn new_worktree_repo(&self) -> Option<String> {
+        match &self.scope {
+            Scope::Browse => self
+                .repos
+                .as_ref()
+                .and_then(|repos| repos.selected())
+                .map(|row| row.repo.full_name()),
+            Scope::AllWorktrees => None,
+            Scope::SingleRepo { repo_label, .. } => Some(repo_label.clone()),
         }
     }
 
@@ -689,76 +756,85 @@ impl DashboardModel {
         self.agents.get(self.agent_index).map(|a| a.name.clone())
     }
 
-    // -- delete flow (Scope::AllWorktrees, delete_mode) -------------------
+    // -- mark-and-delete flow (Scope::AllWorktrees and Browse/SingleRepo alike) --
 
+    /// `Space` on a focused worktree row: always toggles its check-mark,
+    /// never falls through to the filter query (unlike every other typable
+    /// character). A no-op on the synthetic "+ new worktree" row — nothing
+    /// on disk yet to mark for removal.
     pub fn toggle_checked_focused(&mut self) {
-        let Some(filtered_pos) = self.worktrees.selected_index() else {
+        let Some(row) = self.worktrees.selected() else {
             return;
         };
-        let Some(&item_idx) = self.worktrees.filtered.get(filtered_pos) else {
+        let WorktreeSelection::Existing(entry) = &row.selection else {
             return;
         };
-        if !self.checked.remove(&item_idx) {
-            self.checked.insert(item_idx);
+        let path = entry.path.clone();
+        if !self.checked.remove(&path) {
+            self.checked.insert(path);
         }
     }
 
-    /// `d` outside a confirm modal: opens `Modal::ConfirmDelete` when
-    /// something's checked, does nothing when the checked set is empty (the
-    /// dashboard stays open either way — unlike the old picker's `d`, there
-    /// is no longer a "cancel the whole screen" outcome for this).
+    /// `d` outside a confirm modal: opens `Modal::ConfirmDelete` targeting
+    /// the checked set when it's non-empty, or just the focused row when
+    /// nothing is checked (dropping single-worktree delete to two
+    /// keystrokes — `d`, `y`). A no-op when nothing is checked AND nothing
+    /// removable is focused (an empty pane, or the synthetic "+ new
+    /// worktree" row).
     pub fn open_delete_confirm(&mut self) {
-        if self.checked.is_empty() {
-            return;
-        }
-        let mut dirty_count = 0;
-        for &idx in &self.checked {
-            if self.worktrees.items.get(idx).is_some_and(|r| r.dirty) {
-                dirty_count += 1;
+        let targets: Vec<PathBuf> = if self.checked.is_empty() {
+            match self.worktrees.selected().map(|r| &r.selection) {
+                Some(WorktreeSelection::Existing(entry)) => vec![entry.path.clone()],
+                _ => return,
             }
-        }
+        } else {
+            self.checked.iter().cloned().collect()
+        };
+
+        // Reads `dirty_cache` directly — the same canonical source
+        // `confirm_delete` checks against — rather than re-deriving dirty
+        // status from the rendered `self.worktrees.items`, which would be a
+        // second, divergence-prone copy of the same fact.
+        let dirty_count = targets
+            .iter()
+            .filter(|path| self.dirty_cache.get(*path).copied().unwrap_or(false))
+            .count();
         self.modal = Some(Modal::ConfirmDelete {
-            total_count: self.checked.len(),
+            targets,
             dirty_count,
             force: self.force_delete,
         });
     }
 
-    /// Confirms `Modal::ConfirmDelete`: actually removes each checked entry
-    /// via `clean::remove_one` (pure `git2`/`fs`, no subprocess — runs
+    /// Confirms `Modal::ConfirmDelete`: actually removes each targeted
+    /// entry via `clean::remove_one` (pure `git2`/`fs`, no subprocess — runs
     /// inline, no suspend needed, same tolerance as worktree creation).
     /// Dirty entries are skipped unless `--force`, exactly like the old
-    /// `clean.rs::run_clean`.
+    /// `clean.rs::run_clean`. Always clears `checked` — even a target that
+    /// came from the single-focused-row case (never added to `checked` in
+    /// the first place) leaves it empty either way.
     pub fn confirm_delete(&mut self) {
-        self.modal = None;
-        let mut idxs: Vec<usize> = self.checked.drain().collect();
-        idxs.sort_unstable();
-
-        let mut candidates: Vec<CleanCandidate> = Vec::with_capacity(idxs.len());
-        for idx in idxs {
-            if let Some(row) = self.worktrees.items.get(idx) {
-                if let WorktreeSelection::Existing(entry) = &row.selection {
-                    candidates.push(CleanCandidate {
-                        entry: entry.clone(),
-                        dirty: row.dirty,
-                    });
-                }
-            }
-        }
+        let Some(Modal::ConfirmDelete { targets, .. }) = self.modal.take() else {
+            return;
+        };
+        self.checked.clear();
 
         let mut messages = Vec::new();
-        for candidate in candidates {
-            let entry = &candidate.entry;
-            if candidate.dirty && !self.force_delete {
+        for path in targets {
+            let Some(entry) = self.all_entries.iter().find(|e| e.path == path).cloned() else {
+                continue; // already gone — stale target, nothing to do
+            };
+            let dirty = self.dirty_cache.get(&entry.path).copied().unwrap_or(false);
+            if dirty && !self.force_delete {
                 messages.push(format!(
                     "skipped {}/{} — has uncommitted changes",
                     entry.repo, entry.slug
                 ));
                 continue;
             }
-            match crate::clean::remove_one(&self.root, entry) {
+            match crate::clean::remove_one(&self.root, &entry) {
                 Ok(()) => {
-                    self.all_entries.retain(|e| e != entry);
+                    self.all_entries.retain(|e| e != &entry);
                     messages.push(format!("removed {}/{}", entry.repo, entry.slug));
                 }
                 Err(err) => messages.push(format!(
@@ -791,8 +867,8 @@ impl DashboardModel {
         }
         let agent = self.current_agent_name()?;
         match &self.scope {
-            Scope::Browse { repos } => {
-                let repo = repos.selected()?.repo.clone();
+            Scope::Browse => {
+                let repo = self.repos.as_ref()?.selected()?.repo.clone();
                 let repo_label = repo.full_name();
                 let repo_root = sync::resolve_local_path(&self.root, &repo.owner, &repo.name);
                 let (slug, worktree_path) = match selection {
@@ -1150,6 +1226,23 @@ impl DashboardModel {
                     "worktreeinclude: failed to copy file, continuing"
                 );
             }
+
+            // The one asymmetric case vs. removal (which already keeps
+            // `all_entries` current on delete): without this, a worktree
+            // created this session never shows up in the pane until `cw` is
+            // quit and relaunched. `entry.slug` must be the flattened
+            // on-disk form — the same shape `scan_worktrees` reads back off
+            // disk — not the raw (possibly `/`-containing) slug the pipeline
+            // carries.
+            let entry = ScannedEntry {
+                repo: pending.ctx.repo_label.clone(),
+                slug: worktree::flatten_slug(&pending.ctx.slug),
+                path: path.clone(),
+                mtime: SystemTime::now(),
+            };
+            self.all_entries.push(entry);
+            self.all_entries.sort_by_key(|e| std::cmp::Reverse(e.mtime));
+            self.refresh_worktree_pane();
         }
         Ok(())
     }

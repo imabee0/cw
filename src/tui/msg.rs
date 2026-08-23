@@ -16,8 +16,10 @@ pub enum Msg {
     /// Repo-discovery background thread result (`Scope::Browse` only),
     /// polled off an `mpsc::Receiver` once per event-loop tick.
     DataLoaded(RepoLoad),
-    /// Full worktree-scan-plus-dirty-status background thread result,
-    /// spawned once at dashboard construction — see `WorktreesLoad`.
+    /// Full worktree-scan-plus-dirty-status background thread result.
+    /// Spawned once at dashboard construction, and re-armed on demand by the
+    /// `r` key (`DashboardModel::rescan_requested`, handled in
+    /// `dashboard.rs`) — see `WorktreesLoad`.
     WorktreesLoaded(Result<WorktreesLoad, String>),
     /// Background clone/pull thread result for a repo the user committed to
     /// (Enter on a worktree row) — see `CloneOutcome`.
@@ -49,11 +51,11 @@ pub struct RepoLoad {
 }
 
 /// Everything the worktree pane needs from one full background scan: every
-/// worktree found across every repo, plus a one-time `gitstatus::is_dirty`
-/// pass over each entry's path (`DashboardModel::dirty_cache`). Computed off
-/// the render thread exactly once at dashboard startup so every later
-/// repo-cursor move is a pure in-memory filter, never an `is_dirty` call per
-/// keystroke.
+/// worktree found across every repo, plus a `gitstatus::is_dirty` pass over
+/// each entry's path (`DashboardModel::dirty_cache`). Computed off the
+/// render thread — at dashboard startup, and again on each `r`-triggered
+/// rescan — so a repo-cursor move or a filter keystroke is always a pure
+/// in-memory read, never an `is_dirty` call.
 #[derive(Debug, Clone, Default)]
 pub struct WorktreesLoad {
     pub entries: Vec<ScannedEntry>,

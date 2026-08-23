@@ -4,6 +4,9 @@
 //! interior mutability (`ListState::table`/`table_rect`), not by widening
 //! this signature.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -12,7 +15,7 @@ use ratatui::Frame;
 
 use super::model::{
     is_recently_updated, relative_time, AgentEntry, DashboardModel, Focus, ListState, Modal,
-    RepoRow, Scope, Stage, WorktreeRow,
+    RepoRow, Stage, WorktreeRow,
 };
 use crate::worktree::WorktreeSelection;
 
@@ -39,7 +42,7 @@ pub fn draw_dashboard(frame: &mut Frame, model: &DashboardModel) {
     let (title_area, filter_area, body_area, agent_area, status_area) =
         (rows[0], rows[1], rows[2], rows[3], rows[4]);
 
-    frame.render_widget(Paragraph::new(title(model)), title_area);
+    frame.render_widget(Paragraph::new(title()), title_area);
     frame.render_widget(filter_line(model), filter_area);
     draw_body(frame, model, body_area);
     frame.render_widget(agent_bar(model), agent_area);
@@ -50,13 +53,12 @@ pub fn draw_dashboard(frame: &mut Frame, model: &DashboardModel) {
     }
 }
 
-fn title(model: &DashboardModel) -> &'static str {
-    match &model.scope {
-        Scope::Browse { .. } => "cw — pick a repo, then a worktree",
-        Scope::AllWorktrees if model.delete_mode => "cw clean — select worktrees to remove",
-        Scope::AllWorktrees => "cw resume — pick a worktree",
-        Scope::SingleRepo { .. } => "cw scratch — pick a worktree",
-    }
+/// One title regardless of entry point — `cw`/`cw resume`/`cw clean` all
+/// render the same worktree-first dashboard now; `cw clean`'s only remaining
+/// distinction is its `--force` default (`DashboardModel::force_delete`),
+/// not a different screen.
+fn title() -> &'static str {
+    "cw — worktrees"
 }
 
 fn header_style() -> Style {
@@ -79,10 +81,10 @@ fn pane_border_style(focused: bool) -> Style {
 
 fn filter_line(model: &DashboardModel) -> Paragraph<'_> {
     let (label, query) = match model.focus {
-        Focus::Repos => match &model.scope {
-            Scope::Browse { repos } => ("repos", repos.query.as_str()),
-            _ => ("", ""),
-        },
+        Focus::Repos => (
+            "repos",
+            model.repos.as_ref().map(|r| r.query.as_str()).unwrap_or(""),
+        ),
         Focus::Worktrees => ("worktrees", model.worktrees.query.as_str()),
     };
     Paragraph::new(Line::from(vec![
@@ -92,8 +94,8 @@ fn filter_line(model: &DashboardModel) -> Paragraph<'_> {
 }
 
 fn draw_body(frame: &mut Frame, model: &DashboardModel, area: Rect) {
-    match &model.scope {
-        Scope::Browse { repos } => {
+    match &model.repos {
+        Some(repos) => {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -107,7 +109,7 @@ fn draw_body(frame: &mut Frame, model: &DashboardModel, area: Rect) {
             );
             draw_worktree_pane(frame, model, cols[1]);
         }
-        Scope::AllWorktrees | Scope::SingleRepo { .. } => {
+        None => {
             draw_worktree_pane(frame, model, area);
         }
     }
@@ -195,7 +197,9 @@ fn draw_worktree_pane(frame: &mut Frame, model: &DashboardModel, area: Rect) {
         return;
     }
 
-    let is_multi = model.delete_mode;
+    // The checkbox column renders whenever anything's marked — no separate
+    // "delete-mode" any more; `Space` marks a row from any state.
+    let is_multi = !model.checked.is_empty();
     let mut header_cells = vec!["REPO", "SLUG", "IDLE", "STATUS"];
     if is_multi {
         header_cells.insert(0, "");
@@ -206,22 +210,25 @@ fn draw_worktree_pane(frame: &mut Frame, model: &DashboardModel, area: Rect) {
         .worktrees
         .filtered
         .iter()
-        .filter_map(|&idx| model.worktrees.items.get(idx).map(|row| (idx, row)))
-        .map(|(idx, row)| build_worktree_row(row, idx, is_multi, &model.checked))
+        .filter_map(|&idx| model.worktrees.items.get(idx))
+        .map(|row| build_worktree_row(row, is_multi, &model.checked))
         .collect();
 
+    // REPO is widened relative to SLUG — the pane always shows every repo's
+    // worktrees now (see `DashboardModel::pane_repo_filter`), so REPO is
+    // always meaningful, not just when scoped to one repo.
     let widths: Vec<Constraint> = if is_multi {
         vec![
             Constraint::Length(3),
-            Constraint::Percentage(32),
-            Constraint::Percentage(32),
-            Constraint::Percentage(16),
-            Constraint::Percentage(16),
+            Constraint::Percentage(38),
+            Constraint::Percentage(28),
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
         ]
     } else {
         vec![
-            Constraint::Percentage(35),
-            Constraint::Percentage(35),
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
             Constraint::Percentage(15),
             Constraint::Percentage(15),
         ]
@@ -238,9 +245,8 @@ fn draw_worktree_pane(frame: &mut Frame, model: &DashboardModel, area: Rect) {
 
 fn build_worktree_row<'a>(
     row: &'a WorktreeRow,
-    idx: usize,
     is_multi: bool,
-    checked: &std::collections::HashSet<usize>,
+    checked: &HashSet<PathBuf>,
 ) -> Row<'a> {
     let (repo_cell, slug_cell) = match &row.selection {
         WorktreeSelection::Existing(entry) => (row.repo_label.clone(), entry.slug.clone()),
@@ -267,7 +273,11 @@ fn build_worktree_row<'a>(
         Span::styled(status_cell.to_string(), row_style),
     ];
     if is_multi {
-        let mark = if checked.contains(&idx) { "[x]" } else { "[ ]" };
+        let is_checked = matches!(
+            &row.selection,
+            WorktreeSelection::Existing(entry) if checked.contains(&entry.path)
+        );
+        let mark = if is_checked { "[x]" } else { "[ ]" };
         cells.insert(0, Span::styled(mark, row_style));
     }
     Row::new(cells)
@@ -331,49 +341,39 @@ fn status_line(model: &DashboardModel) -> Line<'static> {
     if let Some(status) = &model.status {
         return Line::from(status.clone());
     }
-    help_line(model)
+    help_line()
 }
 
 /// Key tokens colored per the plan's style spec — cyan for neutral/navigation,
 /// yellow for destructive — description text plain, matching the pane
 /// borders/dirty/idle/agent-segment coloring above rather than leaving this
-/// one line as a plain unstyled string.
-fn help_line(model: &DashboardModel) -> Line<'static> {
+/// one line as a plain unstyled string. One line for every scope now — no
+/// separate delete-mode variant, since there's no longer a delete-mode.
+fn help_line() -> Line<'static> {
     let key = |k: &'static str| Span::styled(k, Style::default().fg(KEY_HINT));
     let destructive = |k: &'static str| Span::styled(k, Style::default().fg(KEY_HINT_DESTRUCTIVE));
     let plain = |s: &'static str| Span::raw(s);
 
-    if model.delete_mode {
-        Line::from(vec![
-            key("↑/↓"),
-            plain(" move · "),
-            key("space"),
-            plain("/click check · "),
-            destructive("d"),
-            plain(" confirm/back out · "),
-            key("ctrl-a"),
-            plain(" agent · "),
-            destructive("esc"),
-            plain(" cancel"),
-        ])
-    } else {
-        Line::from(vec![
-            key("↑/↓"),
-            plain(" move · "),
-            key("tab"),
-            plain(" switch pane · type to filter · "),
-            key("enter"),
-            plain(" select · "),
-            destructive("d"),
-            plain(" delete-mode · "),
-            key("ctrl-a"),
-            plain(" agent · "),
-            destructive("q"),
-            plain("/"),
-            destructive("esc"),
-            plain(" quit"),
-        ])
-    }
+    Line::from(vec![
+        key("↑/↓"),
+        plain(" move · "),
+        key("tab"),
+        plain(" repos · type to filter · "),
+        key("enter"),
+        plain(" open · "),
+        key("space"),
+        plain(" mark · "),
+        destructive("d"),
+        plain(" delete · "),
+        key("r"),
+        plain(" rescan · "),
+        key("ctrl-a"),
+        plain(" agent · "),
+        destructive("q"),
+        plain("/"),
+        destructive("esc"),
+        plain(" quit"),
+    ])
 }
 
 fn draw_modal(frame: &mut Frame, modal: &Modal, full: Rect) {
@@ -398,7 +398,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, full: Rect) {
             frame.render_widget(Paragraph::new(lines), inner);
         }
         Modal::ConfirmDelete {
-            total_count,
+            targets,
             dirty_count,
             force,
         } => {
@@ -416,6 +416,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, full: Rect) {
             } else {
                 format!(" ({dirty_count} dirty — will be skipped, not --force)")
             };
+            let total_count = targets.len();
             let lines = vec![
                 Line::from(format!("remove {total_count} worktree(s)?{dirty_note}")),
                 Line::from(""),

@@ -10,10 +10,9 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use super::model::{DashboardModel, DashboardOutcome, Focus, Modal, Scope};
+use super::model::{DashboardModel, DashboardOutcome, Focus, Modal};
 use super::msg::Msg;
 use super::widgets;
-use crate::worktree::WorktreeSelection;
 
 /// `PageUp`/`PageDown` scroll amount. Not derived from the last-rendered
 /// table height (that's `Rect::default()` — height 0 — before the first
@@ -90,18 +89,17 @@ fn handle_modal_key(model: &mut DashboardModel, key: KeyEvent) -> Option<Dashboa
 }
 
 /// The nesting order the plan's Esc rule spells out: modal (already routed
-/// away in `handle_key` before reaching here) → delete-mode → the focused
-/// pane's filter → cancel the whole dashboard.
+/// away in `handle_key` before reaching here) → the focused pane's filter →
+/// the checked set → cancel the whole dashboard.
 fn handle_pane_key(model: &mut DashboardModel, key: KeyEvent) -> Option<DashboardOutcome> {
     match key.code {
         KeyCode::Esc => {
-            if model.delete_mode {
-                model.delete_mode = false;
-                model.checked.clear();
-                return None;
-            }
             if !focused_query_empty(model) {
                 clear_focused_query(model);
+                return None;
+            }
+            if !model.checked.is_empty() {
+                model.checked.clear();
                 return None;
             }
             Some(DashboardOutcome::Cancelled)
@@ -111,16 +109,28 @@ fn handle_pane_key(model: &mut DashboardModel, key: KeyEvent) -> Option<Dashboar
             None
         }
         KeyCode::Enter => handle_enter(model),
-        KeyCode::Char(' ') if model.delete_mode && model.focus == Focus::Worktrees => {
-            toggle_focused_if_existing(model);
+        // Query-gated like `d`/`r` below, per CLAUDE.md: space is typable
+        // filter text (a query can legitimately contain one), so it only
+        // marks the focused row when the pane's own query is already empty —
+        // otherwise it falls through to `type_into_focused` like any other
+        // character.
+        KeyCode::Char(' ') if model.focus == Focus::Worktrees && focused_query_empty(model) => {
+            model.toggle_checked_focused();
             None
         }
         // Query-gated like `q` below, and for the same reason spelled out in
-        // CLAUDE.md: an accidental match here is destructive (it either
-        // enters delete-mode or opens the removal confirm), so it gets the
-        // gate even in panes where a bare `q` would too.
+        // CLAUDE.md: an accidental match here is destructive (it opens the
+        // removal confirm), so it gets the gate even in panes where a bare
+        // `q` would too.
         KeyCode::Char('d') if model.focus == Focus::Worktrees && focused_query_empty(model) => {
-            toggle_delete_or_confirm(model);
+            model.open_delete_confirm();
+            None
+        }
+        // Also query-gated, but not destructive — a rescan can't lose data,
+        // it just re-reads what's already on disk. Gated anyway so `r` stays
+        // typable into an active filter, same discipline as `d`.
+        KeyCode::Char('r') if model.focus == Focus::Worktrees && focused_query_empty(model) => {
+            model.rescan_requested = true;
             None
         }
         KeyCode::Up => {
@@ -164,11 +174,10 @@ fn handle_pane_key(model: &mut DashboardModel, key: KeyEvent) -> Option<Dashboar
 
 /// Enter on the Repos pane just moves focus onto the Worktrees pane —
 /// there's nothing to "commit" about a repo row on its own, the worktree
-/// pane already tracks the repo cursor live (see `move_focused`). Enter on
-/// the Worktrees pane either toggles the focused row's checkbox
-/// (delete-mode, matching Space/click — the batch delete itself only ever
-/// commits on `d`, never Enter) or starts the clone/hook/create/launch
-/// pipeline for that row.
+/// pane already shows every repo's worktrees regardless. Enter on the
+/// Worktrees pane always starts the clone/hook/create/launch pipeline for
+/// the focused row — marking rows for removal is Space's job now, never
+/// Enter's.
 fn handle_enter(model: &mut DashboardModel) -> Option<DashboardOutcome> {
     match model.focus {
         Focus::Repos => {
@@ -176,41 +185,14 @@ fn handle_enter(model: &mut DashboardModel) -> Option<DashboardOutcome> {
             None
         }
         Focus::Worktrees => {
-            if model.delete_mode {
-                toggle_focused_if_existing(model);
-                return None;
-            }
             let selection = model.worktrees.selected()?.selection.clone();
             model.start_pending(selection)
         }
     }
 }
 
-/// `d` outside delete-mode: enters it. `d` with something checked: opens the
-/// removal confirm modal. `d` in delete-mode with nothing checked: backs
-/// out. The three-state toggle the plan's delete-flow section describes.
-fn toggle_delete_or_confirm(model: &mut DashboardModel) {
-    if !model.checked.is_empty() {
-        model.open_delete_confirm();
-    } else {
-        model.delete_mode = !model.delete_mode;
-    }
-}
-
-/// Never lets the synthetic "+ new worktree" row be checked for removal —
-/// there's nothing on disk yet to delete.
-fn toggle_focused_if_existing(model: &mut DashboardModel) {
-    let is_existing = matches!(
-        model.worktrees.selected().map(|r| &r.selection),
-        Some(WorktreeSelection::Existing(_))
-    );
-    if is_existing {
-        model.toggle_checked_focused();
-    }
-}
-
 fn toggle_focus(model: &mut DashboardModel) {
-    if matches!(model.scope, Scope::Browse { .. }) {
+    if model.repos.is_some() {
         model.focus = match model.focus {
             Focus::Repos => Focus::Worktrees,
             Focus::Worktrees => Focus::Repos,
@@ -220,10 +202,10 @@ fn toggle_focus(model: &mut DashboardModel) {
 
 fn focused_query_empty(model: &DashboardModel) -> bool {
     match model.focus {
-        Focus::Repos => match &model.scope {
-            Scope::Browse { repos } => repos.query.is_empty(),
-            _ => true,
-        },
+        Focus::Repos => model
+            .repos
+            .as_ref()
+            .is_none_or(|repos| repos.query.is_empty()),
         Focus::Worktrees => model.worktrees.query.is_empty(),
     }
 }
@@ -231,10 +213,9 @@ fn focused_query_empty(model: &DashboardModel) -> bool {
 fn move_focused(model: &mut DashboardModel, delta: isize) {
     match model.focus {
         Focus::Repos => {
-            if let Scope::Browse { repos } = &model.scope {
+            if let Some(repos) = &model.repos {
                 repos.move_selection(delta);
             }
-            model.refresh_worktree_pane();
         }
         Focus::Worktrees => model.worktrees.move_selection(delta),
     }
@@ -243,11 +224,10 @@ fn move_focused(model: &mut DashboardModel, delta: isize) {
 fn clear_focused_query(model: &mut DashboardModel) {
     match model.focus {
         Focus::Repos => {
-            if let Scope::Browse { repos } = &mut model.scope {
+            if let Some(repos) = &mut model.repos {
                 repos.query.clear();
                 repos.refilter(|r| r.filter_text.as_str());
             }
-            model.refresh_worktree_pane();
         }
         Focus::Worktrees => {
             model.worktrees.query.clear();
@@ -259,17 +239,10 @@ fn clear_focused_query(model: &mut DashboardModel) {
 fn backspace_focused(model: &mut DashboardModel) {
     match model.focus {
         Focus::Repos => {
-            let popped = if let Scope::Browse { repos } = &mut model.scope {
-                let popped = repos.query.pop().is_some();
-                if popped {
+            if let Some(repos) = &mut model.repos {
+                if repos.query.pop().is_some() {
                     repos.refilter(|r| r.filter_text.as_str());
                 }
-                popped
-            } else {
-                false
-            };
-            if popped {
-                model.refresh_worktree_pane();
             }
         }
         Focus::Worktrees => {
@@ -283,11 +256,10 @@ fn backspace_focused(model: &mut DashboardModel) {
 fn type_into_focused(model: &mut DashboardModel, c: char) {
     match model.focus {
         Focus::Repos => {
-            if let Scope::Browse { repos } = &mut model.scope {
+            if let Some(repos) = &mut model.repos {
                 repos.query.push(c);
                 repos.refilter(|r| r.filter_text.as_str());
             }
-            model.refresh_worktree_pane();
         }
         Focus::Worktrees => {
             model.worktrees.query.push(c);
@@ -299,10 +271,9 @@ fn type_into_focused(model: &mut DashboardModel, c: char) {
 /// Resolves a click to a row in whichever pane's last-rendered `Rect`
 /// contains it (checking the Repos pane first, when it exists — panes never
 /// overlap on screen, so at most one hit-tests true), focusing that pane and
-/// row. A click never activates a row — see CLAUDE.md's mouse invariant —
-/// except that, like the keyboard, delete-mode also toggles the checkbox on
-/// the row it just focused. Scroll wheel events move the currently focused
-/// pane's selection, same as `j`/`k`.
+/// row. A click never activates a row, and never marks one either — see
+/// CLAUDE.md's mouse invariant; marking is Space's job. Scroll wheel events
+/// move the currently focused pane's selection, same as `j`/`k`.
 fn handle_mouse(model: &mut DashboardModel, mouse: MouseEvent) {
     if model.modal.is_some() {
         return;
@@ -316,25 +287,21 @@ fn handle_mouse(model: &mut DashboardModel, mouse: MouseEvent) {
 }
 
 fn handle_mouse_down(model: &mut DashboardModel, mouse: MouseEvent) {
-    let repo_idx = match &model.scope {
-        Scope::Browse { repos } => hit_test(repos.table_rect.get(), repos, mouse),
-        _ => None,
-    };
+    let repo_idx = model
+        .repos
+        .as_ref()
+        .and_then(|repos| hit_test(repos.table_rect.get(), repos, mouse));
     if let Some(idx) = repo_idx {
-        if let Scope::Browse { repos } = &model.scope {
+        if let Some(repos) = &model.repos {
             repos.select(Some(idx));
         }
         model.focus = Focus::Repos;
-        model.refresh_worktree_pane();
         return;
     }
 
     if let Some(idx) = hit_test(model.worktrees.table_rect.get(), &model.worktrees, mouse) {
         model.worktrees.select(Some(idx));
         model.focus = Focus::Worktrees;
-        if model.delete_mode {
-            toggle_focused_if_existing(model);
-        }
     }
 }
 
@@ -352,7 +319,7 @@ mod tests {
     use super::*;
     use crate::config::{AgentConfig, Config};
     use crate::hooks::HookConsent;
-    use crate::worktree::WorktreeEntry as ScannedEntry;
+    use crate::worktree::{WorktreeEntry as ScannedEntry, WorktreeSelection};
     use ratatui::layout::Rect;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -414,7 +381,7 @@ mod tests {
     /// (the real `~/.cache/cw` store), so a test that reaches
     /// `resolve_hook_consent`'s `save_consent` call never touches the user's
     /// actual machine state.
-    fn all_worktrees_model(entries: Vec<ScannedEntry>, delete_mode: bool) -> DashboardModel {
+    fn all_worktrees_model(entries: Vec<ScannedEntry>) -> DashboardModel {
         let consent_dir = tempfile::tempdir().expect("tempdir");
         let mut model = DashboardModel::new_all_worktrees(
             PathBuf::from("/nonexistent-root"),
@@ -422,7 +389,6 @@ mod tests {
             HookConsent::new(),
             consent_dir.path().join("hook-consent.json"),
             false,
-            delete_mode,
             false,
         );
         // Leak the tempdir for the model's lifetime — test-only, avoids a
@@ -435,37 +401,47 @@ mod tests {
         model
     }
 
-    // --- Esc nesting: delete-mode -> filter -> cancel -------------------
+    // --- Esc nesting: filter -> checked -> cancel -------------------------
 
     #[test]
-    fn esc_exits_delete_mode_before_clearing_filter() {
-        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")], true);
+    fn esc_clears_query_before_checked_before_cancelling() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
         model.worktrees.query.push_str("abc");
         model.worktrees.refilter(|r| r.filter_text.as_str());
+        model
+            .checked
+            .insert(PathBuf::from("/nonexistent-root/acme/proj/one"));
 
         assert!(update_dashboard(&mut model, key(KeyCode::Esc)).is_none());
-        assert!(!model.delete_mode, "first Esc must exit delete-mode");
+        assert_eq!(model.worktrees.query, "", "first Esc clears the filter");
         assert_eq!(
-            model.worktrees.query, "abc",
-            "delete-mode exit must not also clear the filter"
+            model.checked.len(),
+            1,
+            "clearing the filter must not also clear the checked set"
         );
 
         assert!(update_dashboard(&mut model, key(KeyCode::Esc)).is_none());
-        assert_eq!(model.worktrees.query, "", "second Esc clears the filter");
+        assert!(
+            model.checked.is_empty(),
+            "second Esc, with the filter already empty, clears the checked set"
+        );
 
         match update_dashboard(&mut model, key(KeyCode::Esc)) {
             Some(DashboardOutcome::Cancelled) => {}
-            _ => panic!("third Esc, with delete-mode off and filter empty, must cancel"),
+            _ => panic!("third Esc, with filter empty and nothing checked, must cancel"),
         }
     }
 
     #[test]
     fn ctrl_c_cancels_immediately_regardless_of_state() {
-        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")], true);
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
         model.worktrees.query.push('c');
+        model
+            .checked
+            .insert(PathBuf::from("/nonexistent-root/acme/proj/one"));
         match update_dashboard(&mut model, ctrl_c()) {
             Some(DashboardOutcome::Cancelled) => {}
-            _ => panic!("Ctrl-C must cancel even with filter text and delete-mode active"),
+            _ => panic!("Ctrl-C must cancel even with filter text and a checked row"),
         }
     }
 
@@ -494,24 +470,166 @@ mod tests {
             dirty: HashMap::new(),
         }));
 
+        assert_eq!(
+            model.focus,
+            Focus::Worktrees,
+            "bare cw opens focused on the worktree pane, not the repo pane"
+        );
+        update_dashboard(&mut model, key(KeyCode::Char('z')));
+        assert_eq!(model.focus, Focus::Worktrees);
+
+        update_dashboard(&mut model, key(KeyCode::Tab));
         assert_eq!(model.focus, Focus::Repos);
         update_dashboard(&mut model, key(KeyCode::Char('a')));
-        assert_eq!(model.focus, Focus::Repos);
 
         update_dashboard(&mut model, key(KeyCode::Tab));
         assert_eq!(model.focus, Focus::Worktrees);
-        update_dashboard(&mut model, key(KeyCode::Char('z')));
 
-        update_dashboard(&mut model, key(KeyCode::Tab));
-        assert_eq!(model.focus, Focus::Repos);
-
-        let Scope::Browse { repos } = &model.scope else {
-            panic!("expected Browse scope");
-        };
+        let repos = model
+            .repos
+            .as_ref()
+            .expect("Scope::Browse must carry a repo pane");
         assert_eq!(repos.query, "a", "repo pane's own query must survive Tab");
         assert_eq!(
             model.worktrees.query, "z",
             "worktree pane's own query must survive Tab"
+        );
+    }
+
+    // --- Repo-cursor movement no longer touches the worktree pane --------
+
+    #[test]
+    fn repo_cursor_move_preserves_checked_set_and_worktree_selection() {
+        let repos = vec![
+            crate::github::Repo {
+                owner: "acme".to_string(),
+                name: "first".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            crate::github::Repo {
+                owner: "acme".to_string(),
+                name: "second".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+        ];
+        let consent_dir = tempfile::tempdir().expect("tempdir");
+        let mut model = DashboardModel::new_browse(
+            repos,
+            PathBuf::from("/nonexistent-root"),
+            config_with_agents(&["claude"]),
+            HookConsent::new(),
+            consent_dir.path().join("hook-consent.json"),
+            false,
+            None,
+        );
+        std::mem::forget(consent_dir);
+        model.apply_worktrees_load(Ok(super::super::msg::WorktreesLoad {
+            entries: vec![
+                scanned_entry("acme/first", "one"),
+                scanned_entry("acme/second", "two"),
+            ],
+            dirty: HashMap::new(),
+        }));
+
+        // The worktree pane shows every repo's worktrees regardless of the
+        // repo pane's cursor, not just the selected repo's.
+        let existing_count = model
+            .worktrees
+            .items
+            .iter()
+            .filter(|r| matches!(r.selection, WorktreeSelection::Existing(_)))
+            .count();
+        assert_eq!(existing_count, 2);
+
+        update_dashboard(&mut model, key(KeyCode::Char(' '))); // check the focused row
+        assert_eq!(model.checked.len(), 1);
+        let checked_before = model.checked.clone();
+        let selected_before = model.worktrees.selected_index();
+
+        update_dashboard(&mut model, key(KeyCode::Tab)); // -> Repos
+        assert_eq!(model.focus, Focus::Repos);
+        update_dashboard(&mut model, key(KeyCode::Down)); // move the repo cursor
+
+        assert_eq!(
+            model.checked, checked_before,
+            "repo-cursor movement must not touch the checked set"
+        );
+        assert_eq!(
+            model.worktrees.selected_index(),
+            selected_before,
+            "repo-cursor movement must not reset the worktree pane's selection"
+        );
+    }
+
+    #[test]
+    fn refresh_worktree_pane_preserves_selection_by_path() {
+        let mut model = all_worktrees_model(vec![
+            scanned_entry("acme/proj", "one"),
+            scanned_entry("acme/proj", "two"),
+            scanned_entry("acme/proj", "three"),
+        ]);
+        update_dashboard(&mut model, key(KeyCode::Down)); // focus row "two"
+        let focused_path = match &model.worktrees.selected().unwrap().selection {
+            WorktreeSelection::Existing(entry) => entry.path.clone(),
+            WorktreeSelection::New => panic!("expected an existing row"),
+        };
+
+        // Simulate an `r` rescan resolving — same entries, reordered, as a
+        // fresh scan off disk would return.
+        model.apply_worktrees_load(Ok(super::super::msg::WorktreesLoad {
+            entries: vec![
+                scanned_entry("acme/proj", "three"),
+                scanned_entry("acme/proj", "one"),
+                scanned_entry("acme/proj", "two"),
+            ],
+            dirty: HashMap::new(),
+        }));
+
+        let still_focused_path = match &model.worktrees.selected().unwrap().selection {
+            WorktreeSelection::Existing(entry) => entry.path.clone(),
+            WorktreeSelection::New => panic!("expected an existing row"),
+        };
+        assert_eq!(
+            still_focused_path, focused_path,
+            "a rescan must keep the same row focused by path, not reset to row zero"
+        );
+    }
+
+    // --- Space marks, never types --------------------------------------
+
+    #[test]
+    fn space_marks_when_query_is_empty() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        assert_eq!(model.worktrees.query, "");
+
+        update_dashboard(&mut model, key(KeyCode::Char(' ')));
+
+        assert_eq!(
+            model.worktrees.query, "",
+            "space must not be typed into an already-empty filter"
+        );
+        assert_eq!(
+            model.checked.len(),
+            1,
+            "space must toggle the focused row's check-mark instead"
+        );
+    }
+
+    #[test]
+    fn space_types_into_an_active_filter_instead_of_marking() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        model.worktrees.query.push_str("ab");
+        model.worktrees.refilter(|r| r.filter_text.as_str());
+
+        update_dashboard(&mut model, key(KeyCode::Char(' ')));
+
+        assert_eq!(
+            model.worktrees.query, "ab ",
+            "space with an active filter must be gated like 'd'/'r' and type into the query"
+        );
+        assert!(
+            model.checked.is_empty(),
+            "a gated space must not mark the focused row"
         );
     }
 
@@ -530,7 +648,6 @@ mod tests {
             config_with_agents(&["claude"]),
             HookConsent::new(),
             consent_dir.path().join("hook-consent.json"),
-            false,
             false,
             false,
         );
@@ -580,62 +697,106 @@ mod tests {
         assert!(flipped.dirty, "DirtyRefreshed must update the cached flag");
     }
 
-    // --- Delete three-state toggle ---------------------------------------
-
     #[test]
-    fn d_three_state_toggle_enter_confirm_back_out() {
-        let mut model = all_worktrees_model(
-            vec![
-                scanned_entry("acme/proj", "one"),
-                scanned_entry("acme/proj", "two"),
-            ],
-            false,
+    fn checked_set_survives_dirty_refresh() {
+        let entry = scanned_entry("acme/proj", "one");
+        let mut model = all_worktrees_model(vec![entry.clone()]);
+        update_dashboard(&mut model, key(KeyCode::Char(' '))); // check the only row
+        assert_eq!(model.checked.len(), 1);
+
+        update_dashboard(
+            &mut model,
+            Msg::DirtyRefreshed(entry.path.clone(), Ok(true)),
         );
 
-        // State 1: not in delete-mode, nothing checked -> `d` enters it.
-        assert!(update_dashboard(&mut model, key(KeyCode::Char('d'))).is_none());
-        assert!(model.delete_mode);
-        assert!(model.modal.is_none());
+        assert_eq!(
+            model.checked.len(),
+            1,
+            "a background dirty-status refresh must not wipe the checked set"
+        );
+        assert!(model.checked.contains(&entry.path));
+    }
 
-        // State 2: in delete-mode, focused row checked -> `d` opens confirm.
-        update_dashboard(&mut model, key(KeyCode::Char(' ')));
+    // --- Mark-and-delete via `d` ------------------------------------------
+
+    #[test]
+    fn d_opens_confirm_for_checked_set() {
+        let mut model = all_worktrees_model(vec![
+            scanned_entry("acme/proj", "one"),
+            scanned_entry("acme/proj", "two"),
+        ]);
+
+        update_dashboard(&mut model, key(KeyCode::Char(' '))); // check the focused row
         assert_eq!(model.checked.len(), 1);
+
         assert!(update_dashboard(&mut model, key(KeyCode::Char('d'))).is_none());
         assert!(
             matches!(model.modal, Some(Modal::ConfirmDelete { .. })),
             "d with something checked must open the confirm modal"
         );
 
-        // Back out of the modal without confirming, uncheck, then `d` with
-        // nothing checked while still in delete-mode backs all the way out.
-        update_dashboard(&mut model, key(KeyCode::Esc));
+        // 'n' backs out without clearing the checked set — only Esc or an
+        // actual confirm does that.
+        update_dashboard(&mut model, key(KeyCode::Char('n')));
         assert!(model.modal.is_none());
-        update_dashboard(&mut model, key(KeyCode::Char(' '))); // uncheck
-        assert!(model.checked.is_empty());
-        assert!(update_dashboard(&mut model, key(KeyCode::Char('d'))).is_none());
-        assert!(
-            !model.delete_mode,
-            "d with nothing checked while already in delete-mode must back out"
+        assert_eq!(
+            model.checked.len(),
+            1,
+            "declining the confirm modal must leave the checked set untouched"
         );
     }
 
     #[test]
-    fn d_gated_on_active_filter_types_instead_of_toggling() {
-        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")], true);
+    fn d_with_nothing_checked_targets_focused_row() {
+        let mut model = all_worktrees_model(vec![
+            scanned_entry("acme/proj", "one"),
+            scanned_entry("acme/proj", "two"),
+        ]);
+        assert!(model.checked.is_empty());
+
+        let focused_path = match &model
+            .worktrees
+            .selected()
+            .expect("a row must be focused")
+            .selection
+        {
+            WorktreeSelection::Existing(entry) => entry.path.clone(),
+            WorktreeSelection::New => panic!("expected an existing row to be focused"),
+        };
+
+        assert!(update_dashboard(&mut model, key(KeyCode::Char('d'))).is_none());
+        match &model.modal {
+            Some(Modal::ConfirmDelete { targets, .. }) => {
+                assert_eq!(
+                    targets,
+                    &vec![focused_path],
+                    "d with nothing checked must target only the currently focused row"
+                );
+            }
+            _ => panic!("expected d to open the confirm modal for the focused row"),
+        }
+    }
+
+    #[test]
+    fn d_gated_on_active_filter_types_instead_of_opening_confirm() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
         model.worktrees.query.push_str("abc");
         model.worktrees.refilter(|r| r.filter_text.as_str());
 
         assert!(update_dashboard(&mut model, key(KeyCode::Char('d'))).is_none());
         assert_eq!(
             model.worktrees.query, "abcd",
-            "'d' with an active filter must type into the query, not toggle delete-mode"
+            "'d' with an active filter must type into the query, not open the confirm modal"
         );
-        assert!(model.delete_mode, "delete-mode must be unaffected");
+        assert!(
+            model.modal.is_none(),
+            "a gated 'd' must not open the confirm modal"
+        );
     }
 
     #[test]
     fn confirm_delete_modal_yes_removes_only_checked() {
-        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")], true);
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
         update_dashboard(&mut model, key(KeyCode::Char(' '))); // check the only row
         update_dashboard(&mut model, key(KeyCode::Char('d'))); // opens confirm
         assert!(matches!(model.modal, Some(Modal::ConfirmDelete { .. })));
@@ -646,11 +807,75 @@ mod tests {
         assert_eq!(model.all_entries.len(), 1);
     }
 
+    // --- The list stops going stale on create -----------------------------
+
+    /// Drives a real `Scope::SingleRepo` (`cw scratch`) worktree-creation
+    /// pipeline against a tempdir-backed git repo — `Scope::SingleRepo`'s
+    /// "+ new worktree" selection reaches `Stage::CreatingWorktree` directly
+    /// (no clone/pull stage, unlike `Scope::Browse`), so this is the cheapest
+    /// real path to `DashboardModel::do_create_worktree` without a
+    /// background clone thread. Regression guard for the asymmetry `clean.rs`
+    /// already didn't have: removal already keeps `all_entries` current
+    /// (`confirm_delete`), creation used to leave a freshly created worktree
+    /// invisible until `cw` was quit and relaunched.
+    #[test]
+    fn created_worktree_lands_in_all_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo = git2::Repository::init(&repo_root).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        std::fs::write(repo_root.join("README.md"), "hi").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+
+        let consent_dir = tempfile::tempdir().expect("tempdir");
+        let mut model = DashboardModel::new_single_repo(
+            "acme/proj".to_string(),
+            repo_root,
+            dir.path().to_path_buf(),
+            config_with_agents(&["claude"]),
+            HookConsent::new(),
+            consent_dir.path().join("hook-consent.json"),
+            false,
+            Some("feature".to_string()),
+        );
+        std::mem::forget(consent_dir);
+
+        assert!(model.all_entries.is_empty());
+        let outcome = model.start_pending(WorktreeSelection::New);
+        match outcome {
+            Some(DashboardOutcome::Suspend(super::super::model::SuspendReq::LaunchAgent {
+                ..
+            })) => {}
+            other => panic!(
+                "expected the pipeline to reach a launch once the worktree was created, got {}",
+                describe(&other)
+            ),
+        }
+
+        assert_eq!(
+            model.all_entries.len(),
+            1,
+            "a freshly created worktree must land in the in-memory scanned-entries list"
+        );
+        let created = &model.all_entries[0];
+        assert_eq!(created.repo, "acme/proj");
+        assert_eq!(created.slug, "feature");
+        assert!(created.path.join(".git").exists());
+    }
+
     // --- Hook-consent-once-per-repo ---------------------------------------
 
     #[test]
     fn hook_consent_declined_is_recorded_and_not_reprompted() {
-        let mut model = all_worktrees_model(vec![], false);
+        let mut model = all_worktrees_model(vec![]);
         model.pending = Some(super::super::model::PendingLaunch {
             ctx: super::super::model::LaunchContext {
                 repo_label: "acme/proj".to_string(),
@@ -706,7 +931,6 @@ mod tests {
             consent_dir.path().join("hook-consent.json"),
             false,
             false,
-            false,
         );
         std::mem::forget(consent_dir);
         model.pending = Some(super::super::model::PendingLaunch {
@@ -756,7 +980,7 @@ mod tests {
 
     #[test]
     fn resume_after_hook_ok_advances_stage_and_continues_the_pipeline() {
-        let mut model = all_worktrees_model(vec![], false);
+        let mut model = all_worktrees_model(vec![]);
         model.pending = Some(super::super::model::PendingLaunch {
             ctx: super::super::model::LaunchContext {
                 repo_label: "acme/proj".to_string(),
@@ -792,7 +1016,7 @@ mod tests {
 
     #[test]
     fn resume_after_hook_err_records_status_but_still_advances() {
-        let mut model = all_worktrees_model(vec![], false);
+        let mut model = all_worktrees_model(vec![]);
         model.pending = Some(super::super::model::PendingLaunch {
             ctx: super::super::model::LaunchContext {
                 repo_label: "acme/proj".to_string(),
@@ -836,14 +1060,11 @@ mod tests {
 
     #[test]
     fn mouse_click_focuses_worktree_row_without_activating() {
-        let mut model = all_worktrees_model(
-            vec![
-                scanned_entry("acme/proj", "one"),
-                scanned_entry("acme/proj", "two"),
-                scanned_entry("acme/proj", "three"),
-            ],
-            false,
-        );
+        let mut model = all_worktrees_model(vec![
+            scanned_entry("acme/proj", "one"),
+            scanned_entry("acme/proj", "two"),
+            scanned_entry("acme/proj", "three"),
+        ]);
         model.worktrees.table_rect.set(Rect::new(0, 0, 40, 4)); // header + 3 rows
 
         let click = Msg::Mouse(MouseEvent {
@@ -862,7 +1083,7 @@ mod tests {
 
     #[test]
     fn clone_done_up_to_date_skips_clone_hook_goes_to_launching() {
-        let mut model = all_worktrees_model(vec![], false);
+        let mut model = all_worktrees_model(vec![]);
         model.pending = Some(super::super::model::PendingLaunch {
             ctx: super::super::model::LaunchContext {
                 repo_label: "acme/proj".to_string(),
@@ -900,7 +1121,7 @@ mod tests {
 
     #[test]
     fn clone_done_failure_clears_pending_and_sets_status() {
-        let mut model = all_worktrees_model(vec![], false);
+        let mut model = all_worktrees_model(vec![]);
         model.pending = Some(super::super::model::PendingLaunch {
             ctx: super::super::model::LaunchContext {
                 repo_label: "acme/proj".to_string(),
@@ -928,13 +1149,10 @@ mod tests {
 
     #[test]
     fn enter_while_pending_in_flight_does_not_overwrite_it() {
-        let mut model = all_worktrees_model(
-            vec![
-                scanned_entry("acme/first", "one"),
-                scanned_entry("acme/second", "two"),
-            ],
-            false,
-        );
+        let mut model = all_worktrees_model(vec![
+            scanned_entry("acme/first", "one"),
+            scanned_entry("acme/second", "two"),
+        ]);
         model.pending = Some(super::super::model::PendingLaunch {
             ctx: super::super::model::LaunchContext {
                 repo_label: "acme/inflight".to_string(),
