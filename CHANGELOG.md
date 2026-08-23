@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/imabee0/cw/compare/v0.1.10...v0.1.11) - 2026-08-23
+
+### Other
+
+- sync CLAUDE.md/README/Cargo.toml with wave 2/3 behavior ([#23](https://github.com/imabee0/cw/pull/23))
+
 ## [0.1.10](https://github.com/imabee0/cw/compare/v0.1.9...v0.1.10) - 2026-08-23
 
 ### Added
