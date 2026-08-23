@@ -8,8 +8,9 @@
 //!
 //! This is the impure boundary the pure `tui::update`/`tui::model` code
 //! deliberately stays out of: background threads (repo discovery, the
-//! one-shot worktree scan, the clone/pull thread) are all spawned from
-//! here, never from `tui::update::update_dashboard`.
+//! worktree scan — re-armed on demand by the `r` key — and the clone/pull
+//! thread) are all spawned from here, never from
+//! `tui::update::update_dashboard`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,7 +28,7 @@ use crate::github;
 use crate::gitstatus;
 use crate::hooks;
 use crate::sync::{self, CloneStdio};
-use crate::tui::model::{DashboardModel, DashboardOutcome, Focus, Stage, SuspendReq};
+use crate::tui::model::{DashboardModel, DashboardOutcome, Stage, SuspendReq};
 use crate::tui::msg::{CloneOutcome, WorktreesLoad};
 use crate::tui::{self, update, view, Msg, RepoLoad};
 use crate::worktree;
@@ -155,7 +156,11 @@ struct DashboardScreen {
     /// dashboard.rs territory anyway.
     no_pull: bool,
     repo_rx: Option<mpsc::Receiver<RepoLoad>>,
-    worktrees_rx: mpsc::Receiver<Result<WorktreesLoad, String>>,
+    /// `None` once the in-flight scan's result has been consumed — the
+    /// re-armable half of `r`'s rescan (see `maybe_spawn_rescan`): a channel
+    /// only ever yields once, so a fresh one is spawned per scan rather than
+    /// reused.
+    worktrees_rx: Option<mpsc::Receiver<Result<WorktreesLoad, String>>>,
     clone_rx: Option<mpsc::Receiver<Result<CloneOutcome, String>>>,
 }
 
@@ -164,6 +169,7 @@ impl tui::Screen for DashboardScreen {
 
     fn update(&mut self, msg: Msg) -> Option<Self::Outcome> {
         let is_clone_done = matches!(msg, Msg::CloneDone(_));
+        let is_worktrees_loaded = matches!(msg, Msg::WorktreesLoaded(_));
         let outcome = update::update_dashboard(&mut self.model, msg);
         if is_clone_done {
             // Whether it succeeded or failed, this attempt is over — a
@@ -171,7 +177,13 @@ impl tui::Screen for DashboardScreen {
             // able to spawn a fresh clone thread.
             self.clone_rx = None;
         }
+        if is_worktrees_loaded {
+            // Same reasoning as `clone_rx` above — a scan's channel only
+            // ever yields once, so a later `r` needs a fresh one.
+            self.worktrees_rx = None;
+        }
         self.maybe_spawn_clone();
+        self.maybe_spawn_rescan();
         outcome
     }
 
@@ -185,8 +197,10 @@ impl tui::Screen for DashboardScreen {
                 return Some(Msg::DataLoaded(load));
             }
         }
-        if let Ok(result) = self.worktrees_rx.try_recv() {
-            return Some(Msg::WorktreesLoaded(result));
+        if let Some(rx) = &self.worktrees_rx {
+            if let Ok(result) = rx.try_recv() {
+                return Some(Msg::WorktreesLoaded(result));
+            }
         }
         if let Some(rx) = &self.clone_rx {
             if let Ok(result) = rx.try_recv() {
@@ -238,6 +252,21 @@ impl DashboardScreen {
         });
         self.clone_rx = Some(rx);
     }
+
+    /// Reactive, same pattern as `maybe_spawn_clone`: `r` sets
+    /// `DashboardModel::rescan_requested` (`tui/update.rs`), and this checks
+    /// after every `update()` call whether that just happened. Guarded on
+    /// `worktrees_rx.is_none()` so a second `r` while a scan is already in
+    /// flight doesn't spawn a duplicate — the request just stays pending
+    /// until the current scan resolves and clears `worktrees_rx` (see
+    /// `Screen::update` above).
+    fn maybe_spawn_rescan(&mut self) {
+        if !self.model.rescan_requested || self.worktrees_rx.is_some() {
+            return;
+        }
+        self.model.rescan_requested = false;
+        self.worktrees_rx = Some(spawn_worktrees_thread(self.model.root.clone()));
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -272,10 +301,10 @@ fn build_screen(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result
                 forced_slug,
             );
             if forced {
-                // Nothing left to pick in the repo pane — start the user
-                // straight on the worktree choice, which is the only real
-                // decision remaining.
-                m.focus = Focus::Worktrees;
+                // Nothing left to load in the repo pane — the dashboard
+                // already opens focused on the worktree pane regardless
+                // (`new_browse`), so this only needs to stop the "loading
+                // repos…" placeholder from showing.
                 m.loading = false;
             }
             m
@@ -287,7 +316,6 @@ fn build_screen(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result
             consent_path,
             auto_yes,
             false,
-            false,
         ),
         Entry::Clean { force } => DashboardModel::new_all_worktrees(
             root.to_path_buf(),
@@ -295,7 +323,6 @@ fn build_screen(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result
             hook_consent,
             consent_path,
             auto_yes,
-            true,
             force,
         ),
         Entry::Scratch { forced_slug } => {
@@ -331,7 +358,7 @@ fn build_screen(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result
         model,
         no_pull: cli.no_pull,
         repo_rx,
-        worktrees_rx: spawn_worktrees_thread(root.to_path_buf()),
+        worktrees_rx: Some(spawn_worktrees_thread(root.to_path_buf())),
         clone_rx: None,
     })
 }
@@ -395,13 +422,14 @@ fn load_cached_repos() -> Result<Vec<github::Repo>> {
         .unwrap_or_default())
 }
 
-/// Spawned once at dashboard construction regardless of `Entry`: every
-/// worktree across every repo, plus a one-time `gitstatus::is_dirty` pass
-/// over each — the fix for the per-keystroke `is_dirty` I/O storm
-/// `WorktreeRow::existing` used to cause on every repo-cursor move (see
-/// CLAUDE.md and `tui::model`'s module doc). Every later repo-cursor move is
-/// a pure in-memory filter over this snapshot plus `Msg::DirtyRefreshed`
-/// updates, never a fresh scan.
+/// Spawned at dashboard construction regardless of `Entry`, and again by
+/// `DashboardScreen::maybe_spawn_rescan` on each `r` press: every worktree
+/// across every repo, plus a `gitstatus::is_dirty` pass over each — the fix
+/// for the per-keystroke `is_dirty` I/O storm `WorktreeRow::existing` used
+/// to cause on every repo-cursor move (see CLAUDE.md and `tui::model`'s
+/// module doc). Every repo-cursor move or filter keystroke between scans is
+/// a pure in-memory filter over the last scan's snapshot plus
+/// `Msg::DirtyRefreshed` updates, never a fresh scan on its own.
 fn spawn_worktrees_thread(root: PathBuf) -> mpsc::Receiver<Result<WorktreesLoad, String>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {

@@ -384,16 +384,6 @@ pub enum WorktreeSelection {
     New,
 }
 
-/// One worktree checked in `cw clean`'s multi-select delete mode, plus the
-/// dirty flag already computed while annotating the row — so `clean.rs`
-/// never needs to re-open the repo itself just to decide whether `--force`
-/// is required.
-#[derive(Debug, Clone)]
-pub struct CleanCandidate {
-    pub entry: WorktreeEntry,
-    pub dirty: bool,
-}
-
 /// `cw scratch` — repo-less worktrees, reusing the existing worktree
 /// machinery unchanged. Lazily creates a synthetic repo at
 /// `<root>/.scratch/workspace` with one empty commit (so
