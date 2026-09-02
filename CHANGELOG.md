@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/imabee0/cw/compare/v0.1.12...v0.1.13) - 2026-09-02
+
+### Fixed
+
+- *(release)* rustup update stable before cargo-dist Darwin builds ([#28](https://github.com/imabee0/cw/pull/28))
+
 ## [0.1.12](https://github.com/imabee0/cw/compare/v0.1.11...v0.1.12) - 2026-09-02
 
 ### Added
