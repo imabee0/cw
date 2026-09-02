@@ -138,20 +138,38 @@ fn run_suspend_chain(screen: &mut DashboardScreen, mut req: SuspendReq) -> Resul
                 agent: agent_cfg,
                 worktree_path,
             } => {
+                // Read before `resume_after_launch` clears `pending`; falls
+                // back to the worktree's own `<repo>/.claude/worktrees/<slug>`
+                // ancestry when there's no pipeline to ask.
+                let repo_root = screen
+                    .model
+                    .pending
+                    .as_ref()
+                    .map(|p| p.repo_root.clone())
+                    .or_else(|| worktree_path.ancestors().nth(3).map(Path::to_path_buf))
+                    .unwrap_or_default();
                 let result = agent::launch(&agent_cfg, &worktree_path);
-                let dirty = gitstatus::is_dirty(&worktree_path).map_err(|e| format!("{e:#}"));
+                let work =
+                    gitstatus::work_state(&worktree_path, &repo_root).map_err(|e| format!("{e:#}"));
                 // Routed through `update_dashboard` (not a direct
-                // `apply_dirty_refresh` call) so a real `Msg::DirtyRefreshed`
+                // `apply_work_refresh` call) so a real `Msg::WorkRefreshed`
                 // is constructed here, same as every other background
                 // result — the agent session may have left the worktree
-                // dirty (or clean again), and the pane's cached flag needs
-                // exactly this one fresh read to reflect it.
+                // changed (or clean again), and the pane's cached state
+                // needs exactly this one fresh read to reflect it.
                 update::update_dashboard(
                     &mut screen.model,
-                    Msg::DirtyRefreshed(worktree_path.clone(), dirty),
+                    Msg::WorkRefreshed(worktree_path.clone(), work),
                 );
                 screen.model.resume_after_launch();
-                result?;
+                // A launch that couldn't even start (binary not on PATH) is
+                // reported in the dashboard and the session continues —
+                // never a hard exit that tears the whole TUI down.
+                if let Err(e) = result {
+                    screen
+                        .model
+                        .report_launch_failure(&agent_cfg.cmd, format!("{e:#}"));
+                }
                 return Ok(false);
             }
             SuspendReq::ApplyUpdate => {
@@ -466,24 +484,32 @@ fn load_cached_repos() -> Result<Vec<github::Repo>> {
 
 /// Spawned at dashboard construction regardless of `Entry`, and again by
 /// `DashboardScreen::maybe_spawn_rescan` on each `r` press: every worktree
-/// across every repo, plus a `gitstatus::is_dirty` pass over each — the fix
-/// for the per-keystroke `is_dirty` I/O storm `WorktreeRow::existing` used
-/// to cause on every repo-cursor move (see CLAUDE.md and `tui::model`'s
-/// module doc). Every repo-cursor move or filter keystroke between scans is
-/// a pure in-memory filter over the last scan's snapshot plus
-/// `Msg::DirtyRefreshed` updates, never a fresh scan on its own.
+/// across every repo, plus a `gitstatus::work_state` pass over each
+/// (changed files + unpushed commits — the removal confirm's risky/safe
+/// signal). Every repo-cursor move or filter keystroke between scans is a
+/// pure in-memory filter over the last scan's snapshot plus
+/// `Msg::WorkRefreshed` updates, never a fresh git read on its own.
 fn spawn_worktrees_thread(root: PathBuf) -> mpsc::Receiver<Result<WorktreesLoad, String>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = worktree::scan_worktrees(&root)
             .map_err(|e| format!("{e:#}"))
             .map(|entries| {
-                let mut dirty = HashMap::new();
+                let mut work = HashMap::new();
                 for e in &entries {
-                    let is_dirty = gitstatus::is_dirty(&e.path).unwrap_or(false);
-                    dirty.insert(e.path.clone(), is_dirty);
+                    let state = match gitstatus::work_state(&e.path, &root.join(&e.repo)) {
+                        Ok(s) => Some(s),
+                        Err(err) => {
+                            tracing::warn!(
+                                "reading work state of {}: {err:#} — treating as unknown",
+                                e.path.display()
+                            );
+                            None
+                        }
+                    };
+                    work.insert(e.path.clone(), state);
                 }
-                WorktreesLoad { entries, dirty }
+                WorktreesLoad { entries, work }
             });
         let _ = tx.send(result);
     });

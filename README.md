@@ -45,8 +45,16 @@ symlink_dirs = []
 cmd = "claude"
 args = []
 
+[agents.codex]
+cmd = "codex"
+args = []
+
 [agents.grok]
 cmd = "grok"
+args = []
+
+[agents.opencode]
+cmd = "opencode"
 args = []
 
 [agents.shell]
@@ -56,7 +64,7 @@ args = []
 
 ## Usage
 
-**Default flow** — pick a repo, clone/pull, create or resume a worktree, launch the default agent. `cw` (bare), `cw resume`, and `cw clean` all open on a worktree pane listing every worktree across every repo — no need to pick a repo first; picking one in the repo pane only targets it for clone/pull or a new worktree. Every pane supports arrow keys/`j`/`k`, live fuzzy filtering, and mouse click/scroll (a click focuses a row; Enter commits it). In the worktree pane: `Space` marks/unmarks a row for removal, `d` opens a removal confirm for the marked rows (or just the focused row if none are marked), `r` rescans, `u` applies a pending self-update, `Esc` clears the filter, then the marked set, then cancels:
+**Default flow** — pick a repo, clone/pull, create or resume a worktree, launch the selected agent. `cw` (bare), `cw resume`, and `cw clean` all open on a worktree pane listing every worktree across every repo. Click a row to focus it, double-click (or Enter) to open it; click an agent in the footer (or `←`/`→`) to choose claude/codex/grok/opencode/shell. Every pane supports arrow keys/`j`/`k`, live fuzzy filtering, and mouse click/scroll. In the worktree pane: `Space` marks a row, `d` opens a removal confirm (marked rows, or the focused row if none are marked). Confirm with `y`; worktrees with changed files or unpushed commits are kept unless you press `f` first (or started with `cw clean --force`). `r` rescans, `u` applies a pending self-update, `Esc` clears the status, then the filter, then the marked set, then cancels. Clone/pull and launch failures open an error modal (also written to `~/.cache/cw/cw.log.<date>`):
 
 ```bash
 cw
@@ -67,8 +75,8 @@ cw --repo owner/name my-slug # skip the repo picker, act on a named repo directl
 
 - `cw resume` — open straight on the worktree pane (see above), skipping the repo pane entirely.
 - `cw scratch [SLUG]` — a real worktree with no project attached, for quick work that doesn't belong to a repo.
-- `cw clean` / `cw clean --force` — remove finished worktrees (annotated dirty/clean and idle-days; dirty entries need `--force`); same `Space`/`d` flow as any worktree pane.
-- `cw doctor` — sanity-check the environment (`gh` auth, git credential helper, terminal, each configured agent on `PATH`); exits nonzero if anything fails.
+- `cw clean` / `cw clean --force` — remove finished worktrees (STATUS shows changed files / unpushed commits; `--force` starts the confirm including those). Same `Space`/`d` flow as any worktree pane.
+- `cw doctor` — sanity-check the environment (`gh` auth, git credential helper, terminal, each configured agent on `PATH`); only a missing `default_agent` fails the exit code.
 - `cw --repo owner/name --dry-run my-slug` — preview the clone/pull + worktree + agent decision without mutating anything.
 - `cw completions zsh` — emit a shell completion script; install via a directory on `fpath` (e.g. `mkdir -p ~/.zfunc && cw completions zsh > ~/.zfunc/_cw`, with `fpath=(~/.zfunc $fpath)` placed *before* `compinit` in `~/.zshrc`). Appending straight into `~/.zshrc` also works only if that file calls `compinit` earlier in the same file — `fpath` avoids the ordering trap.
 

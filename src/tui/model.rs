@@ -1,13 +1,12 @@
 //! `DashboardModel`: the single composite Model backing `cw`'s persistent
-//! split-pane dashboard (`dashboard.rs`). Replaces the old
-//! `RepoModel`/`WorktreeModel`/`AgentModel` triple — one screen, one model,
-//! for the whole session, surviving suspend/resume round trips out to a
-//! hook or an agent launch.
+//! split-pane dashboard (`dashboard.rs`). One screen, one model, for the
+//! whole session, surviving suspend/resume round trips out to a hook or an
+//! agent launch.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -17,22 +16,34 @@ use ratatui::widgets::TableState;
 use super::msg::{CloneOutcome, RepoLoad, WorktreesLoad};
 use super::widgets::filter_indices;
 use crate::config::{self, AgentConfig, Config};
+use crate::doctor;
 use crate::github::Repo;
+use crate::gitstatus::WorkState;
 use crate::hooks::{self, HookConsent, HookEnv, ResolvedHook};
 use crate::sync::{self, PullOutcome};
 use crate::worktree::{self, WorktreeEntry as ScannedEntry, WorktreeSelection};
 use crate::worktreeinclude;
 
-/// Idle-duration label (`"idle Nd"`), or `None` under `threshold_days` —
-/// baked into a row's text once at construction, never recomputed on every
-/// render. `now` is a parameter (not `SystemTime::now()` inline) so this
-/// stays testable without real elapsed time.
-pub fn humanize(mtime: SystemTime, now: SystemTime, threshold_days: u64) -> Option<String> {
-    let days = now
-        .duration_since(mtime)
-        .map(|d| d.as_secs() / 86_400)
-        .unwrap_or(0);
-    (days >= threshold_days).then(|| format!("idle {days}d"))
+/// The worktree pane's AGE cell: `"idle Nd"` once `threshold_days` is
+/// reached (the `bool` is that idle flag, for dimming), otherwise a coarse
+/// "Nm/Nh/Nd ago". `now` is a parameter (not `SystemTime::now()` inline) so
+/// this stays testable without real elapsed time.
+pub fn age_label(mtime: SystemTime, now: SystemTime, threshold_days: u64) -> (String, bool) {
+    let secs = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
+    let days = secs / 86_400;
+    if days >= threshold_days {
+        return (format!("idle {days}d"), true);
+    }
+    let label = if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{days}d ago")
+    };
+    (label, false)
 }
 
 /// Coarse "Nm/Nh/Nd ago" label for the repo pane's UPDATED column, computed
@@ -72,11 +83,11 @@ pub fn is_recently_updated(updated_at: &str, now: DateTime<Utc>) -> bool {
 
 /// Shared filterable-table state: the full item list, live filter query,
 /// the filtered index subset (`filtered[i]` is an index into `items`), the
-/// `TableState` (selection/scroll), and the table's last-rendered `Rect`.
+/// `TableState` (selection/scroll), and the table's last-rendered `Rect`s.
 ///
-/// `table`/`table_rect` use interior mutability (`RefCell`/`Cell`)
-/// deliberately: `Screen::draw` takes `&Model` (never widened to `&mut
-/// self` just to let rendering write back state), yet
+/// `table`/`table_rect`/`pane_rect` use interior mutability
+/// (`RefCell`/`Cell`) deliberately: `Screen::draw` takes `&Model` (never
+/// widened to `&mut self` just to let rendering write back state), yet
 /// `ratatui::widgets::Table` is a `StatefulWidget` that mutates
 /// `TableState.offset` during `render` to keep the selection scrolled into
 /// view, and a later mouse click must hit-test against that up-to-date
@@ -87,7 +98,11 @@ pub struct ListState<T> {
     pub query: String,
     pub filtered: Vec<usize>,
     pub table: RefCell<TableState>,
+    /// The table's content area (header row first) — row hit-testing.
     pub table_rect: Cell<Rect>,
+    /// The whole bordered pane — a click anywhere inside focuses the pane
+    /// even when it lands on the border, the title, or empty space.
+    pub pane_rect: Cell<Rect>,
 }
 
 impl<T> ListState<T> {
@@ -103,6 +118,7 @@ impl<T> ListState<T> {
             filtered,
             table: RefCell::new(table),
             table_rect: Cell::new(Rect::default()),
+            pane_rect: Cell::new(Rect::default()),
         }
     }
 
@@ -189,14 +205,16 @@ fn build_repo_rows(repos: Vec<Repo>, root: &Path) -> Vec<RepoRow> {
 
 /// A worktree row (or the synthetic "+ new worktree" row, offered only when
 /// the pane's scope has a concrete repo to create one under), annotated with
-/// idle/dirty state at construction. `dirty` is looked up from
-/// `DashboardModel::dirty_cache` — never computed here via a live
-/// `gitstatus::is_dirty` call, which is exactly the per-keystroke I/O bug
-/// this rewrite fixes (see the plan's Context section).
+/// age and work state at construction. `state` is looked up from
+/// `DashboardModel::work_cache` — never computed here via a live git call,
+/// which is exactly the per-keystroke I/O bug the background scan exists
+/// to avoid. `None` = the state couldn't be read (treated as valuable, not
+/// disposable, by the removal confirm).
 pub struct WorktreeRow {
     pub selection: WorktreeSelection,
-    pub dirty: bool,
-    pub idle_label: Option<String>,
+    pub state: Option<WorkState>,
+    pub age_label: String,
+    pub idle: bool,
     pub repo_label: String,
     pub filter_text: String,
 }
@@ -204,28 +222,30 @@ pub struct WorktreeRow {
 impl WorktreeRow {
     fn existing(
         entry: ScannedEntry,
-        dirty: bool,
+        state: Option<WorkState>,
         idle_threshold_days: u64,
         now: SystemTime,
     ) -> Self {
         let repo_label = worktree::display_repo_label(&entry.repo);
-        let idle_label = humanize(entry.mtime, now, idle_threshold_days);
+        let (age_label, idle) = age_label(entry.mtime, now, idle_threshold_days);
         let filter_text = format!("{repo_label}/{}", entry.slug);
         Self {
             selection: WorktreeSelection::Existing(entry),
-            dirty,
-            idle_label,
+            state,
+            age_label,
+            idle,
             repo_label,
             filter_text,
         }
     }
 
-    fn new_row() -> Self {
+    fn new_row(repo_label: &str) -> Self {
         Self {
             selection: WorktreeSelection::New,
-            dirty: false,
-            idle_label: None,
-            repo_label: String::new(),
+            state: Some(WorkState::default()),
+            age_label: String::new(),
+            idle: false,
+            repo_label: worktree::display_repo_label(repo_label),
             filter_text: "+ new worktree".to_string(),
         }
     }
@@ -233,54 +253,67 @@ impl WorktreeRow {
 
 fn build_worktree_rows(
     entries: impl Iterator<Item = ScannedEntry>,
-    dirty_cache: &HashMap<PathBuf, bool>,
+    work_cache: &HashMap<PathBuf, Option<WorkState>>,
     idle_threshold_days: u64,
-    include_new: bool,
+    new_under: Option<&str>,
 ) -> Vec<WorktreeRow> {
     let now = SystemTime::now();
     let mut rows: Vec<WorktreeRow> = entries
         .map(|e| {
-            let dirty = dirty_cache.get(&e.path).copied().unwrap_or(false);
-            WorktreeRow::existing(e, dirty, idle_threshold_days, now)
+            let state = work_cache.get(&e.path).copied().flatten();
+            WorktreeRow::existing(e, state, idle_threshold_days, now)
         })
         .collect();
-    if include_new {
-        rows.push(WorktreeRow::new_row());
+    if let Some(repo_label) = new_under {
+        rows.push(WorktreeRow::new_row(repo_label));
     }
     rows
 }
 
-/// An agent, annotated with its resolved command-line preview — the
-/// footer's segmented control (`Ctrl-A` cycles, not a `ListState` — small
+/// An agent, annotated with its resolved command-line preview and whether
+/// its binary is actually on `PATH` right now — the footer's segmented
+/// control (`←`/`→`/`Ctrl-A` or a click select; not a `ListState` — small
 /// and fixed, never filtered).
 pub struct AgentEntry {
     pub name: String,
     pub cmd_preview: String,
+    pub installed: bool,
 }
 
 impl AgentEntry {
-    fn new(name: String, cfg: &AgentConfig) -> Self {
+    fn new(name: String, cfg: &AgentConfig, installed: bool) -> Self {
         let mut cmd_preview = cfg.cmd.clone();
         for arg in &cfg.args {
             cmd_preview.push(' ');
             cmd_preview.push_str(arg);
         }
-        Self { name, cmd_preview }
+        Self {
+            name,
+            cmd_preview,
+            installed,
+        }
     }
 }
 
-fn build_agent_entries(agents: &HashMap<String, AgentConfig>) -> Vec<AgentEntry> {
+fn build_agent_entries(config: &Config) -> Vec<AgentEntry> {
     // Sorted, not `HashMap` iteration order — deterministic run to run.
-    let mut names: Vec<&String> = agents.keys().collect();
+    let mut names: Vec<&String> = config.agents.keys().collect();
     names.sort();
     names
         .into_iter()
-        .map(|name| AgentEntry::new(name.clone(), &agents[name]))
+        .map(|name| {
+            // Resolved (not the raw `cmd`) so `$SHELL` is checked as the
+            // real binary it expands to — same as `cw doctor`.
+            let installed = config::resolve_agent(Some(name), config)
+                .map(|a| doctor::check_binary_on_path(&a.cmd).is_ok())
+                .unwrap_or(false);
+            AgentEntry::new(name.clone(), &config.agents[name], installed)
+        })
         .collect()
 }
 
 // ---------------------------------------------------------------------
-// Scope / Focus
+// Scope / Focus / Actions
 // ---------------------------------------------------------------------
 
 /// What the dashboard is showing — the semantic mode only; the repo pane
@@ -312,6 +345,32 @@ enum PaneRepoFilter {
     One(String),
 }
 
+/// A clickable region's meaning. `view.rs` registers one `(Rect, Action)`
+/// pair per clickable thing it draws (agent segments, help-line keys, modal
+/// buttons, the mark column) into `DashboardModel::hotspots`; `update.rs`
+/// resolves a click against them and performs the action through exactly
+/// the same code path the equivalent key uses — so every action reachable
+/// by keyboard is reachable by mouse, and neither can drift from the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    SelectAgent(usize),
+    CycleAgent,
+    /// `Tab`: swap focus between the repo and worktree panes.
+    ToggleFocus,
+    /// Enter on the focused row.
+    OpenFocused,
+    NewWorktree,
+    /// Toggle the mark on the given *filtered* worktree row index.
+    ToggleMark(usize),
+    Delete,
+    Rescan,
+    ApplyUpdate,
+    Quit,
+    ModalConfirm,
+    ModalCancel,
+    ModalIncludeRisky,
+}
+
 // ---------------------------------------------------------------------
 // Modal
 // ---------------------------------------------------------------------
@@ -322,21 +381,45 @@ pub enum HookKind {
     Create,
 }
 
+/// One row of the removal confirm — resolved once when the modal opens, not
+/// re-read from `checked` on confirm (which may have been empty the whole
+/// time, in the single-focused-row case).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteTarget {
+    pub path: PathBuf,
+    /// `"repo/slug"`, display form.
+    pub label: String,
+    pub state: Option<WorkState>,
+}
+
+impl DeleteTarget {
+    /// Removing this would discard unsaved work — or a state that couldn't
+    /// be read, which is treated the same way rather than as disposable.
+    pub fn risky(&self) -> bool {
+        self.state.is_none_or(|s| s.has_unsaved_work())
+    }
+}
+
 pub enum Modal {
     HookConsent {
         resolved: ResolvedHook,
         kind: HookKind,
     },
+    /// The two-step removal confirm. `y` only ever removes targets with
+    /// nothing to lose; a risky target (unsaved work) is kept unless the
+    /// user first flips `include_risky` (`f`, or the modal's own button) —
+    /// one deliberate extra step, spelled out on screen, rather than a
+    /// blanket refusal (the old "dirty entries need --force") or a blanket
+    /// "y to delete everything".
     ConfirmDelete {
-        /// The worktree paths this confirm targets — the checked set at the
-        /// moment `d` was pressed, or just the focused row's path when
-        /// nothing was checked. Resolved once here rather than re-read from
-        /// `checked` on confirm, since `checked` may have been empty the
-        /// whole time (the single-row case).
-        targets: Vec<PathBuf>,
-        dirty_count: usize,
-        force: bool,
+        targets: Vec<DeleteTarget>,
+        include_risky: bool,
     },
+    /// A failure the user has to read in full — clone/pull output, a
+    /// worktree-creation error, an agent that isn't installed. Wrapped and
+    /// dismissable, unlike the one-line status, and always also written to
+    /// the day's log file (`DashboardModel::fail`).
+    Error { title: String, detail: String },
 }
 
 // ---------------------------------------------------------------------
@@ -344,9 +427,9 @@ pub enum Modal {
 // ---------------------------------------------------------------------
 
 /// The repo/slug/agent identity a `PendingLaunch` pipeline is carrying
-/// end-to-end. `owner`/`name` are only meaningful in `Scope::Browse` (needed
-/// for `sync::clone_or_pull_ex`) — empty in `Scope::AllWorktrees`/
-/// `Scope::SingleRepo`, which never clone.
+/// end-to-end. `owner`/`name` are only meaningful when the pipeline starts
+/// at `Stage::Cloning` (needed for `sync::clone_or_pull_ex`) — empty
+/// otherwise.
 #[derive(Debug, Clone)]
 pub struct LaunchContext {
     pub repo_label: String,
@@ -439,14 +522,14 @@ pub struct DashboardModel {
     pub scope: Scope,
     pub focus: Focus,
     /// The repo pane's own state — `Some` only in `Scope::Browse`, `None` in
-    /// `AllWorktrees`/`SingleRepo`, which have no repo pane at all. Lifted
-    /// out of `Scope` (which used to carry it inline, `Browse { repos }`) so
-    /// every focused-pane function reaches it uniformly instead of
-    /// re-destructuring `Scope` on every call.
+    /// `AllWorktrees`/`SingleRepo`, which have no repo pane at all.
     pub repos: Option<ListState<RepoRow>>,
     pub worktrees: ListState<WorktreeRow>,
     pub all_entries: Vec<ScannedEntry>,
-    pub dirty_cache: HashMap<PathBuf, bool>,
+    /// Per-worktree work state from the last background scan (`None` = the
+    /// read failed). The single source of truth for both the pane's STATUS
+    /// column and the removal confirm's risky/safe split.
+    pub work_cache: HashMap<PathBuf, Option<WorkState>>,
     pub agents: Vec<AgentEntry>,
     pub agent_index: usize,
     /// Worktree paths marked for removal — keyed by path, not list index:
@@ -456,11 +539,14 @@ pub struct DashboardModel {
     pub checked: HashSet<PathBuf>,
     pub modal: Option<Modal>,
     pub pending: Option<PendingLaunch>,
+    /// One-line informational message (rendered in the worktree pane's
+    /// bottom border; `Esc` clears it). Failures go to `Modal::Error`
+    /// instead — see `fail`.
     pub status: Option<String>,
     /// The pending version string from a completed background self-update
     /// check (`Msg::UpdateChecked`), or `None` when unchecked/up to date.
-    /// Drives the agent bar's "update available" segment (`view.rs`) and
-    /// gates the `u` key (`tui/update.rs`).
+    /// Drives the "update available" segment (`view.rs`) and gates the `u`
+    /// key (`tui/update.rs`).
     pub update_available: Option<String>,
     pub root: PathBuf,
     pub idle_threshold_days: u64,
@@ -472,16 +558,25 @@ pub struct DashboardModel {
     /// `update_dashboard` itself never touches the filesystem — this flag is
     /// the request, not the scan.
     pub rescan_requested: bool,
+    /// Every clickable region the last frame drew — see `Action`. Cleared
+    /// and refilled by `view::draw_dashboard` on every frame (interior
+    /// mutability for the same reason as `ListState::table_rect`).
+    pub hotspots: RefCell<Vec<(Rect, Action)>>,
+    /// The previous left click's (pane, filtered row, time) — a second
+    /// click on the same row inside `DOUBLE_CLICK` is an open, same as
+    /// Enter.
+    pub last_click: Option<(Focus, usize, Instant)>,
+    /// `Msg::Tick` counter — drives the in-flight pipeline's spinner.
+    pub ticks: u64,
 
-    // Not in the plan's illustrative struct sketch, but required to make
-    // the pipeline above actually work: `config` is a snapshot (not a
-    // reference — `DashboardModel` outlives any one `Config` borrow across
-    // suspend/resume) supplying hook paths/symlink_dirs/the agents map;
-    // `force_delete` is `cw clean --force`; `forced_slug` is an explicit
-    // SLUG given on the command line that bypasses the worktree-choice step
-    // entirely once a repo is committed to; `hook_consent`/
-    // `hook_consent_path` back the in-TUI consent modal the same way
-    // `main.rs`'s fast path uses `hooks::load_consent`/`save_consent`.
+    // `config` is a snapshot (not a reference — `DashboardModel` outlives
+    // any one `Config` borrow across suspend/resume) supplying hook paths/
+    // symlink_dirs/the agents map; `force_delete` is `cw clean --force`;
+    // `forced_slug` is an explicit SLUG given on the command line that
+    // bypasses the worktree-choice step entirely once a repo is committed
+    // to; `hook_consent`/`hook_consent_path` back the in-TUI consent modal
+    // the same way `main.rs`'s fast path uses `hooks::load_consent`/
+    // `save_consent`.
     config: Config,
     force_delete: bool,
     forced_slug: Option<String>,
@@ -491,6 +586,9 @@ pub struct DashboardModel {
     pub(crate) hook_consent: HookConsent,
     hook_consent_path: PathBuf,
 }
+
+/// Two clicks on the same row within this window open it.
+pub const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
 impl DashboardModel {
     #[allow(clippy::too_many_arguments)]
@@ -506,7 +604,7 @@ impl DashboardModel {
         force_delete: bool,
         forced_slug: Option<String>,
     ) -> Self {
-        let agents = build_agent_entries(&config.agents);
+        let agents = build_agent_entries(&config);
         let agent_index = agents
             .iter()
             .position(|a| a.name == config.default_agent)
@@ -518,7 +616,7 @@ impl DashboardModel {
             repos,
             worktrees: ListState::new(Vec::new()),
             all_entries: Vec::new(),
-            dirty_cache: HashMap::new(),
+            work_cache: HashMap::new(),
             agents,
             agent_index,
             checked: HashSet::new(),
@@ -531,6 +629,9 @@ impl DashboardModel {
             auto_yes,
             loading: true,
             rescan_requested: false,
+            hotspots: RefCell::new(Vec::new()),
+            last_click: None,
+            ticks: 0,
             config,
             force_delete,
             forced_slug,
@@ -652,7 +753,7 @@ impl DashboardModel {
         match result {
             Ok(load) => {
                 self.all_entries = load.entries;
-                self.dirty_cache = load.dirty;
+                self.work_cache = load.work;
             }
             Err(e) => {
                 self.status = Some(format!("worktree scan failed: {e}"));
@@ -661,8 +762,8 @@ impl DashboardModel {
         self.refresh_worktree_pane();
     }
 
-    pub fn apply_dirty_refresh(&mut self, path: PathBuf, result: Result<bool, String>) {
-        self.dirty_cache.insert(path, result.unwrap_or(false));
+    pub fn apply_work_refresh(&mut self, path: PathBuf, result: Result<WorkState, String>) {
+        self.work_cache.insert(path, result.ok());
         self.refresh_worktree_pane();
     }
 
@@ -670,19 +771,15 @@ impl DashboardModel {
         self.update_available = pending;
     }
 
-    /// Pure in-memory filter over `all_entries`/`dirty_cache` — no I/O. The
+    /// Pure in-memory filter over `all_entries`/`work_cache` — no I/O. The
     /// pane shows every repo's worktrees regardless of the repo pane's
     /// cursor (see `pane_repo_filter`) — call sites are purely data-driven:
-    /// after a worktree-scan load, a dirty-status refresh, a delete
+    /// after a worktree-scan load, a work-state refresh, a delete
     /// confirmed, an agent launch resumed, a repo-list reload, or an `r`
-    /// rescan. Never called on a bare repo-cursor move any more (that used
-    /// to rebuild `self.worktrees` on every arrow key). The rebuild is
-    /// selection-stable across all of these, same reasoning as `checked`:
-    /// the focused row's path (if any) is looked up again in the new rows
-    /// and reselected, so an `r` rescan or a background dirty refresh no
-    /// longer bounces the cursor back to row zero. Never calls
-    /// `gitstatus::is_dirty` itself — that per-keystroke I/O storm is what
-    /// the split from `dashboard.rs`'s one-time scan thread fixes.
+    /// rescan. The rebuild is selection-stable across all of these, same
+    /// reasoning as `checked`: the focused row's path (if any) is looked up
+    /// again in the new rows and reselected, so a rescan or a background
+    /// refresh never bounces the cursor back to row zero.
     pub fn refresh_worktree_pane(&mut self) {
         let selected_path = self
             .worktrees
@@ -701,14 +798,14 @@ impl DashboardModel {
                 .cloned()
                 .collect(),
         };
-        let include_new = self.new_worktree_repo().is_some();
+        let new_under = self.new_worktree_repo();
 
         let query = std::mem::take(&mut self.worktrees.query);
         let rows = build_worktree_rows(
             entries.into_iter(),
-            &self.dirty_cache,
+            &self.work_cache,
             self.idle_threshold_days,
-            include_new,
+            new_under.as_deref(),
         );
         self.worktrees = ListState::new(rows);
         self.worktrees.query = query;
@@ -728,11 +825,7 @@ impl DashboardModel {
     }
 
     /// Which worktrees the pane displays: every repo's, except in
-    /// `Scope::SingleRepo`, which is pinned to just its own repo. Note this
-    /// no longer depends on the repo pane's selection in `Scope::Browse` —
-    /// see `new_worktree_repo` for the one thing that still does (which
-    /// repo the synthetic "+ new worktree" row targets, a separate concern
-    /// from which worktrees are actually listed).
+    /// `Scope::SingleRepo`, which is pinned to just its own repo.
     fn pane_repo_filter(&self) -> PaneRepoFilter {
         match &self.scope {
             Scope::Browse | Scope::AllWorktrees => PaneRepoFilter::All,
@@ -740,12 +833,11 @@ impl DashboardModel {
         }
     }
 
-    /// Which repo the worktree pane's synthetic "+ new worktree" row would
-    /// create under, if any. `None` when there's no concrete repo to create
-    /// one under: `Scope::AllWorktrees` (`cw resume`/`cw clean`, which never
-    /// create), or `Scope::Browse` before anything is selected in the
-    /// (top-level) repo pane yet.
-    fn new_worktree_repo(&self) -> Option<String> {
+    /// Which repo a new worktree would be created under, if any. `None`
+    /// when there's no concrete repo to create one under:
+    /// `Scope::AllWorktrees` (`cw resume`/`cw clean`, which never create),
+    /// or `Scope::Browse` before anything is selected in the repo pane yet.
+    pub fn new_worktree_repo(&self) -> Option<String> {
         match &self.scope {
             Scope::Browse => self
                 .repos
@@ -757,11 +849,27 @@ impl DashboardModel {
         }
     }
 
+    /// The repo pane's cursor moved (key or click): the synthetic "+ new
+    /// worktree" row targets the newly selected repo, so its label has to be
+    /// rebuilt — a pure in-memory rebuild, no I/O.
+    pub fn repo_cursor_moved(&mut self) {
+        if self.repos.is_some() {
+            self.refresh_worktree_pane();
+        }
+    }
+
     // -- agent footer -----------------------------------------------------
 
-    pub fn cycle_agent(&mut self) {
-        if !self.agents.is_empty() {
-            self.agent_index = (self.agent_index + 1) % self.agents.len();
+    pub fn cycle_agent(&mut self, delta: isize) {
+        let len = self.agents.len() as isize;
+        if len > 0 {
+            self.agent_index = (self.agent_index as isize + delta).rem_euclid(len) as usize;
+        }
+    }
+
+    pub fn select_agent(&mut self, idx: usize) {
+        if idx < self.agents.len() {
+            self.agent_index = idx;
         }
     }
 
@@ -769,17 +877,50 @@ impl DashboardModel {
         self.agents.get(self.agent_index).map(|a| a.name.clone())
     }
 
-    // -- mark-and-delete flow (Scope::AllWorktrees and Browse/SingleRepo alike) --
+    // -- failures ----------------------------------------------------------
+
+    /// Every pipeline failure lands here: the in-flight pipeline is
+    /// abandoned, the full detail opens in `Modal::Error` (wrapped, not
+    /// truncated to one status line), and the same text is written to the
+    /// day's log file — `tracing`'s stderr half is gated off while the TUI
+    /// owns the screen, so this never corrupts the frame.
+    pub fn fail(&mut self, title: &str, detail: String) {
+        tracing::warn!("{title}: {}", detail.replace('\n', " | "));
+        self.pending = None;
+        self.modal = Some(Modal::Error {
+            title: title.to_string(),
+            detail,
+        });
+    }
+
+    /// Driver-triggered: `agent::launch` returned an error (the binary
+    /// isn't on `PATH`, most likely). Reported like any other pipeline
+    /// failure instead of tearing the whole dashboard down.
+    pub fn report_launch_failure(&mut self, agent: &str, detail: String) {
+        self.fail(&format!("could not launch {agent}"), detail);
+    }
+
+    // -- mark-and-delete flow (every scope alike) -------------------------
 
     /// `Space` on a focused worktree row: always toggles its check-mark,
     /// never falls through to the filter query (unlike every other typable
     /// character). A no-op on the synthetic "+ new worktree" row — nothing
     /// on disk yet to mark for removal.
     pub fn toggle_checked_focused(&mut self) {
-        let Some(row) = self.worktrees.selected() else {
+        if let Some(idx) = self.worktrees.selected_index() {
+            self.toggle_checked_row(idx);
+        }
+    }
+
+    /// Toggles the mark on a *filtered* row index (a click on the mark
+    /// column, or `Space` via `toggle_checked_focused`).
+    pub fn toggle_checked_row(&mut self, filtered_idx: usize) {
+        let Some(&item_idx) = self.worktrees.filtered.get(filtered_idx) else {
             return;
         };
-        let WorktreeSelection::Existing(entry) = &row.selection else {
+        let Some(WorktreeSelection::Existing(entry)) =
+            self.worktrees.items.get(item_idx).map(|r| &r.selection)
+        else {
             return;
         };
         let path = entry.path.clone();
@@ -793,9 +934,10 @@ impl DashboardModel {
     /// nothing is checked (dropping single-worktree delete to two
     /// keystrokes — `d`, `y`). A no-op when nothing is checked AND nothing
     /// removable is focused (an empty pane, or the synthetic "+ new
-    /// worktree" row).
+    /// worktree" row). `include_risky` starts true only under `cw clean
+    /// --force`; every other entry point starts on the safe side.
     pub fn open_delete_confirm(&mut self) {
-        let targets: Vec<PathBuf> = if self.checked.is_empty() {
+        let paths: Vec<PathBuf> = if self.checked.is_empty() {
             match self.worktrees.selected().map(|r| &r.selection) {
                 Some(WorktreeSelection::Existing(entry)) => vec![entry.path.clone()],
                 _ => return,
@@ -804,97 +946,174 @@ impl DashboardModel {
             self.checked.iter().cloned().collect()
         };
 
-        // Reads `dirty_cache` directly — the same canonical source
-        // `confirm_delete` checks against — rather than re-deriving dirty
-        // status from the rendered `self.worktrees.items`, which would be a
-        // second, divergence-prone copy of the same fact.
-        let dirty_count = targets
-            .iter()
-            .filter(|path| self.dirty_cache.get(*path).copied().unwrap_or(false))
-            .count();
+        // Reads `work_cache` directly — the same canonical source
+        // `confirm_delete` checks against — rather than re-deriving state
+        // from the rendered `self.worktrees.items`, which would be a second,
+        // divergence-prone copy of the same fact.
+        let mut targets: Vec<DeleteTarget> = paths
+            .into_iter()
+            .filter_map(|path| {
+                let entry = self.all_entries.iter().find(|e| e.path == path)?;
+                Some(DeleteTarget {
+                    label: format!(
+                        "{}/{}",
+                        worktree::display_repo_label(&entry.repo),
+                        entry.slug
+                    ),
+                    state: self.work_cache.get(&path).copied().flatten(),
+                    path,
+                })
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        targets.sort_by(|a, b| a.label.cmp(&b.label));
         self.modal = Some(Modal::ConfirmDelete {
             targets,
-            dirty_count,
-            force: self.force_delete,
+            include_risky: self.force_delete,
         });
+    }
+
+    /// `f` on `Modal::ConfirmDelete`: flips whether targets with unsaved
+    /// work are removed too. A no-op when no target is risky — there's
+    /// nothing to include.
+    pub fn toggle_include_risky(&mut self) {
+        if let Some(Modal::ConfirmDelete {
+            targets,
+            include_risky,
+        }) = self.modal.as_mut()
+        {
+            if targets.iter().any(DeleteTarget::risky) {
+                *include_risky = !*include_risky;
+            }
+        }
     }
 
     /// Confirms `Modal::ConfirmDelete`: actually removes each targeted
     /// entry via `clean::remove_one` (pure `git2`/`fs`, no subprocess — runs
-    /// inline, no suspend needed, same tolerance as worktree creation).
-    /// Dirty entries are skipped unless `--force`, exactly like the old
-    /// `clean.rs::run_clean`. Always clears `checked` — even a target that
-    /// came from the single-focused-row case (never added to `checked` in
-    /// the first place) leaves it empty either way.
+    /// inline, no suspend needed). Risky targets are kept unless
+    /// `include_risky`. Always clears `checked` — even a target that came
+    /// from the single-focused-row case (never added to `checked` in the
+    /// first place) leaves it empty either way.
     pub fn confirm_delete(&mut self) {
-        let Some(Modal::ConfirmDelete { targets, .. }) = self.modal.take() else {
+        let Some(Modal::ConfirmDelete {
+            targets,
+            include_risky,
+        }) = self.modal.take()
+        else {
             return;
         };
         self.checked.clear();
 
-        let mut messages = Vec::new();
-        for path in targets {
-            let Some(entry) = self.all_entries.iter().find(|e| e.path == path).cloned() else {
+        let mut removed = 0usize;
+        let mut kept = 0usize;
+        let mut failures = Vec::new();
+        for target in targets {
+            let Some(entry) = self
+                .all_entries
+                .iter()
+                .find(|e| e.path == target.path)
+                .cloned()
+            else {
                 continue; // already gone — stale target, nothing to do
             };
-            let dirty = self.dirty_cache.get(&entry.path).copied().unwrap_or(false);
-            if dirty && !self.force_delete {
-                messages.push(format!(
-                    "skipped {}/{} — has uncommitted changes",
-                    entry.repo, entry.slug
-                ));
+            if target.risky() && !include_risky {
+                kept += 1;
                 continue;
             }
             match crate::clean::remove_one(&self.root, &entry) {
                 Ok(()) => {
                     self.all_entries.retain(|e| e != &entry);
-                    messages.push(format!("removed {}/{}", entry.repo, entry.slug));
+                    self.work_cache.remove(&entry.path);
+                    removed += 1;
                 }
-                Err(err) => messages.push(format!(
-                    "failed to remove {}/{}: {err:#}",
-                    entry.repo, entry.slug
-                )),
+                Err(err) => failures.push(format!("{}: {err:#}", target.label)),
             }
         }
-        self.status = (!messages.is_empty()).then(|| messages.join(" | "));
+
+        let mut parts = Vec::new();
+        if removed > 0 {
+            parts.push(format!("removed {removed} worktree{}", plural(removed)));
+        }
+        if kept > 0 {
+            parts.push(format!(
+                "kept {kept} with unsaved work (press d, then f to include)"
+            ));
+        }
+        self.status = (!parts.is_empty()).then(|| parts.join(" · "));
+        if !failures.is_empty() {
+            self.fail("removal failed", failures.join("\n"));
+        }
         self.refresh_worktree_pane();
     }
 
     // -- launch pipeline ----------------------------------------------------
 
+    /// `n`, Enter on a repo row, or the "+ new worktree" row: starts a fresh
+    /// worktree under `new_worktree_repo()`, or explains why it can't.
+    pub fn new_worktree(&mut self) -> Option<DashboardOutcome> {
+        if self.new_worktree_repo().is_none() {
+            self.status = Some(match self.scope {
+                Scope::Browse => "pick a repo first (tab, or click one)".to_string(),
+                _ => "run bare `cw` to create a worktree under a repo".to_string(),
+            });
+            return None;
+        }
+        self.start_pending(WorktreeSelection::New)
+    }
+
     /// Enter on a worktree-pane row: starts the clone/hook/create/launch
-    /// pipeline for that selection, scoped by `self.scope`'s rules (see
-    /// each match arm). A no-op while a pipeline is already in flight
-    /// (`self.pending` already `Some`) — most importantly `Stage::Cloning`,
-    /// the one stage that leaves the terminal event loop live while a
-    /// background thread runs (every other stage either resolves
-    /// synchronously inside `advance_pending` or suspends the whole TUI).
-    /// Without this guard, an Enter on a different row during that window
-    /// would replace `self.pending` outright, and the original background
-    /// clone's result would later land via `apply_clone_done` and get
-    /// applied to the new (unrelated) pending instead — silently skipping
-    /// the new selection's own clone/pull.
+    /// pipeline for that selection. A no-op while a pipeline is already in
+    /// flight (`self.pending` already `Some`) — most importantly
+    /// `Stage::Cloning`, the one stage that leaves the terminal event loop
+    /// live while a background thread runs. Without this guard, an Enter on
+    /// a different row during that window would replace `self.pending`
+    /// outright, and the original background clone's result would later
+    /// land via `apply_clone_done` and get applied to the new (unrelated)
+    /// pending instead.
+    ///
+    /// An existing worktree always resumes under its *own* repo (read off
+    /// the scanned entry) and launches directly — never a clone/pull, which
+    /// only touches the main checkout and can't affect the worktree's own
+    /// branch anyway. A new worktree in `Scope::Browse` is created under
+    /// the repo pane's selected repo, after a clone/pull of that repo.
     pub fn start_pending(&mut self, selection: WorktreeSelection) -> Option<DashboardOutcome> {
         if self.pending.is_some() {
             return None;
         }
         let agent = self.current_agent_name()?;
+        if let WorktreeSelection::Existing(entry) = selection {
+            let (owner, name) = entry
+                .repo
+                .split_once('/')
+                .map(|(o, n)| (o.to_string(), n.to_string()))
+                .unwrap_or_default();
+            self.pending = Some(PendingLaunch {
+                ctx: LaunchContext {
+                    repo_label: entry.repo.clone(),
+                    owner,
+                    name,
+                    slug: worktree::unflatten_slug(&entry.slug),
+                    agent,
+                },
+                repo_root: self.root.join(&entry.repo),
+                worktree_path: Some(entry.path),
+                stage: Stage::Launching,
+                freshly_created: false,
+            });
+            return self.advance_pending();
+        }
+
         match &self.scope {
             Scope::Browse => {
                 let repo = self.repos.as_ref()?.selected()?.repo.clone();
                 let repo_label = repo.full_name();
                 let repo_root = sync::resolve_local_path(&self.root, &repo.owner, &repo.name);
-                let (slug, worktree_path) = match selection {
-                    WorktreeSelection::Existing(entry) => {
-                        (worktree::unflatten_slug(&entry.slug), Some(entry.path))
-                    }
-                    WorktreeSelection::New => (
-                        self.forced_slug
-                            .take()
-                            .unwrap_or_else(worktree::generate_timestamp_slug),
-                        None,
-                    ),
-                };
+                let slug = self
+                    .forced_slug
+                    .take()
+                    .unwrap_or_else(worktree::generate_timestamp_slug);
                 self.pending = Some(PendingLaunch {
                     ctx: LaunchContext {
                         repo_label,
@@ -904,54 +1123,25 @@ impl DashboardModel {
                         agent,
                     },
                     repo_root,
-                    worktree_path,
-                    // Bare `cw` always pulls before resolving the worktree,
-                    // whether resuming or creating (matches the old
+                    worktree_path: None,
+                    // A fresh worktree branches from HEAD, so the main
+                    // checkout is pulled first (matches the old
                     // `run_default`'s unconditional `clone_or_pull`).
                     stage: Stage::Cloning,
                     freshly_created: false,
                 });
             }
-            Scope::AllWorktrees => {
-                // `cw resume`: launch directly, no clone/create/hooks —
-                // matches the old `run_resume`, which never pulled.
-                let WorktreeSelection::Existing(entry) = selection else {
-                    return None;
-                };
-                self.pending = Some(PendingLaunch {
-                    ctx: LaunchContext {
-                        repo_label: entry.repo.clone(),
-                        owner: String::new(),
-                        name: String::new(),
-                        slug: worktree::unflatten_slug(&entry.slug),
-                        agent,
-                    },
-                    repo_root: PathBuf::new(),
-                    worktree_path: Some(entry.path),
-                    stage: Stage::Launching,
-                    freshly_created: false,
-                });
-            }
+            Scope::AllWorktrees => return None,
             Scope::SingleRepo {
                 repo_label,
                 repo_root,
             } => {
                 let repo_label = repo_label.clone();
                 let repo_root = repo_root.clone();
-                let (slug, worktree_path, stage) = match selection {
-                    WorktreeSelection::Existing(entry) => (
-                        worktree::unflatten_slug(&entry.slug),
-                        Some(entry.path),
-                        Stage::Launching,
-                    ),
-                    WorktreeSelection::New => (
-                        self.forced_slug
-                            .take()
-                            .unwrap_or_else(worktree::generate_timestamp_slug),
-                        None,
-                        Stage::CreatingWorktree,
-                    ),
-                };
+                let slug = self
+                    .forced_slug
+                    .take()
+                    .unwrap_or_else(worktree::generate_timestamp_slug);
                 self.pending = Some(PendingLaunch {
                     ctx: LaunchContext {
                         repo_label,
@@ -961,8 +1151,8 @@ impl DashboardModel {
                         agent,
                     },
                     repo_root,
-                    worktree_path,
-                    stage,
+                    worktree_path: None,
+                    stage: Stage::CreatingWorktree,
                     freshly_created: false,
                 });
             }
@@ -1008,8 +1198,12 @@ impl DashboardModel {
                 self.advance_pending()
             }
             Err(e) => {
-                self.status = Some(format!("clone/pull failed: {e}"));
-                self.pending = None;
+                let label = self
+                    .pending
+                    .as_ref()
+                    .map(|p| p.ctx.repo_label.clone())
+                    .unwrap_or_default();
+                self.fail(&format!("clone/pull of {label} failed"), e);
                 None
             }
         }
@@ -1050,8 +1244,7 @@ impl DashboardModel {
     }
 
     /// Driver-triggered: a suspended hook run finished. Direct method call
-    /// from `dashboard.rs`'s loop (not routed through a `Msg`) — mirrors the
-    /// plan's driver pseudocode exactly.
+    /// from `dashboard.rs`'s loop (not routed through a `Msg`).
     pub fn resume_after_hook(
         &mut self,
         kind: HookKind,
@@ -1067,9 +1260,9 @@ impl DashboardModel {
     }
 
     /// Driver-triggered: the suspended agent launch finished. Clears
-    /// `pending`/`modal`/`status` — `dirty_cache` for the launched worktree
-    /// is refreshed separately via `Msg::DirtyRefreshed`, once the driver
-    /// has a fresh `gitstatus::is_dirty` read.
+    /// `pending`/`modal`/`status` — `work_cache` for the launched worktree
+    /// is refreshed separately via `Msg::WorkRefreshed`, once the driver
+    /// has a fresh `gitstatus::work_state` read.
     pub fn resume_after_launch(&mut self) {
         self.pending = None;
         self.modal = None;
@@ -1120,8 +1313,7 @@ impl DashboardModel {
                         self.pending.as_mut()?.stage = Stage::CreateHook;
                     }
                     Err(e) => {
-                        self.status = Some(format!("worktree creation failed: {e:#}"));
-                        self.pending = None;
+                        self.fail("worktree creation failed", format!("{e:#}"));
                         return None;
                     }
                 },
@@ -1153,15 +1345,14 @@ impl DashboardModel {
                 }
                 Stage::Launching => {
                     let pending = self.pending.as_ref()?;
-                    let agent_cfg =
-                        match config::resolve_agent(Some(&pending.ctx.agent), &self.config) {
-                            Ok(cfg) => cfg,
-                            Err(e) => {
-                                self.status = Some(format!("{e:#}"));
-                                self.pending = None;
-                                return None;
-                            }
-                        };
+                    let agent_name = pending.ctx.agent.clone();
+                    let agent_cfg = match config::resolve_agent(Some(&agent_name), &self.config) {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            self.report_launch_failure(&agent_name, format!("{e:#}"));
+                            return None;
+                        }
+                    };
                     let worktree_path = pending.worktree_path.clone()?;
                     return Some(DashboardOutcome::Suspend(SuspendReq::LaunchAgent {
                         agent: agent_cfg,
@@ -1204,7 +1395,7 @@ impl DashboardModel {
 
     /// Inline `git2`/`fs` worktree creation — no subprocess, so it runs
     /// synchronously here rather than through the suspend/resume driver.
-    /// Symlinks + `.worktreeinclude` best-effort, mirroring `main.rs`'s old
+    /// Symlinks + `.worktreeinclude` best-effort, mirroring `main.rs`'s
     /// `finish_worktree_creation`; skipped entirely on a fast-resume
     /// (`freshly_created` stays `false`), matching `create_or_resume_
     /// worktree`'s own contract.
@@ -1224,12 +1415,11 @@ impl DashboardModel {
         if !was_existing {
             // `?`, not `let _ =`/`if let Ok(..)` — matches main.rs's
             // `finish_worktree_creation` fast path exactly: a hard failure in
-            // either call surfaces via `advance_pending`'s `Err(e) =>
-            // self.status = ...` branch instead of being silently discarded.
-            // Per-file copy failures inside a successful `apply_worktreeinclude`
-            // call remain non-fatal, logged as warnings — that's the
-            // deliberate continue-on-error behavior `worktreeinclude.rs`
-            // documents, not part of what this propagates.
+            // either call surfaces via `advance_pending`'s `Err(e)` branch
+            // instead of being silently discarded. Per-file copy failures
+            // inside a successful `apply_worktreeinclude` call remain
+            // non-fatal, logged as warnings — that's the deliberate
+            // continue-on-error behavior `worktreeinclude.rs` documents.
             worktree::symlink_shared_dirs(&pending.repo_root, &path, &self.config.symlink_dirs)?;
             let failures = worktreeinclude::apply_worktreeinclude(&pending.repo_root, &path)?;
             for f in &failures {
@@ -1240,19 +1430,19 @@ impl DashboardModel {
                 );
             }
 
-            // The one asymmetric case vs. removal (which already keeps
-            // `all_entries` current on delete): without this, a worktree
-            // created this session never shows up in the pane until `cw` is
-            // quit and relaunched. `entry.slug` must be the flattened
-            // on-disk form — the same shape `scan_worktrees` reads back off
-            // disk — not the raw (possibly `/`-containing) slug the pipeline
-            // carries.
+            // Without this, a worktree created this session never shows up
+            // in the pane until `cw` is quit and relaunched. `entry.slug`
+            // must be the flattened on-disk form — the same shape
+            // `scan_worktrees` reads back off disk — not the raw (possibly
+            // `/`-containing) slug the pipeline carries.
             let entry = ScannedEntry {
                 repo: pending.ctx.repo_label.clone(),
                 slug: worktree::flatten_slug(&pending.ctx.slug),
                 path: path.clone(),
                 mtime: SystemTime::now(),
             };
+            self.work_cache
+                .insert(path.clone(), Some(WorkState::default()));
             self.all_entries.push(entry);
             self.all_entries.sort_by_key(|e| std::cmp::Reverse(e.mtime));
             self.refresh_worktree_pane();
@@ -1277,21 +1467,29 @@ impl DashboardModel {
     }
 }
 
+pub fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
     #[test]
-    fn idle_annotation_formatting() {
+    fn age_label_idle_and_relative() {
         let now = SystemTime::now();
         let old = now - Duration::from_secs(20 * 86_400);
-        let recent = now - Duration::from_secs(2 * 86_400);
+        let recent = now - Duration::from_secs(2 * 3_600);
 
-        assert_eq!(humanize(old, now, 14), Some("idle 20d".to_string()));
-        assert_eq!(humanize(recent, now, 14), None);
-        assert_eq!(humanize(old, now, 20), Some("idle 20d".to_string()));
-        assert_eq!(humanize(old, now, 21), None);
+        assert_eq!(age_label(old, now, 14), ("idle 20d".to_string(), true));
+        assert_eq!(age_label(recent, now, 14), ("2h ago".to_string(), false));
+        assert_eq!(age_label(old, now, 20), ("idle 20d".to_string(), true));
+        assert_eq!(age_label(old, now, 21), ("20d ago".to_string(), false));
     }
 
     #[test]
@@ -1314,5 +1512,28 @@ mod tests {
         let old = (now - chrono::Duration::hours(25)).to_rfc3339();
         assert!(is_recently_updated(&recent, now));
         assert!(!is_recently_updated(&old, now));
+    }
+
+    #[test]
+    fn delete_target_unknown_state_is_risky() {
+        let t = DeleteTarget {
+            path: PathBuf::from("/x"),
+            label: "a/b/c".into(),
+            state: None,
+        };
+        assert!(t.risky());
+        let clean = DeleteTarget {
+            state: Some(WorkState::default()),
+            ..t.clone()
+        };
+        assert!(!clean.risky());
+        let unpushed = DeleteTarget {
+            state: Some(WorkState {
+                changed_files: 0,
+                unpushed_commits: 2,
+            }),
+            ..t
+        };
+        assert!(unpushed.risky());
     }
 }
