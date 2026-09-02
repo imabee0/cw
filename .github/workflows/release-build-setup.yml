@@ -1,7 +1,0 @@
-# Injected into dist-generated release.yml local-artifact jobs
-# (`dist.github-build-setup`). GitHub macOS images ship a rustup `stable`
-# months behind (1.96 vs Cargo.toml rust-version 1.98). rust-toolchain.toml
-# uses channel = "stable", which selects the installed toolchain and does
-# not update it — `rustup update stable` is what actually moves it.
-- name: rustup update stable
-  run: rustup update stable --no-self-update && rustup default stable
