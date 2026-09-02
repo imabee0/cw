@@ -9,7 +9,7 @@ readme = "README.md"
 description = "Fuzzy-pick a GitHub repo, clone/pull it, create-or-resume a git worktree, launch an agent CLI inside it."
 keywords = ["cli", "git", "worktree", "github", "tui"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.98"   # matches rust-toolchain.toml's `channel = "stable"` as resolved in this repo's CI/dev environment today — that file floats to current stable rather than pinning an exact version, so there is no lower-bound MSRV to record instead
+rust-version = "1.98"   # pinned with rust-toolchain.toml and dist.rust-toolchain-version — GitHub macOS images lag current rustup stable
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

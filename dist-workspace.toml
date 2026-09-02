@@ -9,12 +9,16 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
-# Target platforms to build apps for (Rust target-triple syntax)
-# Windows and Linux-arm64 deliberately excluded: cw has no Windows support
-# (hooks/logging/the TUI backend all assume Unix — /dev/tty, chmod +x, unix
-# file modes) and no known arm64 Linux users yet; cheap to add later since
-# dist uses native arm64 Linux runners, not cross-compilation.
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Target platforms to build apps for (Rust target-triple syntax).
+# Windows, Linux-arm64, and Intel macOS are excluded: cw is Unix-only
+# (/dev/tty, chmod +x), and GitHub's x86_64 macOS runner pool is gone —
+# aarch64-apple-darwin is the macOS artifact.
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Pin the rustup toolchain cargo-dist installs in release.yml. GitHub
+# macOS images ship an older `stable` than Cargo.toml rust-version;
+# rust-toolchain.toml channel = "1.98" alone is not enough if cargo is
+# not a rustup proxy. Deprecated dist key, still the generated-CI hook.
+rust-toolchain-version = "1.98"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
@@ -34,7 +38,3 @@ pr-run-mode = "skip"
 # Sign release artifacts via GitHub attestations (the "sign" half of house
 # policy; verify with `gh attestation verify <artifact> --repo imabee0/cw`).
 github-attestations = true
-# Extra steps in every local-artifact job. Path is relative to
-# `.github/workflows/` — MUST sit outside that directory, otherwise GitHub
-# treats the snippet as its own workflow and fails every push.
-github-build-setup = "../release-build-setup.yml"

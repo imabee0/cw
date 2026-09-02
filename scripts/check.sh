@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Every file in .github/workflows must be a real workflow — a snippet
+# (cargo-dist github-build-setup) placed there is run as its own workflow
+# and fails every push.
+for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+  [ -f "$f" ] || continue
+  if ! grep -qE '^on:' "$f"; then
+    echo "error: $f is not a GitHub Actions workflow (missing top-level on:)" >&2
+    exit 1
+  fi
+done
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
