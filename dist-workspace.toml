@@ -5,36 +5,14 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
-# CI backends to support
-ci = "github"
-# The installers to generate for each app
+# GitHub Actions lives in `.github/workflows/ci.yml` (one workflow).
+# Dist builds artifacts; it does not generate a second workflow.
 installers = ["shell"]
-# Target platforms to build apps for (Rust target-triple syntax)
-# Windows and Linux-arm64 deliberately excluded: cw has no Windows support
-# (hooks/logging/the TUI backend all assume Unix — /dev/tty, chmod +x, unix
-# file modes) and no known arm64 Linux users yet; cheap to add later since
-# dist uses native arm64 Linux runners, not cross-compilation.
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
-# Path that installers should place binaries in
+# Unix-only (/dev/tty, chmod +x). Intel macOS dropped: GitHub's x86_64
+# macOS runner pool is gone. Apple Silicon + Linux x86_64.
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 install-path = "CARGO_HOME"
-# Where to host releases
 hosting = "github"
-# Whether to install an updater program
-# true: the release-plz.yml/release-verify.yml chain (release-plz.toml)
-# makes releases frequent and automatic, so the shell installer bundles a
-# `cw-update` binary letting existing installs self-update instead of
-# re-running the install script by hand each time.
+# release-plz tags; this workflow's `publish` job creates the GitHub Release.
 install-updater = true
-# Skip running on pull_request — the generated workflow grants contents:write
-# at the workflow level, which every job (including a PR-triggered plan job)
-# would inherit for no reason, contradicting ci.yml's least-privilege
-# contents:read convention. The tag-vs-Cargo.toml-version check still runs
-# the moment a real tag is pushed.
-pr-run-mode = "skip"
-# Sign release artifacts via GitHub attestations (the "sign" half of house
-# policy; verify with `gh attestation verify <artifact> --repo imabee0/cw`).
 github-attestations = true
-# Extra steps in every local-artifact job. Path is relative to
-# `.github/workflows/` — MUST sit outside that directory, otherwise GitHub
-# treats the snippet as its own workflow and fails every push.
-github-build-setup = "../release-build-setup.yml"
