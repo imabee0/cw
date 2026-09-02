@@ -35,14 +35,14 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 | `tui/view.rs` | pure `draw_dashboard` — `ratatui::widgets::Table`/`Paragraph` split-pane rendering |
 | `tui/event.rs` | crossterm event polling + tick cadence |
 | `tui/widgets.rs` | `row_at` mouse hit-testing, frizbee-backed `filter_indices` |
-| `gitstatus.rs` | `is_dirty`/`is_dirty_repo` — shared by sync.rs's pull guard and clean.rs |
+| `gitstatus.rs` | `work_state` (changed files + unpushed commits) for the dashboard; `is_dirty_repo` for sync.rs's pull guard |
 | `sync.rs` | clone/pull (`clone_or_pull_ex`'s `CloneStdio::Capture` variant backs the dashboard's background clone thread), `gh`-credential-helper wiring, dirty-tree guard before force-checkout |
 | `worktree.rs` | slug validation/flattening/`unflatten_slug`, worktree create-or-resume, `scan_worktrees`, `remove_worktree`, `display_repo_label`, `WorktreeSelection`/`CleanCandidate`, `generate_timestamp_slug` |
 | `worktreeinclude.rs` | `.worktreeinclude` copy: symlink-preserving, CRLF/BOM-tolerant, continue-on-error |
 | `hooks.rs` | `post_clone_hook`/`post_create_hook` execution, confirm-once-per-repo consent |
 | `agent.rs` | launches the resolved agent CLI in the worktree, distinguishes exit outcomes |
 | `clean.rs` | `cw clean`: thin `dashboard::run(Entry::Clean)` entry point; `remove_one` (git2 prune + branch delete), shared with the dashboard's in-TUI delete flow |
-| `doctor.rs` | `cw doctor`: gh auth, credential helper, terminal, each configured agent on PATH |
+| `doctor.rs` | `cw doctor`: gh auth, credential helper, terminal, each configured agent on PATH (only `default_agent` fails the exit code if missing) |
 | `selfupdate.rs` | background self-update check (`spawn_check`) + apply (`apply_update`, the dashboard's `u` key), also backing `cw doctor`'s stale-binary diagnostic; every failure (no install receipt, offline, rate-limited) degrades silently, never an error |
 
 ## Conventions
@@ -69,8 +69,8 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 - **`release-plz.toml` sets `git_release_enable = false`** — `release.yml`'s cargo-dist host job already creates the GitHub Release for each tag; two creators racing on the same release would duplicate or fail it.
 - **`release-verify.yml` is a separate workflow file, not folded into `release.yml`** — `release.yml` is cargo-dist-generated (`dist generate`) and must never be hand-edited; it triggers on the Release workflow's completion instead.
 - **Self-update degrades completely silently when no install receipt is present** — a `cargo install --path .` (from-source) build has no `~/.config/cw/cw-receipt.json`, so `selfupdate`'s check and apply fail quietly to a `tracing::debug!` line and the dashboard's `u` key never activates; by design, not a bug, but a from-source install never learns about updates.
-- **A mouse click in `tui` only ever focuses a row (`TableState::select`), never activates or marks it** — a click and a keyboard arrow key are the same operation, both funneling through Enter to commit and Space to mark. `tui::update`'s mouse handlers never return an `Outcome` from a `MouseEventKind::Down`.
-- **Any single-char key binding that doubles as filter text must be gated on the *focused pane's* `query.is_empty()`**, same as `q`-quit. There is no delete-mode toggle: `Space` always marks/unmarks the focused worktree row and never types (`toggle_checked_focused`), and `d` always opens the removal confirm for the checked set, or the focused row alone when nothing is checked — both gated in `tui/update.rs` because an ungated destructive binding is worse than an ungated quit. `r` (rescan) and `u` (apply a pending self-update) are gated the same way. Each pane (repo `ListState`, worktree `ListState`) owns its own query, and gating always checks whichever pane `DashboardModel::focus` currently points at, never a single global query. `j`/`k` are the deliberate exception: always navigation, never typable, so they're never gated.
+- **A click on a registered hotspot (agent segment, help-line key, mark column, modal button) performs that action; a click on a table row only focuses it; a second click on the same row within 400ms opens it, same as Enter.** Keys and clicks converge on `tui::update::perform` so neither can drift from the other.
+- **Any single-char key binding that doubles as filter text must be gated on the *focused pane's* `query.is_empty()`**, same as `q`-quit. `Space` marks/unmarks the focused worktree row when that query is empty and types a space into the filter otherwise; `d` opens the removal confirm for the checked set, or the focused row alone when nothing is checked. Confirm with `y`; worktrees with changed files, unpushed commits, or unread state are kept unless `f` includes them (`cw clean --force` starts with them included). `r` (rescan) and `u` (apply a pending self-update) are gated the same way. Each pane owns its own query; gating always checks whichever pane `DashboardModel::focus` currently points at. `j`/`k` are always navigation; `←`/`→` always cycle the agent.
 
 ## Standards exceptions
 

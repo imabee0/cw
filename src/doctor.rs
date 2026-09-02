@@ -61,10 +61,20 @@ pub fn run_doctor(config: &Config) -> Vec<(String, Result<String>)> {
         let resolved_cmd = config::resolve_agent(Some(name), config)
             .map(|a| a.cmd)
             .unwrap_or_else(|_| config.agents[name].cmd.clone());
-        checks.push((
-            format!("agent: {name}"),
-            check_binary_on_path(&resolved_cmd).map(|()| String::new()),
-        ));
+        // Only `default_agent` has to be installed for `cw` to work; the
+        // other bundled agents (`config::default_agents` ships five) are
+        // optional, and a missing optional one is information, not a
+        // failure — otherwise every machine without all five installed
+        // would fail `cw doctor`'s exit code for nothing.
+        let result = match check_binary_on_path(&resolved_cmd) {
+            Ok(()) => Ok(String::new()),
+            Err(e) if *name == config.default_agent => Err(e),
+            Err(_) => Ok(format!(
+                "'{resolved_cmd}' not on PATH — optional, only default_agent ('{}') is required",
+                config.default_agent
+            )),
+        };
+        checks.push((format!("agent: {name}"), result));
     }
 
     checks
@@ -225,6 +235,7 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AgentConfig, Config};
     use std::ffi::OsString;
 
     #[test]
@@ -241,6 +252,51 @@ mod tests {
 
         assert!(resolve_on_path("foo", &path_var).is_ok());
         assert!(resolve_on_path("does-not-exist-anywhere", &path_var).is_err());
+    }
+
+    #[test]
+    fn missing_optional_agent_is_ok_missing_default_is_err() {
+        let present = AgentConfig {
+            cmd: "/bin/sh".to_string(),
+            args: vec![],
+        };
+        let absent = AgentConfig {
+            cmd: "cw-test-not-a-real-binary".to_string(),
+            args: vec![],
+        };
+
+        let mut cfg = Config::default();
+        cfg.agents.clear();
+        cfg.default_agent = "present".to_string();
+        cfg.agents.insert("present".to_string(), present);
+        cfg.agents.insert("absent".to_string(), absent);
+        let results = run_doctor(&cfg);
+        let present_row = results
+            .iter()
+            .find(|(l, _)| l == "agent: present")
+            .expect("present agent row");
+        assert!(present_row.1.is_ok());
+        let absent_row = results
+            .iter()
+            .find(|(l, _)| l == "agent: absent")
+            .expect("absent agent row");
+        assert!(
+            absent_row.1.is_ok(),
+            "optional agent must not fail doctor: {:?}",
+            absent_row.1
+        );
+        assert!(absent_row.1.as_ref().expect("ok").contains("optional"));
+
+        cfg.default_agent = "absent".to_string();
+        let results = run_doctor(&cfg);
+        let absent_row = results
+            .iter()
+            .find(|(l, _)| l == "agent: absent")
+            .expect("absent default-agent row");
+        assert!(
+            absent_row.1.is_err(),
+            "a missing default_agent must fail doctor"
+        );
     }
 
     #[test]

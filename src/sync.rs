@@ -102,12 +102,17 @@ pub fn clone_or_pull_ex(
         if !pull {
             return Ok((repo, PullOutcome::Skipped));
         }
-        let branch = repo
-            .head()
-            .context("repo HEAD unresolved — detached or unborn?")?
-            .shorthand()
-            .context("HEAD is not a valid UTF-8 branch name")?
-            .to_string();
+        let branch = {
+            let head = repo.head().with_context(|| {
+                format!(
+                    "{owner}/{name} has no HEAD — empty repository with no commits yet ({})",
+                    path.display()
+                )
+            })?;
+            head.shorthand()
+                .context("HEAD is not a valid UTF-8 branch name")?
+                .to_string()
+        };
         let outcome = fetch_and_ff(&repo, &branch)?;
         return Ok((repo, outcome));
     }
@@ -140,9 +145,18 @@ pub fn clone_or_pull_ex(
                 "launching `gh repo clone` — is `gh` on PATH and authenticated? run `gh auth login`",
             )?;
             if !output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                let detail = [stdout.trim(), stderr.trim()]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if detail.is_empty() {
+                    bail!("`gh repo clone {slug}` exited with {}", output.status);
+                }
                 bail!(
-                    "`gh repo clone {slug}` exited with {}: {stderr}",
+                    "`gh repo clone {slug}` exited with {}: {detail}",
                     output.status
                 );
             }

@@ -52,30 +52,20 @@ fn default_idle_days() -> u64 {
 }
 
 fn default_agents() -> HashMap<String, AgentConfig> {
+    let plain = |cmd: &str| AgentConfig {
+        cmd: cmd.to_string(),
+        args: vec![],
+    };
     let mut agents = HashMap::new();
-    agents.insert(
-        "claude".to_string(),
-        AgentConfig {
-            cmd: "claude".to_string(),
-            args: vec![],
-        },
-    );
-    agents.insert(
-        "grok".to_string(),
-        AgentConfig {
-            cmd: "grok".to_string(),
-            args: vec![],
-        },
-    );
+    // Every bundled agent CLI opens its interactive session in the current
+    // directory with no arguments — `agent::launch` sets `current_dir` to
+    // the worktree, so none of them need a path flag.
+    for name in ["claude", "codex", "grok", "opencode"] {
+        agents.insert(name.to_string(), plain(name));
+    }
     // `$SHELL` is expanded by `resolve_agent()` itself (F13): `Command::new("$SHELL")`
     // would NOT go through a shell and fails with ENOENT — see `expand_var` below.
-    agents.insert(
-        "shell".to_string(),
-        AgentConfig {
-            cmd: "$SHELL".to_string(),
-            args: vec![],
-        },
-    );
+    agents.insert("shell".to_string(), plain("$SHELL"));
     agents
 }
 
@@ -204,6 +194,21 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("gpt"));
         assert!(msg.contains("claude"));
+    }
+
+    #[test]
+    fn default_agents_include_bundled_clis() {
+        let cfg = Config::default();
+        for name in ["claude", "codex", "grok", "opencode", "shell"] {
+            assert!(
+                cfg.agents.contains_key(name),
+                "missing default agent {name}"
+            );
+            assert!(cfg.agents[name].args.is_empty());
+        }
+        assert_eq!(cfg.agents["codex"].cmd, "codex");
+        assert_eq!(cfg.agents["opencode"].cmd, "opencode");
+        assert_eq!(cfg.agents["shell"].cmd, "$SHELL");
     }
 
     // `cargo test` runs tests concurrently by default, but SHELL is process-global —

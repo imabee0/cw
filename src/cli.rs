@@ -71,7 +71,8 @@ pub enum Cmd {
     },
 
     /// Run environment/config sanity checks (gh auth, git credential helper,
-    /// terminal compat, each configured agent's binary on PATH)
+    /// terminal compat, each configured agent's binary on PATH — only
+    /// default_agent fails the exit code if missing)
     Doctor,
 
     /// Emit a shell completion script

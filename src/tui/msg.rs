@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::github::Repo;
+use crate::gitstatus::WorkState;
 use crate::sync::PullOutcome;
 use crate::worktree::WorktreeEntry as ScannedEntry;
 
@@ -16,7 +17,7 @@ pub enum Msg {
     /// Repo-discovery background thread result (`Scope::Browse` only),
     /// polled off an `mpsc::Receiver` once per event-loop tick.
     DataLoaded(RepoLoad),
-    /// Full worktree-scan-plus-dirty-status background thread result.
+    /// Full worktree-scan-plus-work-state background thread result.
     /// Spawned once at dashboard construction, and re-armed on demand by the
     /// `r` key (`DashboardModel::rescan_requested`, handled in
     /// `dashboard.rs`) — see `WorktreesLoad`.
@@ -24,14 +25,13 @@ pub enum Msg {
     /// Background clone/pull thread result for a repo the user committed to
     /// (Enter on a worktree row) — see `CloneOutcome`.
     CloneDone(Result<CloneOutcome, String>),
-    /// A fresh `gitstatus::is_dirty` read for one worktree path, reported by
-    /// `dashboard.rs`'s driver loop after resuming from a suspended hook run
-    /// or agent launch (either could have changed the worktree's dirty
-    /// state). `Err` only on a real I/O failure reading the worktree's git
-    /// status — folded into `dirty_cache` as "unknown, assume clean" rather
-    /// than surfaced as a hard error, same tolerance idiom
-    /// `WorktreeRow::existing` used before this rewrite.
-    DirtyRefreshed(PathBuf, Result<bool, String>),
+    /// A fresh `gitstatus::work_state` read for one worktree path, reported
+    /// by `dashboard.rs`'s driver loop after resuming from a suspended hook
+    /// run or agent launch (either could have changed what the worktree
+    /// holds). `Err` only on a real I/O failure reading the worktree's git
+    /// state — folded into `work_cache` as "unknown", which the removal
+    /// confirm treats as valuable rather than disposable.
+    WorkRefreshed(PathBuf, Result<WorkState, String>),
     /// Background self-update check result (`selfupdate::spawn_check`) —
     /// `Some(version)` when a newer release is pending, `None` when up to
     /// date. Never sent at all on a failed check (no install receipt,
@@ -57,15 +57,16 @@ pub struct RepoLoad {
 }
 
 /// Everything the worktree pane needs from one full background scan: every
-/// worktree found across every repo, plus a `gitstatus::is_dirty` pass over
-/// each entry's path (`DashboardModel::dirty_cache`). Computed off the
-/// render thread — at dashboard startup, and again on each `r`-triggered
-/// rescan — so a repo-cursor move or a filter keystroke is always a pure
-/// in-memory read, never an `is_dirty` call.
+/// worktree found across every repo, plus a `gitstatus::work_state` pass
+/// over each entry's path (`DashboardModel::work_cache`; `None` for an
+/// entry whose state couldn't be read). Computed off the render thread — at
+/// dashboard startup, and again on each `r`-triggered rescan — so a
+/// repo-cursor move or a filter keystroke is always a pure in-memory read,
+/// never a git call.
 #[derive(Debug, Clone, Default)]
 pub struct WorktreesLoad {
     pub entries: Vec<ScannedEntry>,
-    pub dirty: HashMap<PathBuf, bool>,
+    pub work: HashMap<PathBuf, Option<WorkState>>,
 }
 
 /// Background clone/pull thread result — carries only plain `Clone`-able

@@ -9,7 +9,7 @@ use crate::worktree;
 
 /// `cw clean`: opens the dashboard scoped to every worktree across every
 /// repo, letting the user mark rows with Space and remove them with `d`/`y`
-/// (idle/dirty already annotated, per `tui::model::WorktreeRow`) — renders
+/// (age and work state already annotated, per `tui::model::WorktreeRow`) — renders
 /// identically to `cw resume`, just entered under a different name/`--force`
 /// default. The dashboard itself owns the scan/select/confirm/remove flow
 /// (`DashboardModel::confirm_delete`) — this is now a thin entry point, not
