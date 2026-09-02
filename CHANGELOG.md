@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/imabee0/cw/compare/v0.1.11...v0.1.12) - 2026-09-02
+
+### Added
+
+- *(tui)* clickable agents, safer delete, and clone error modal ([#26](https://github.com/imabee0/cw/pull/26))
+
 ## [0.1.11](https://github.com/imabee0/cw/compare/v0.1.10...v0.1.11) - 2026-08-23
 
 ### Other
