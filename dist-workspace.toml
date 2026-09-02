@@ -34,3 +34,6 @@ pr-run-mode = "skip"
 # Sign release artifacts via GitHub attestations (the "sign" half of house
 # policy; verify with `gh attestation verify <artifact> --repo imabee0/cw`).
 github-attestations = true
+# Extra steps in every local-artifact job — see release-build-setup.yml.
+# Path is relative to .github/workflows/.
+github-build-setup = "release-build-setup.yml"
