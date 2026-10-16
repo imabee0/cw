@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16](https://github.com/imabee0/cw/compare/v0.1.15...v0.1.16) - 2026-10-16
+
+### Other
+
+- macos-26 runners for dist-build and verify; rustls 0.23.46 ([#48](https://github.com/imabee0/cw/pull/48))
+
 ## [0.1.15](https://github.com/imabee0/cw/compare/v0.1.14...v0.1.15) - 2026-09-02
 
 ### Other
