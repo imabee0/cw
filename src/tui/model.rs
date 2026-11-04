@@ -415,7 +415,7 @@ pub enum Modal {
         targets: Vec<DeleteTarget>,
         include_risky: bool,
     },
-    /// A failure the user has to read in full — clone/pull output, a
+    /// A failure the user has to read in full — clone/fetch output, a
     /// worktree-creation error, an agent that isn't installed. Wrapped and
     /// dismissable, unlike the one-line status, and always also written to
     /// the day's log file (`DashboardModel::fail`).
@@ -455,7 +455,7 @@ pub struct PendingLaunch {
     pub stage: Stage,
     /// Set only once a fresh worktree was actually just created by this
     /// pipeline (never for a fast-resumed/existing selection) — gates
-    /// `post_create_hook`, mirroring `main.rs`'s old `was_existing` check.
+    /// `post_create_hook`, same as `main.rs`'s fast path `was_existing` check.
     pub freshly_created: bool,
 }
 
@@ -1076,10 +1076,11 @@ impl DashboardModel {
     /// pending instead.
     ///
     /// An existing worktree always resumes under its *own* repo (read off
-    /// the scanned entry) and launches directly — never a clone/pull, which
-    /// only touches the main checkout and can't affect the worktree's own
-    /// branch anyway. A new worktree in `Scope::Browse` is created under
-    /// the repo pane's selected repo, after a clone/pull of that repo.
+    /// the scanned entry) and launches directly — never a clone/fetch, which
+    /// only moves the base new sessions branch from and can't affect an
+    /// existing session's branch anyway. A new worktree in `Scope::Browse`
+    /// is created under the repo pane's selected repo, after a clone/fetch
+    /// of that repo.
     pub fn start_pending(&mut self, selection: WorktreeSelection) -> Option<DashboardOutcome> {
         if self.pending.is_some() {
             return None;
@@ -1162,7 +1163,7 @@ impl DashboardModel {
         self.advance_pending()
     }
 
-    /// Background clone/pull thread result — advances the pipeline past
+    /// Background clone/fetch thread result — advances the pipeline past
     /// `Stage::Cloning`. A pull of an already-cloned repo (not a fresh
     /// clone) skips the clone-hook checkpoint entirely, mirroring the old
     /// `run_default`'s `if matches!(pull_outcome, PullOutcome::Cloned)`
@@ -1178,15 +1179,10 @@ impl DashboardModel {
                     PullOutcome::FastForwarded => {
                         Some(format!("pulled latest changes for {}", outcome.repo_label))
                     }
-                    PullOutcome::Diverged => Some(format!(
-                        "{}'s local branch has diverged from origin — left untouched",
-                        outcome.repo_label
-                    )),
-                    PullOutcome::DirtyLocalChanges => Some(format!(
-                        "{} has uncommitted local changes — skipped pull to avoid discarding them",
-                        outcome.repo_label
-                    )),
-                    PullOutcome::UpToDate | PullOutcome::Skipped => None,
+                    PullOutcome::Fetched | PullOutcome::UpToDate | PullOutcome::Skipped => None,
+                    // `clone_or_pull` turns both into an error (an error
+                    // modal) before returning.
+                    PullOutcome::Diverged | PullOutcome::DirtyLocalChanges => None,
                 };
                 if let Some(p) = self.pending.as_mut() {
                     p.stage = if outcome.pull_outcome == PullOutcome::Cloned {
@@ -1205,7 +1201,7 @@ impl DashboardModel {
                     .as_ref()
                     .map(|p| p.ctx.repo_label.clone())
                     .unwrap_or_default();
-                self.fail(&format!("clone/pull of {label} failed"), e);
+                self.fail(&format!("fetching {label} failed"), e);
                 None
             }
         }

@@ -1,3 +1,11 @@
+//! Getting a repo's history onto disk, on demand. A repo is cloned only when
+//! a session in it starts, as a **bare store** (`<root>/<owner>/<name>/.git`,
+//! no checkout of its own); every session is a worktree of that store, and
+//! `clean::remove_one` deletes the store with its last session. Network
+//! access is `gh repo clone` for the first clone and system `git fetch`
+//! afterwards — both honour SSH remotes and configured credential helpers,
+//! and neither ever prompts.
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -5,46 +13,43 @@ use anyhow::{bail, Context, Result};
 
 use crate::gitstatus::is_dirty_repo;
 
-/// `<root>/<owner>/<repo>` — never `<root>/<repo-name>` alone (§5a). A
-/// personal repo and an org repo can share a bare name; flat layout would
-/// silently collide, and owner-nesting also matches `gh`'s own default
-/// clone shape.
-///
-/// Takes `owner`/`name` as plain strings rather than a `Repo` struct: §6
-/// step 4 builds `github.rs` and `sync.rs` as parallel, independent waves,
-/// so this module cannot compile-depend on a type owned by the other wave.
-/// `root` is expected pre-expanded (`~` handled by the caller at
-/// config-load time, not here).
+/// `<root>/<owner>/<repo>` — never `<root>/<repo-name>` alone. A personal
+/// repo and an org repo can share a name; a flat layout would silently
+/// collide. `root` is expected pre-expanded (`~` handled by the caller).
 pub fn resolve_local_path(root: &Path, owner: &str, name: &str) -> PathBuf {
     root.join(owner).join(name)
 }
 
-/// Result of a `clone_or_pull`/`fetch_and_ff` call — named so callers
-/// (incl. `--dry-run`, §7b #15) can report exactly what happened/would
-/// happen without re-deriving it from a raw `MergeAnalysis`.
+/// What `clone_or_pull` did, so callers can report it. `Diverged` and
+/// `DirtyLocalChanges` never reach a caller of `clone_or_pull` (it turns
+/// them into errors); they're `fetch_and_ff`'s own results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullOutcome {
-    /// Repo wasn't cloned locally yet; `gh repo clone` ran instead of a pull.
+    /// No store existed yet; a fresh bare store was cloned (or, if another
+    /// `cw` finished cloning the same repo first, that one is used).
     Cloned,
-    /// Already up to date with the remote — nothing to fast-forward.
+    /// An existing bare store fetched the remote's current default branch;
+    /// new sessions branch from it.
+    Fetched,
+    /// A full checkout (a `root` the user populated themselves) was already
+    /// up to date with its remote branch.
     UpToDate,
-    /// Local branch fast-forwarded onto the fetched remote commit.
+    /// A full checkout's branch fast-forwarded onto the fetched commit.
     FastForwarded,
     /// Fetched history isn't a fast-forward of the local branch (diverged) —
     /// left untouched; cw doesn't attempt a merge/rebase on the user's behalf.
     Diverged,
-    /// A fast-forward was possible but the worktree has uncommitted local
-    /// changes — aborted before touching any ref or file (§5c).
+    /// A fast-forward was possible but the checkout has uncommitted local
+    /// changes — aborted before touching any ref or file.
     DirtyLocalChanges,
-    /// Already cloned; `--no-pull` requested skipping fetch/fast-forward
-    /// entirely (cli.rs's `no_pull` flag).
+    /// Already present; `--no-pull` skipped fetching entirely.
     Skipped,
 }
 
 /// Which stdio a `gh repo clone` subprocess should use — `Inherit` for the
-/// plain-terminal fast path (unchanged today's behavior: the user sees raw
-/// `gh` output directly), `Capture` for the dashboard's background clone
-/// thread, where inherited stdio would corrupt the active alt-screen.
+/// plain-terminal fast path (the user sees `gh`'s own progress output),
+/// `Capture` for the dashboard's background clone thread, where inherited
+/// stdio would corrupt the active alt-screen.
 /// `Capture` also sets `GH_PROMPT_DISABLED=1` (confirmed via `gh help
 /// environment`) so a `gh` that would otherwise block on an interactive
 /// prompt fails fast instead of hanging a background thread forever.
@@ -53,11 +58,8 @@ pub enum CloneStdio {
     Capture,
 }
 
-/// Clones `owner/name` under `root` via `gh repo clone` if it isn't present
-/// locally yet, otherwise opens the existing clone and — unless `pull` is
-/// `false` (cli.rs's `--no-pull`, §4: "on an already-cloned repo, skip
-/// fetch/fast-forward entirely") — fast-forwards its current branch in
-/// place. Returns the opened repo plus what happened.
+/// Makes `owner/name` ready to branch a new session from, with the
+/// terminal's stdio for `gh` (see `clone_or_pull_ex`).
 pub fn clone_or_pull(
     root: &Path,
     owner: &str,
@@ -67,11 +69,18 @@ pub fn clone_or_pull(
     clone_or_pull_ex(root, owner, name, pull, CloneStdio::Inherit)
 }
 
-/// `clone_or_pull`'s captured-stdio sibling — same clone/pull decision and
-/// return shape, but the `gh repo clone` subprocess's stdio is controlled by
-/// `stdio` instead of always inheriting the caller's terminal. `fetch_and_ff`
-/// (the pull path) never shells out — it's pure `git2` — so `stdio` only
-/// affects the fresh-clone branch below.
+/// Makes `owner/name` ready to branch a new session from:
+/// - nothing on disk → clone a managed bare store (`Cloned`);
+/// - an existing bare store → fetch the remote default branch into
+///   `refs/cw/default`, which `HEAD` points at (`Fetched`);
+/// - a full checkout (only if the user put one under `root` themselves) →
+///   fast-forward its current branch, refusing — as an error — a detached
+///   HEAD, a diverged branch, or uncommitted changes, rather than silently
+///   starting a session from stale code;
+/// - `pull == false` (`--no-pull`) → use what's on disk (`Skipped`).
+///
+/// `stdio` only affects the `gh repo clone` subprocess; fetches always run
+/// captured, since their stderr is folded into the error.
 pub fn clone_or_pull_ex(
     root: &Path,
     owner: &str,
@@ -89,7 +98,7 @@ pub fn clone_or_pull_ex(
         }
         if repo.is_bare() {
             fetch_default(&repo)?;
-            return Ok((repo, PullOutcome::UpToDate));
+            return Ok((repo, PullOutcome::Fetched));
         }
         if repo.head_detached()? {
             bail!("{owner}/{name} has a detached HEAD; check out a branch before updating, or use --no-pull to explicitly use local code");
@@ -134,7 +143,7 @@ pub fn clone_or_pull_ex(
         let _ = std::fs::remove_dir(&path);
         match std::fs::rename(&staging, &path) {
             Ok(()) => Ok(PullOutcome::Cloned),
-            Err(_) if path.join(".git").exists() => Ok(PullOutcome::UpToDate),
+            Err(_) if path.join(".git").exists() => Ok(PullOutcome::Cloned),
             Err(e) => Err(anyhow::Error::new(e)
                 .context(format!("moving fresh clone into {}", path.display()))),
         }
@@ -146,9 +155,9 @@ pub fn clone_or_pull_ex(
     Ok((repo, outcome))
 }
 
-/// `gh repo clone -- --bare` into `<path>/.git`: a git store with no main
-/// checkout at all, so nothing but history lives on disk until a session
-/// worktree is created, and `cw finish` on the last session deletes it.
+/// `gh repo clone -- --bare` into `<path>/.git`, then `configure_managed_store`.
+/// Only history lives on disk — no checkout until a session worktree is
+/// created.
 fn clone_managed_store(
     path: &Path,
     owner: &str,
@@ -252,7 +261,10 @@ fn configure_managed_store(repo: &git2::Repository) -> Result<()> {
     Ok(())
 }
 
-/// Fetch remote HEAD directly, so default-branch renames are respected.
+/// Fetches the remote's HEAD (whatever its default branch is today, so a
+/// rename is followed) into `refs/cw/default` and every remote branch into
+/// `refs/remotes/origin/*`, then points the store's `HEAD` at
+/// `refs/cw/default` (detached) — the base every new session branches from.
 fn fetch_default(repo: &git2::Repository) -> Result<()> {
     let output = Command::new("git")
         .arg("--git-dir")
@@ -281,15 +293,13 @@ fn fetch_default(repo: &git2::Repository) -> Result<()> {
     Ok(())
 }
 
-/// Fetches `origin` and fast-forwards `branch` onto it — dirty-tree guard
-/// added (§5c; a prior draft would have force-checked-out over uncommitted
-/// local edits). The guard runs BEFORE any ref mutation: `set_target`/
-/// `set_head`/`checkout_head` only ever run after `is_dirty_repo` has
-/// already returned `false`, so an aborted pull leaves both the working
-/// tree and the ref graph byte-for-byte unchanged — not just the file
-/// contents, which a checkout could disturb even for files the incoming
-/// commit doesn't touch (force-checkout resets the whole tree, not just
-/// the diff).
+/// Full checkouts only (a bare store uses `fetch_default`): fetches `branch`
+/// from `origin` with system `git` and fast-forwards it. Uncommitted changes
+/// abort before any ref or file is touched (`DirtyLocalChanges`); otherwise
+/// the new tree is checked out with a *safe* checkout first and the branch
+/// moved only after that succeeded, so an obstruction can never leave the
+/// branch advanced over an old working tree. A non-fast-forward is reported
+/// as `Diverged` and left alone — cw never merges or rebases for you.
 pub fn fetch_and_ff(repo: &git2::Repository, branch: &str) -> Result<PullOutcome> {
     // Use Git's configured transport and credential helpers (including SSH),
     // consistently with gh's clone subprocess. Never prompt inside the TUI.
@@ -444,7 +454,7 @@ mod tests {
             CloneStdio::Capture,
         )
         .unwrap();
-        assert_eq!(outcome, PullOutcome::UpToDate);
+        assert_eq!(outcome, PullOutcome::Fetched);
         assert_eq!(rev(&repo, "HEAD"), rev(&origin_repo, "trunk"));
         let wt2 = crate::worktree::create_or_resume_worktree(&repo, &store, "t", "HEAD").unwrap();
         let wt2_repo = git2::Repository::open(wt2).unwrap();
@@ -497,8 +507,8 @@ mod tests {
         assert_eq!(b, root.join("bob").join("app"));
     }
 
-    /// F33 / §7b #9's underlying regression guard: a fast-forward-able pull
-    /// on a worktree with uncommitted local changes must abort entirely —
+    /// Regression guard: a fast-forward-able pull on a checkout with
+    /// uncommitted local changes must abort entirely —
     /// not just leave file bytes alone, but leave the branch ref untouched
     /// too, since a naive fix could move the ref before the guard runs.
     #[test]

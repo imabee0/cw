@@ -8,7 +8,7 @@
 //!
 //! This is the impure boundary the pure `tui::update`/`tui::model` code
 //! deliberately stays out of: background threads (repo discovery, the
-//! worktree scan — re-armed on demand by the `r` key — and the clone/pull
+//! worktree scan — re-armed on demand by the `r` key — and the clone/fetch
 //! thread) are all spawned from here, never from
 //! `tui::update::update_dashboard`.
 
@@ -34,9 +34,8 @@ use crate::tui::msg::{CloneOutcome, WorktreesLoad};
 use crate::tui::{self, update, view, Msg, RepoLoad};
 use crate::worktree;
 
-/// What the dashboard is opened for — one variant per `cw` entry point,
-/// matching the plan's caller table exactly (bare `cw` / `cw resume` /
-/// `cw clean [--force]` / `cw scratch [SLUG]`).
+/// What the dashboard is opened for — one variant per `cw` entry point
+/// (bare `cw` / `cw resume` / `cw clean [--force]` / `cw scratch [SLUG]`).
 pub enum Entry {
     /// Bare `cw`. `forced_repo` is set when `--repo OWNER/NAME` was passed
     /// (the interactive repo pane is seeded with just that one row, already
@@ -101,7 +100,7 @@ pub fn run(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result<()> 
                 // out to `main` instead of looping back into `tui::run` —
                 // deliberately not a raw `std::process::exit` here, which
                 // would skip `main`'s `WorkerGuard` drop and lose any
-                // buffered log lines (CLAUDE.md's §5m invariant).
+                // buffered log lines (see CLAUDE.md on `WorkerGuard`).
                 if run_suspend_chain(&mut screen, req)? {
                     return Ok(());
                 }
@@ -191,10 +190,9 @@ fn run_suspend_chain(screen: &mut DashboardScreen, mut req: SuspendReq) -> Resul
 
 struct DashboardScreen {
     model: DashboardModel,
-    /// `--no-pull`: kept on the screen, not the model — the plan's
-    /// `DashboardModel` sketch has no field for it, and it only ever affects
+    /// `--no-pull`: kept on the screen, not the model — it only ever affects
     /// how `maybe_spawn_clone` calls `clone_or_pull_ex`, which is impure
-    /// dashboard.rs territory anyway.
+    /// dashboard.rs territory.
     no_pull: bool,
     repo_rx: Option<mpsc::Receiver<RepoLoad>>,
     /// `None` once the in-flight scan's result has been consumed — the
@@ -424,11 +422,11 @@ fn build_screen(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result
     })
 }
 
-/// Mirrors the pre-rewrite `main.rs::pick_repo_interactive`'s background
-/// fetch: streams a `cache::refresh_if_needed` + `github::discover_repos`
-/// result in as `Msg::DataLoaded` so the dashboard opens immediately against
-/// whatever's cached (`load_cached_repos`, possibly empty on a cold cache)
-/// rather than blocking on the network first.
+/// Background repo discovery: streams a `cache::refresh_if_needed` +
+/// `github::discover_repos` result in as `Msg::DataLoaded` so the dashboard
+/// opens immediately against whatever's cached (`load_cached_repos`,
+/// possibly empty on a cold cache) rather than blocking on the network
+/// first. `--org` is applied here as a view filter, after caching.
 fn spawn_repo_thread(cli: &Cli, config: &Config) -> Result<mpsc::Receiver<RepoLoad>> {
     let cache_path = config::cache_path()?;
     let org_filter = cli.org.clone();
@@ -439,7 +437,7 @@ fn spawn_repo_thread(cli: &Cli, config: &Config) -> Result<mpsc::Receiver<RepoLo
     thread::spawn(move || {
         let warnings = std::cell::RefCell::new(Vec::new());
         let result = cache::refresh_if_needed(&cache_path, ttl, force_refresh, || {
-            let discovered = github::discover_repos(&[])?;
+            let discovered = github::discover_repos()?;
             *warnings.borrow_mut() = discovered.warnings;
             Ok(discovered.repos)
         });

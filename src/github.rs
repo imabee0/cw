@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 /// A repo discovered via `gh` — either the authenticated user's own or one
 /// belonging to an org they're a member of. `owner`/`name` are exactly the
-/// fields `sync.rs`'s `resolve_local_path` joins onto `root` (plan §5a:
-/// `root.join(&repo.owner).join(&repo.name)`), so their names are
+/// fields `sync.rs`'s `resolve_local_path` joins onto `root`
+/// (`root.join(&repo.owner).join(&repo.name)`), so their names are
 /// load-bearing, not just naming convention.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Repo {
@@ -148,20 +148,16 @@ fn merge_discovered(
 }
 
 /// Discovers repos across the authenticated user's personal account plus
-/// orgs. `org_filter` non-empty restricts discovery to those orgs and skips
-/// `list_orgs()` entirely (the CLI's `--org` flag); empty discovers every
-/// org the user belongs to. A failure listing personal repos is a hard
-/// error (no isolation — there'd be nothing to show regardless); a failure
-/// listing one org only warns, per-org, and discovery continues with the
-/// rest.
-pub fn discover_repos(org_filter: &[String]) -> Result<DiscoverResult> {
+/// every org they belong to. Always the full set — it's what lands in the
+/// shared `repos.json` cache; the CLI's `--org` is a view filter applied
+/// afterwards (`dashboard.rs::filter_repos`), so it can never leave a
+/// truncated list in the cache for a later unfiltered run. A failure
+/// listing personal repos is a hard error (no isolation — there'd be nothing
+/// to show regardless); a failure listing one org only warns, per-org, and
+/// discovery continues with the rest.
+pub fn discover_repos() -> Result<DiscoverResult> {
     let personal = list_repos(None).context("listing personal repos")?;
-
-    let orgs: Vec<String> = if org_filter.is_empty() {
-        list_orgs().context("listing orgs")?
-    } else {
-        org_filter.to_vec()
-    };
+    let orgs = list_orgs().context("listing orgs")?;
 
     let org_results: Vec<(String, Result<Vec<Repo>>)> = orgs
         .into_iter()

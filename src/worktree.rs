@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 /// subcommand" or "a worktree literally named `resume`"). `help` is included
 /// even though it isn't a named `Cmd` variant: clap treats `help` as a
 /// special case inside the same subcommand-matching branch as named
-/// subcommands (F12), so `cw help` never reaches slug parsing either.
+/// subcommands, so `cw help` never reaches slug parsing either.
 pub const RESERVED_SLUGS: &[&str] = &[
     "finish",
     "resume",
@@ -21,13 +21,11 @@ pub const RESERVED_SLUGS: &[&str] = &[
     "help",
 ];
 
-/// Validates a worktree slug against git's own ref-component rules, applied
-/// per `/`-separated segment (F11 — a prior draft only blocked
-/// `'+'`/`'..'`/absolute/whitespace ad hoc, which still admitted
-/// `` ~ ^ : ? * [ \ ``, a leading `-`, and a trailing `.lock`, all of which
-/// are either invalid in a git ref name or dangerous as a CLI arg — a slug
-/// starting with `-` would otherwise be parsed by clap as a flag, not a
-/// positional value).
+/// Validates a worktree slug: at most 64 chars, not a subcommand name, and
+/// each `/`-separated segment matches `[A-Za-z0-9._-]+` — an allowlist, so
+/// `+` (reserved by `flatten_slug`), whitespace and every git-ref-invalid
+/// character are out — and is not `.`/`..`, doesn't start with `-` (clap
+/// would parse it as a flag), and doesn't end in `.lock`.
 ///
 /// The charset check alone (`[A-Za-z0-9._-]+`) doesn't reject a bare `.`/`..`
 /// segment, a leading `-`, or a trailing `.lock` — those characters are all
@@ -99,12 +97,14 @@ pub fn worktree_path_and_exists(repo_root: &Path, slug: &str) -> (PathBuf, bool)
     (path, existed)
 }
 
-/// The actual entry point every caller (default flow, `cw scratch`, §0a's
-/// resume picker) uses. `create_worktree` below is force-create/reset (`-B`
-/// semantics) — calling it unconditionally on every invocation would
-/// silently discard in-progress work in an existing worktree on repeat runs.
-/// This wrapper is what makes re-running `cw <same-slug>` a genuine no-op
-/// fast-resume instead.
+/// The entry point every caller (default flow, `cw scratch`, the
+/// dashboard) uses. An existing worktree at the slug's path is resumed as-is
+/// (after checking it really belongs to `repo`) — re-running `cw
+/// <same-slug>` is a genuine no-op fast-resume. Otherwise one is created on
+/// branch `worktree-<flat>`: a new branch at `base_ref`, or, if that branch
+/// already exists (its checkout was deleted by hand), the existing branch
+/// with its commits intact — never reset.
+///
 /// `repo_root` is the path the caller resolved from its configured `root`,
 /// never one derived from `repo`: git2 reports a repo's location with
 /// symlinks resolved (macOS `/var` → `/private/var`, a symlinked `$HOME`),
@@ -139,8 +139,7 @@ fn create_worktree(
     let branch_name = format!("worktree-{flat}");
     let path = path.to_path_buf();
 
-    // Zero-commit repos (a genuinely fresh `git init`, before §5n's
-    // scratch-repo fix or a real empty GitHub repo) have no HEAD to peel —
+    // Zero-commit repos (a real empty GitHub repo) have no HEAD to peel —
     // surface a clear message here rather than an opaque git2::Error further
     // down.
     let target = repo
@@ -188,16 +187,13 @@ fn create_worktree(
         Err(e) => Err(e.into()),
     };
 
-    // Append `.claude/worktrees/` to the PARENT repo's `.git/info/exclude`,
-    // idempotently, right after a successful create — NOT a §5n scratch-only
-    // fix (F5, the most consequential single catch in this round). Worktrees
-    // live inside the main checkout; `gitstatus::is_dirty_repo` uses
-    // include_untracked(true), so the moment any worktree exists, the parent
-    // repo has an untracked `.claude/` entry and `sync::fetch_and_ff`'s
-    // dirty guard starts rejecting every future `cw` pull on that repo,
-    // forever — intermittently (repos that already .gitignore `.claude/`
-    // are unaffected, which is exactly what let this slip past manual
-    // testing).
+    // Append `/.claude/worktrees/` to the repo's `info/exclude`, idempotently,
+    // after every successful create. Needed for full checkouts (scratch, or a
+    // `root` the user populated): worktrees live inside the checkout, and
+    // `gitstatus::is_dirty_repo` counts untracked files, so without it the
+    // first worktree would make `sync::fetch_and_ff`'s dirty guard reject
+    // every future update of that repo. Harmless for a bare store, which has
+    // no working tree to be dirty.
     if result.is_ok() {
         append_line_if_missing(&repo.path().join("info/exclude"), "/.claude/worktrees/")?;
     }
@@ -229,10 +225,8 @@ fn append_line_if_missing(path: &Path, line: &str) -> Result<()> {
     Ok(())
 }
 
-/// `cw clean` / worktree removal — signature corrected, branch cleanup added
-/// (F9: the design pass's original form doesn't compile — `prune()` is an
-/// INSTANCE method on `Worktree`, not `Worktree::prune(opts)` — and prune
-/// alone leaks a branch per removal).
+/// Removes a worktree: prunes its checkout and admin entry, then deletes its
+/// `worktree-<flat>` branch (prune alone would leak one branch per removal).
 pub fn remove_worktree(repo: &git2::Repository, slug: &str) -> Result<()> {
     let flat = flatten_slug(slug);
     let wt = repo.find_worktree(&flat)?;
@@ -270,7 +264,7 @@ pub fn generate_timestamp_slug() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeEntry {
     /// `"owner/repo"` — matches the label `resolve_local_path` derives the
-    /// on-disk layout from (§5a/§5g).
+    /// on-disk layout from.
     pub repo: String,
     pub slug: String,
     pub path: PathBuf,
@@ -305,10 +299,8 @@ fn read_dir_ok(path: &Path) -> impl Iterator<Item = fs::DirEntry> {
 }
 
 /// Scans the two-level `<root>/<owner>/<repo>/.claude/worktrees/<slug>`
-/// layout (this was the advisor's #2, the most serious catch: without this
-/// fix, `cw resume` and `cw clean` silently return nothing under the
-/// owner-nested repo layout §5a introduced). `clean.rs` reuses this same
-/// function rather than duplicating a one-level scan.
+/// layout for every session under `root`. The single scanner behind the
+/// dashboard, `cw finish`, and the fast path's resume check.
 pub fn scan_worktrees(root: &Path) -> Result<Vec<WorktreeEntry>> {
     let mut out = vec![];
     for owner_dir in read_dir_ok(root) {
@@ -334,7 +326,7 @@ pub fn scan_worktrees(root: &Path) -> Result<Vec<WorktreeEntry>> {
                         .expect("invariant: read_dir entry always has a file name")
                         .to_string_lossy()
                         .into_owned(),
-                    // `.ok()`-chained, not `?` (F34) — one unreadable entry
+                    // `.ok()`-chained, not `?` — one unreadable entry
                     // (permissions, a race with concurrent deletion) would
                     // otherwise abort the ENTIRE scan via `?`, defeating
                     // read_dir_ok's whole point of being tolerant.
@@ -352,22 +344,45 @@ pub fn scan_worktrees(root: &Path) -> Result<Vec<WorktreeEntry>> {
     Ok(out)
 }
 
-/// Symlinks each configured `symlink_dirs` entry (config.rs's
-/// `Config::symlink_dirs`, §3/§5c-note) from the repo's main checkout into a
-/// freshly created worktree, when present in the main checkout — so e.g.
-/// `node_modules` doesn't need reinstalling in every worktree. Mirrors
-/// Claude Code's own `--worktree` behavior; unlike that tool, cw's own
-/// default `symlink_dirs` list is empty (§3) — this only runs at all when
-/// the user has explicitly opted a dir in, because a symlinked
-/// `node_modules` is shared mutable state across every worktree of the repo.
-/// A dir missing from the main checkout (nothing installed yet) or already
-/// present in the worktree (re-running against an existing worktree) is
-/// silently skipped, not an error.
+/// Whether `repo_root` holds a cw-managed bare store (`clone --bare`, no
+/// checkout of its own) rather than a full checkout.
+pub fn is_bare_store(repo_root: &Path) -> bool {
+    git2::Repository::open(repo_root).is_ok_and(|r| r.is_bare())
+}
+
+/// Symlinks each configured `symlink_dirs` entry into a freshly created
+/// worktree, so e.g. `node_modules` is installed once per repo instead of
+/// once per session. Off unless the user opts a dir in (the default list is
+/// empty): a symlinked dir is shared mutable state across every session of
+/// the repo.
+///
+/// The shared copy lives in the repo's directory under `root`:
+/// - bare store: `<store>/<dir>`, created empty on first use — the first
+///   session's install populates it through the symlink, later sessions
+///   reuse it, and it goes away with the store when the last session
+///   finishes;
+/// - full checkout: the checkout's own `<dir>`, linked only if present.
+///
+/// Each linked dir is also added to the repo's shared `info/exclude`: a
+/// symlink doesn't match a `node_modules/`-style (directory-only) ignore
+/// pattern, so it would otherwise show as an untracked file and make every
+/// session look like it has unsaved work. A dir already present in the
+/// worktree (tracked, or a re-run) is left alone.
 pub fn symlink_shared_dirs(repo_root: &Path, worktree_path: &Path, dirs: &[String]) -> Result<()> {
+    if dirs.is_empty() {
+        return Ok(());
+    }
+    let bare = is_bare_store(repo_root);
+    let exclude = git2::Repository::open(repo_root)
+        .ok()
+        .map(|r| r.commondir().join("info/exclude"));
     for dir in dirs {
         let src = repo_root.join(dir);
         if !src.exists() {
-            continue;
+            if !bare {
+                continue;
+            }
+            fs::create_dir_all(&src).with_context(|| format!("creating {}", src.display()))?;
         }
         let dst = worktree_path.join(dir);
         if dst.exists() {
@@ -382,6 +397,9 @@ pub fn symlink_shared_dirs(repo_root: &Path, worktree_path: &Path, dirs: &[Strin
         #[cfg(not(unix))]
         {
             bail!("symlink_dirs is only supported on unix targets");
+        }
+        if let Some(exclude) = &exclude {
+            append_line_if_missing(exclude, &format!("/{}", dir.trim_matches('/')))?;
         }
     }
     Ok(())
@@ -483,6 +501,53 @@ mod tests {
                 .unwrap()
                 .target(),
             Some(oid)
+        );
+    }
+
+    /// `symlink_dirs` on a bare store: one shared copy per repo, created on
+    /// first use, visible from every session, never counted as unsaved work,
+    /// and never deleted by removing a single session (prune must not follow
+    /// the symlink) — only with the store itself.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_dirs_share_one_copy_across_sessions_of_a_bare_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let container = tmp.path().join("acme/proj");
+        let repo = git2::Repository::init_bare(container.join(".git")).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+        let dirs = vec!["node_modules".to_string()];
+
+        let a = create_or_resume_worktree(&repo, &container, "a", "HEAD").unwrap();
+        symlink_shared_dirs(&container, &a, &dirs).unwrap();
+        assert!(
+            container.join("node_modules").is_dir(),
+            "created on first use"
+        );
+        fs::write(a.join("node_modules/dep.js"), "x").unwrap();
+
+        let b = create_or_resume_worktree(&repo, &container, "b", "HEAD").unwrap();
+        symlink_shared_dirs(&container, &b, &dirs).unwrap();
+        assert_eq!(
+            fs::read_to_string(b.join("node_modules/dep.js")).unwrap(),
+            "x"
+        );
+
+        let state = crate::gitstatus::work_state(&a, &container).unwrap();
+        assert_eq!(
+            state.changed_files, 0,
+            "the symlink must not read as unsaved work"
+        );
+
+        remove_worktree(&repo, "a").unwrap();
+        assert!(!a.exists());
+        assert!(
+            container.join("node_modules/dep.js").exists(),
+            "removing one session must not follow the symlink into the shared copy"
         );
     }
 
@@ -739,7 +804,7 @@ mod tests {
         // path — `stat()` only checks search permission on ancestor
         // directories, never any permission bit on the target itself, so
         // there's no non-root, non-racy way to make the two disagree. The
-        // practically-reproducible half of this regression guard (F34): one
+        // practically-reproducible half of this regression guard: one
         // repo whose worktrees directory can't be traversed at all must not
         // abort the scan of every other repo. `read_dir_ok`'s `.ok()`
         // chaining (not `?`) is what makes that true; this test would fail
