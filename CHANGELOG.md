@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/imabee0/cw/compare/v0.1.16...v0.2.0) - 2026-11-04
+
+**Upgrading:** repos are no longer kept as full checkouts in `~/repos`. Finish (or push) your existing sessions there with 0.1.x before upgrading — 0.2 no longer lists or touches `~/repos`.
+
+### Added
+
+- [**breaking**] On-demand session stores ([#54](https://github.com/imabee0/cw/pull/54)): a repo is cloned only when its first session starts, as a bare store (history only, no checkout) under `$XDG_DATA_HOME/cw/sessions` (default `~/.local/share/cw/sessions`, previously `~/repos`). Each session is a worktree branched from the freshly fetched remote default branch; finishing a repo's last session deletes the store, so only repos with open sessions are on disk.
+- `cw finish OWNER/NAME SLUG`: remove one session whose work is committed and pushed, non-interactively.
+- `--yolo` (alias `--skip-permissions`): launch Codex/Claude with permission prompts skipped, for that invocation only.
+- `/` in the dashboard: search with every letter, shortcut keys included.
+- `cw doctor` checks that `git` is on `PATH`.
+
+### Changed
+
+- Removing a session (`cw finish`, `d` in the dashboard) re-checks changed files, unpushed commits and whether its agent is still running at that moment; a lock left by a crashed `cw` is cleared automatically.
+- Fetches use system `git` (SSH remotes and credential helpers work) and never prompt; a pushed session branch stays "pushed" after the remote deletes it on merge.
+- Inside a session, git behaves like a normal clone: `origin/*` is fetched and a plain `git push` publishes the session branch.
+- Hooks resolve against the new session worktree; `post_clone_hook` runs once that worktree exists.
+- `symlink_dirs` keeps one shared copy per repo in its store; `.worktreeinclude` copies from the repo's most recent other session and never overwrites a tracked file.
+- `--org` filters the cached repo list too; discovery always caches every org.
+- An agent exiting nonzero is a status note, not a launch-failure error.
+
+### Fixed
+
+- A failed update no longer silently starts a session from stale code; dirty, diverged or detached checkouts stop with recovery instructions.
+- Creating a worktree never resets an existing branch's commits or prunes live/locked worktree metadata.
+- Concurrent or interrupted clones can't leave a half-made repo behind.
+- Worktree paths stay consistent through a symlinked root (e.g. macOS `/var`).
+- Keyboard input and scrolling reset pending double-click detection.
+
 ## [0.1.16](https://github.com/imabee0/cw/compare/v0.1.15...v0.1.16) - 2026-10-16
 
 ### Other
