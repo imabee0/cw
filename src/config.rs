@@ -32,7 +32,11 @@ pub struct AgentConfig {
 }
 
 fn default_root() -> PathBuf {
-    PathBuf::from("~/repos")
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        .join("cw/sessions")
 }
 
 fn default_ttl() -> u64 {
@@ -63,7 +67,7 @@ fn default_agents() -> HashMap<String, AgentConfig> {
     for name in ["claude", "codex", "grok", "opencode"] {
         agents.insert(name.to_string(), plain(name));
     }
-    // `$SHELL` is expanded by `resolve_agent()` itself (F13): `Command::new("$SHELL")`
+    // `$SHELL` is expanded by `resolve_agent()` itself: `Command::new("$SHELL")`
     // would NOT go through a shell and fails with ENOENT — see `expand_var` below.
     agents.insert("shell".to_string(), plain("$SHELL"));
     agents
@@ -85,7 +89,7 @@ impl Default for Config {
 }
 
 /// `$HOME`-based dotfile convention (matches `gh`/`cargo`/`rustup`), not
-/// `directories::ProjectDirs` — see plan §0: `ProjectDirs` would put macOS
+/// `directories::ProjectDirs`: `ProjectDirs` would put macOS
 /// config at `~/Library/Application Support/cw`, diverging from Linux.
 pub fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
@@ -111,7 +115,7 @@ pub fn log_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".cache/cw"))
 }
 
-/// Per-repo hook confirm-once consent store (§5h) — `"owner/repo" -> confirmed`.
+/// Per-repo hook confirm-once consent store — `"owner/repo" -> confirmed`.
 pub fn hook_consent_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".cache/cw/hook-consent.json"))
 }
@@ -127,14 +131,12 @@ pub fn load() -> Result<Config> {
     toml::from_str(&text).with_context(|| format!("parsing config at {}", path.display()))
 }
 
-// No `save()`: nothing in the CLI surface (§4) ever writes config.toml back —
-// it's hand-edited by the user, only ever loaded by cw. Adding a write path
-// with no caller would sit as permanent dead code once `scripts/check.sh`'s
-// `cargo clippy --all-targets -- -D warnings` starts running in phase 4.
+// No `save()`: cw never writes config.toml — it's hand-edited by the user,
+// only ever loaded.
 
 /// Resolves `--agent`/`default_agent` against `config.agents`. Never panics
 /// on a `HashMap` miss: an unknown name errors listing the configured agents.
-/// Expands a leading `$VAR`/`${VAR}` in the resolved `cmd`/`args` (F13), so
+/// Expands a leading `$VAR`/`${VAR}` in the resolved `cmd`/`args`, so
 /// returns an owned `AgentConfig` rather than a borrow.
 pub fn resolve_agent(name: Option<&str>, cfg: &Config) -> Result<AgentConfig> {
     let name = name.unwrap_or(cfg.default_agent.as_str());
@@ -158,7 +160,7 @@ pub fn resolve_agent(name: Option<&str>, cfg: &Config) -> Result<AgentConfig> {
 
 /// Expands a leading `$VAR` or `${VAR}` by reading the env var directly
 /// (never routes through `sh -c`). `$SHELL` specifically falls back to
-/// `/bin/sh` when unset (§3). Anything else that fails to resolve — a
+/// `/bin/sh` when unset. Anything else that fails to resolve — a
 /// malformed `${VAR}suffix` form (no closing brace, or trailing text after
 /// one), or any other variable that's simply unset — is an error naming the
 /// exact string that didn't resolve, rather than silently substituting an
@@ -183,9 +185,40 @@ fn expand_var(s: &str) -> Result<String> {
     })
 }
 
+/// Apply only to the two supported agent entries; preserve custom arguments.
+pub fn enable_agent_permission_bypass(config: &mut Config) {
+    for (name, flag) in [
+        ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+        ("claude", "--dangerously-skip-permissions"),
+    ] {
+        if let Some(agent) = config.agents.get_mut(name) {
+            if !agent.args.iter().any(|arg| arg == flag) {
+                agent.args.push(flag.into());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_bypass_is_idempotent_and_scoped() {
+        let mut config = Config::default();
+        let shell = config.agents["shell"].args.clone();
+        enable_agent_permission_bypass(&mut config);
+        enable_agent_permission_bypass(&mut config);
+        assert_eq!(
+            config.agents["codex"].args,
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert_eq!(
+            config.agents["claude"].args,
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(config.agents["shell"].args, shell);
+    }
 
     #[test]
     fn resolve_agent_missing_name() {

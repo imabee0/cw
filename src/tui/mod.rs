@@ -31,9 +31,7 @@ pub use msg::{Msg, RepoLoad};
 /// straight to `/dev/stderr`, not through stdin/stdout (see `TerminalGuard`
 /// below), so a piped stdin plausibly still reaches a real controlling
 /// terminal; the case that actually matters is no controlling terminal at
-/// all, e.g. a workflow agent. Moved here from the old `picker.rs` (now
-/// `dashboard.rs`) — this is the TUI backend's own precondition, not a
-/// picker-specific one, so it belongs next to the backend it gates.
+/// all, e.g. a workflow agent. Lives here, next to the backend it gates.
 pub fn is_interactive() -> bool {
     std::fs::File::open("/dev/tty").is_ok() && io::stderr().is_terminal()
 }
@@ -71,7 +69,7 @@ pub trait Screen {
 
     /// Non-blocking poll for work that isn't a terminal event — the
     /// dashboard's background threads (repo discovery, the one-shot worktree
-    /// scan, the reactive clone/pull thread). Default: no background work,
+    /// scan, the reactive clone/fetch thread). Default: no background work,
     /// for a `Screen` implementor with none of these.
     fn poll_background(&mut self) -> Option<Msg> {
         None

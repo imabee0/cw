@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
-/// cw — fuzzy-pick a repo (or resume a worktree), clone/pull it, and launch
-/// an agent CLI inside a git worktree.
+/// cw — fuzzy-pick a repo (or resume a session), fetch its latest default
+/// branch into an on-demand store, and launch an agent CLI in a fresh git
+/// worktree. Finishing a repo's last session deletes the store.
 #[derive(Debug, Parser)]
 #[command(name = "cw", version, about)]
 pub struct Cli {
@@ -16,11 +17,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub agent: Option<String>,
 
-    /// Root directory repos are cloned under (overrides config's root)
+    /// Directory session stores live under (overrides config's root)
     #[arg(long, global = true)]
     pub root: Option<PathBuf>,
 
-    /// Restrict discovery to this org (repeatable); skips org enumeration
+    /// Show only repos owned by this org or user (repeatable)
     #[arg(long)]
     pub org: Vec<String>,
 
@@ -28,7 +29,7 @@ pub struct Cli {
     #[arg(long)]
     pub refresh: bool,
 
-    /// On an already-cloned repo, skip fetch/fast-forward entirely
+    /// Skip fetching an existing store; new sessions branch from what's already fetched
     #[arg(long)]
     pub no_pull: bool,
 
@@ -44,6 +45,10 @@ pub struct Cli {
     #[arg(long)]
     pub yes: bool,
 
+    /// Skip agent permission checks for Codex and Claude
+    #[arg(long, global = true, alias = "skip-permissions")]
+    pub yolo: bool,
+
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
 }
@@ -53,9 +58,19 @@ pub enum Cmd {
     /// Pick from all known worktrees across every repo, sorted most-recent-first
     Resume,
 
-    /// Scan and remove worktrees interactively
+    /// Remove one session whose work is committed and pushed; deletes the
+    /// repo's local store when it was the last session
+    Finish {
+        /// Repository in OWNER/NAME form
+        repo: String,
+        /// Session slug
+        slug: String,
+    },
+
+    /// Review every session and remove finished ones interactively
     Clean {
-        /// Allow removing a worktree with uncommitted changes
+        /// Start with sessions holding changed files or unpushed commits included
+        /// in the removal (toggle with `f` in the confirm)
         #[arg(long)]
         force: bool,
     },
@@ -70,9 +85,10 @@ pub enum Cmd {
         dry_run: bool,
     },
 
-    /// Run environment/config sanity checks (gh auth, git credential helper,
-    /// terminal compat, each configured agent's binary on PATH — only
-    /// default_agent fails the exit code if missing)
+    /// Run environment/config sanity checks (gh auth, git on PATH, git
+    /// credential helper, terminal compat, install source/update status,
+    /// each configured agent's binary on PATH — only default_agent fails the
+    /// exit code if missing)
     Doctor,
 
     /// Emit a shell completion script

@@ -10,7 +10,7 @@ use crate::config::{self, Config};
 use crate::selfupdate;
 
 /// Runs every configured sanity check and returns one `(label, outcome)`
-/// pair per check, in a stable, deterministic order (§5m): the fixed checks
+/// pair per check, in a stable, deterministic order: the fixed checks
 /// first, then one row per configured `[agents.*]`, sorted by name —
 /// `HashMap` iteration order would otherwise make `cw doctor`'s output
 /// nondeterministic run to run. `Ok` carries an informational detail string
@@ -24,6 +24,12 @@ pub fn run_doctor(config: &Config) -> Vec<(String, Result<String>)> {
         (
             "gh auth".to_string(),
             check_gh_auth().map(|()| String::new()),
+        ),
+        (
+            // Fetches shell out to system git (SSH remotes, credential
+            // helpers), so a missing git breaks every new session.
+            "git on PATH".to_string(),
+            check_binary_on_path("git").map(|()| String::new()),
         ),
         (
             "git credential helper".to_string(),
@@ -101,10 +107,9 @@ fn receipt_path() -> Result<PathBuf> {
     Ok(config::home_dir()?.join(".config/cw/cw-receipt.json"))
 }
 
-/// Which install method put this binary on disk — the fact that would have
-/// caught this plan's own motivating incident (a `cw` three feature-commits
-/// behind main with no visible symptom) at its actual root cause: whether
-/// there's an install receipt at all to self-update from.
+/// Which install method put this binary on disk — whether there's an
+/// install receipt to self-update from at all. Without one a binary can sit
+/// releases behind with no visible symptom.
 fn check_install_source() -> Result<String> {
     let path = receipt_path()?;
     let Ok(bytes) = std::fs::read(&path) else {
@@ -169,7 +174,7 @@ fn check_gh_auth() -> Result<()> {
 /// Confirms the git credential helper can resolve credentials for
 /// `https://github.com` — asserts success only. The returned `Cred` is a
 /// live credential (possibly an access token); it is immediately dropped,
-/// NEVER logged, printed, or otherwise rendered (F37).
+/// NEVER logged, printed, or otherwise rendered.
 fn check_credential_helper() -> Result<()> {
     let cfg = git2::Config::open_default().context("opening git config")?;
     // `_cred` deliberately unused beyond confirming `Ok` — do not add a

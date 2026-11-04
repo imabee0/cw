@@ -31,7 +31,7 @@ use config::Config;
 use dashboard::Entry;
 
 fn main() -> ExitCode {
-    // Bound in main's own scope for the whole process lifetime (§5m) — a
+    // Bound in main's own scope for the whole process lifetime — a
     // guard dropped early (e.g. inside a helper that returns only `()`)
     // silently loses any log lines still buffered in the non-blocking
     // writer at exit. Never shadow or drop this before `run` returns.
@@ -49,7 +49,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // `tracing::error!` goes through the same tee'd writer as every
-            // other log call (stderr + the day's log file, §5m) — one call
+            // other log call (stderr + the day's log file) — one call
             // prints the chain AND persists it, rather than risking the
             // console seeing it twice via a separate eprintln! of the same
             // text.
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Sets up `tracing` + `tracing-appender` per §5m: a `Rotation::DAILY`
+/// Sets up `tracing` + `tracing-appender`: a `Rotation::DAILY`
 /// rolling file under `~/.cache/cw/`, tee'd with stderr so warnings surface
 /// live AND persist. Returns the `WorkerGuard` — the caller (`main`) must
 /// keep it alive for the whole process, never drop it early.
@@ -71,8 +71,8 @@ fn init_logging() -> Result<WorkerGuard> {
     // 0600-on-one-file doesn't survive rotation (`RollingFileAppender`
     // creates each day's file itself) — 0700 on the directory is what
     // actually holds across every rotation, and it can end up adjacent to
-    // credential-helper diagnostic output (F37's discipline only helps if
-    // the file itself isn't world-readable).
+    // credential-helper diagnostic output (`doctor.rs` never logs a
+    // credential, but that only helps if the file isn't world-readable).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -148,11 +148,26 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let config = config::load()?;
+    let mut config = config::load()?;
+    if cli.yolo {
+        config::enable_agent_permission_bypass(&mut config);
+    }
     let root = resolve_root(cli.root.as_deref(), &config)?;
 
     match &cli.cmd {
         Some(Cmd::Doctor) => run_doctor_cmd(&config),
+        Some(Cmd::Finish { repo, slug }) => {
+            let choice = parse_owner_repo(repo)?;
+            worktree::validate_worktree_slug(slug)?;
+            let label = choice.full_name();
+            let entry = worktree::scan_worktrees(&root)?
+                .into_iter()
+                .find(|e| e.repo == label && e.slug == worktree::flatten_slug(slug))
+                .context("session not found; use cw resume to inspect retained sessions")?;
+            clean::remove_one(&entry, false)?;
+            println!("finished {label}/{slug}");
+            Ok(())
+        }
         Some(Cmd::Resume) => run_resume(&cli, &config, &root),
         Some(Cmd::Clean { force }) => clean::run_clean(&cli, &config, &root, *force),
         Some(Cmd::Scratch { slug, dry_run }) => {
@@ -165,7 +180,7 @@ fn run(cli: Cli) -> Result<()> {
 
 /// `--root`/`config.root` with `~` expanded — pure, no filesystem mutation,
 /// so it's safe to call unconditionally, including on the `--dry-run` path
-/// (§7b #15's "no mutation" must hold literally). Root creation itself is
+/// (whose "no mutation" promise must hold literally). Root creation itself is
 /// handled by whichever call actually needs it to exist
 /// (`sync::clone_or_pull`'s clone path, `worktree::ensure_scratch_repo`) —
 /// `scan_worktrees` already tolerates a nonexistent root as "no worktrees".
@@ -212,7 +227,7 @@ fn worktree_precheck(repo_root: &Path, slug: &str) -> (PathBuf, bool) {
 /// Whether `--agent`/`default_agent` need the dashboard's interactive agent
 /// footer at all: only when `--agent` was NOT passed AND `default_agent`
 /// doesn't name a real entry in `config.agents` — never simply "more than
-/// one agent is configured" (§3 ships three by default, which would
+/// one agent is configured" (the default config ships five, which would
 /// otherwise make the dashboard mandatory on every single invocation).
 fn agent_picker_needed(explicit: Option<&str>, cfg: &Config) -> bool {
     if explicit.is_some() {
@@ -222,14 +237,11 @@ fn agent_picker_needed(explicit: Option<&str>, cfg: &Config) -> bool {
 }
 
 /// Whether the given invocation needs the dashboard at all, computed BEFORE
-/// any clone/pull happens. `needs_dashboard` is designed to be `false` in
-/// exactly the cases today's non-dashboard code already resolves without
-/// opening any TUI: `cw doctor`/`cw completions` (handled before this is
-/// ever called), `--dry-run`, and — for the default flow and `cw scratch`,
-/// which both share the same "no worktree choice with an explicit SLUG"
-/// shortcut — a fully resolvable repo/slug/agent triple. `cw resume`/
-/// `cw clean` always open the dashboard: neither ever had a non-interactive
-/// path before this rewrite either.
+/// any clone/fetch happens. `false` exactly when nothing is left to choose:
+/// `--dry-run`, and — for the default flow and `cw scratch` — a fully
+/// resolvable repo/slug/agent triple. `cw doctor`/`cw finish`/`cw
+/// completions` are handled before this is ever called; `cw resume`/`cw
+/// clean` always open the dashboard.
 fn needs_dashboard(cli: &Cli, config: &Config, root: &Path) -> Result<bool> {
     match &cli.cmd {
         Some(Cmd::Resume) | Some(Cmd::Clean { .. }) => Ok(true),
@@ -243,7 +255,7 @@ fn needs_dashboard(cli: &Cli, config: &Config, root: &Path) -> Result<bool> {
             let repo_label = format!("{}/{}", worktree::SCRATCH_OWNER, worktree::SCRATCH_REPO);
             slug_choice_needs_dashboard(root, &repo_label, slug.as_deref())
         }
-        Some(Cmd::Doctor) | Some(Cmd::Completions { .. }) => Ok(false), // unreachable — handled earlier in `run`
+        Some(Cmd::Doctor) | Some(Cmd::Finish { .. }) | Some(Cmd::Completions { .. }) => Ok(false), // unreachable — handled earlier in `run`
         None => {
             if cli.dry_run {
                 return Ok(false);
@@ -260,12 +272,10 @@ fn needs_dashboard(cli: &Cli, config: &Config, root: &Path) -> Result<bool> {
     }
 }
 
-/// With an explicit SLUG there is no worktree *choice* to make (mirrors the
-/// pre-dashboard `determine_slug_and_agent`'s `if let Some(s) = explicit_slug`
-/// shortcut). Without one, the dashboard is needed only when `repo_label`
-/// already has at least one worktree to pick between or resume — a repo
-/// with none yet auto-generates a fresh timestamp slug with no picker
-/// either, exactly as it always has.
+/// With an explicit SLUG there is no worktree *choice* to make. Without one,
+/// the dashboard is needed only when `repo_label` already has at least one
+/// worktree to pick between or resume — a repo with none yet auto-generates
+/// a fresh timestamp slug with no picker.
 fn slug_choice_needs_dashboard(root: &Path, repo_label: &str, slug: Option<&str>) -> Result<bool> {
     if slug.is_some() {
         return Ok(false);
@@ -278,8 +288,8 @@ fn slug_choice_needs_dashboard(root: &Path, repo_label: &str, slug: Option<&str>
 
 fn interactive_confirm(resolved: &hooks::ResolvedHook) -> bool {
     // Never block on a piped/absent stdin: no controlling terminal means
-    // decline, not hang — the same non-interactive discipline §5j's picker
-    // prechecks apply, extended to this y/N prompt.
+    // decline, not hang — the same `tui::is_interactive` gate the dashboard
+    // uses, applied to this y/N prompt.
     if !tui::is_interactive() {
         return false;
     }
@@ -309,14 +319,14 @@ fn report_hook_outcome(label: &str, outcome: hooks::HookOutcome) {
                 println!("{label}: completed");
             }
             // A nonzero exit is already logged as a warning inside
-            // hooks::exec_hook (warn-and-continue, §5h) — nothing more to
+            // hooks::exec_hook (warn-and-continue) — nothing more to
             // report here.
         }
     }
 }
 
 /// Runs `post_clone_hook` if configured, gated by the confirm-once-per-repo
-/// consent store (§5h). Only ever called right after a fresh `gh repo
+/// consent store. Only ever called right after a fresh `gh repo
 /// clone` — never on a pull of an already-cloned repo, and never for
 /// `cw scratch` (there's no clone event to trigger it). Used only by the
 /// fully non-interactive fast paths — the dashboard's equivalent path is
@@ -326,8 +336,7 @@ fn run_post_clone_hook_step(
     config: &Config,
     auto_yes: bool,
     repo_label: &str,
-    repo_root: &Path,
-    worktree_path_hint: &Path,
+    worktree_path: &Path,
     slug: &str,
     agent_name: &str,
 ) -> Result<()> {
@@ -338,7 +347,7 @@ fn run_post_clone_hook_step(
     let mut consent = hooks::load_consent(&consent_path);
     let env = hooks::HookEnv {
         repo: repo_label,
-        worktree_path: worktree_path_hint,
+        worktree_path,
         slug,
         agent: agent_name,
     };
@@ -349,7 +358,7 @@ fn run_post_clone_hook_step(
     };
     let result = hooks::run_post_clone_hook(
         &mut session,
-        repo_root,
+        worktree_path,
         config.post_clone_hook.as_deref(),
         &env,
         interactive_confirm,
@@ -360,8 +369,8 @@ fn run_post_clone_hook_step(
 }
 
 /// Finishes creating a freshly-made worktree: symlinks configured shared
-/// dirs (§5c-note), copies `.worktreeinclude` matches (§5f), then runs
-/// `post_create_hook` if configured (§5h). Never called on a fast-resumed
+/// dirs, copies `.worktreeinclude` matches, then runs
+/// `post_create_hook` if configured. Never called on a fast-resumed
 /// worktree — callers only invoke this when `worktree_precheck` reported
 /// `existed == false`. Used only by the fully non-interactive fast paths —
 /// the dashboard's equivalent is `DashboardModel::do_create_worktree` +
@@ -405,7 +414,6 @@ fn finish_worktree_creation(
     };
     let result = hooks::run_post_create_hook(
         &mut session,
-        repo_root,
         worktree_path,
         config.post_create_hook.as_deref(),
         &env,
@@ -419,15 +427,10 @@ fn finish_worktree_creation(
 fn report_pull_outcome(repo_label: &str, outcome: sync::PullOutcome) {
     match outcome {
         sync::PullOutcome::Cloned => println!("cloned {repo_label}"),
-        sync::PullOutcome::UpToDate => {}
         sync::PullOutcome::FastForwarded => println!("pulled latest changes for {repo_label}"),
-        sync::PullOutcome::Diverged => println!(
-            "warning: {repo_label}'s local branch has diverged from origin — left untouched"
-        ),
-        sync::PullOutcome::DirtyLocalChanges => println!(
-            "warning: {repo_label} has uncommitted local changes — skipped pull to avoid discarding them"
-        ),
-        sync::PullOutcome::Skipped => {}
+        sync::PullOutcome::Fetched | sync::PullOutcome::UpToDate | sync::PullOutcome::Skipped => {}
+        // `clone_or_pull` turns both into an error before returning.
+        sync::PullOutcome::Diverged | sync::PullOutcome::DirtyLocalChanges => {}
     }
 }
 
@@ -496,29 +499,39 @@ fn run_default_fast_path(cli: &Cli, config: &Config, root: &Path) -> Result<()> 
         .clone()
         .unwrap_or_else(|| config.default_agent.clone());
 
+    worktree::validate_worktree_slug(&slug)?;
+    let agent_cfg = config::resolve_agent(Some(&agent_name), config)?;
+    // An existing session resumes as-is: no fetch, no hooks.
+    let local_root = sync::resolve_local_path(root, &repo_choice.owner, &repo_choice.name);
+    let (existing_path, exists) = worktree_precheck(&local_root, &slug);
+    if exists {
+        let repo = git2::Repository::open(&local_root)?;
+        let path = worktree::create_or_resume_worktree(&repo, &local_root, &slug, "HEAD")?;
+        debug_assert_eq!(path, existing_path);
+        return agent::launch_reporting(&agent_cfg, &path);
+    }
+
     let (git_repo, pull_outcome) =
         sync::clone_or_pull(root, &repo_choice.owner, &repo_choice.name, !cli.no_pull)?;
     report_pull_outcome(&repo_label, pull_outcome);
 
-    let repo_root = git_repo
-        .workdir()
-        .context("repo has no working directory")?
-        .to_path_buf();
-    let (precreate_path, was_existing) = worktree_precheck(&repo_root, &slug);
+    let repo_root = local_root;
+    let (_, was_existing) = worktree_precheck(&repo_root, &slug);
+
+    // A fresh clone is a bare store with no checkout of its own, so the
+    // clone hook runs in the first session worktree, once it exists.
+    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &repo_root, &slug, "HEAD")?;
 
     if matches!(pull_outcome, sync::PullOutcome::Cloned) {
         run_post_clone_hook_step(
             config,
             cli.yes,
             &repo_label,
-            &repo_root,
-            &precreate_path,
+            &worktree_path,
             &slug,
             &agent_name,
         )?;
     }
-
-    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &slug, "HEAD")?;
 
     if !was_existing {
         finish_worktree_creation(
@@ -533,11 +546,11 @@ fn run_default_fast_path(cli: &Cli, config: &Config, root: &Path) -> Result<()> 
     }
 
     let agent_cfg = config::resolve_agent(Some(&agent_name), config)?;
-    agent::launch(&agent_cfg, &worktree_path)
+    agent::launch_reporting(&agent_cfg, &worktree_path)
 }
 
-/// `--dry-run` (requires `--repo` AND an explicit SLUG, F17): prints the
-/// clone-vs-pull decision, resolved worktree path, which hook(s) would run,
+/// `--dry-run` (requires `--repo` AND an explicit SLUG): prints the
+/// clone-vs-fetch decision, resolved worktree path, which hook(s) would run,
 /// and which agent would launch — performs no mutation whatsoever. The
 /// dashboard is never opened on this path.
 fn run_dry_run(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
@@ -555,12 +568,17 @@ fn run_dry_run(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
 
     let local_path = sync::resolve_local_path(root, &repo_choice.owner, &repo_choice.name);
     let already_cloned = local_path.join(".git").exists();
+    let managed_store =
+        already_cloned && git2::Repository::open(&local_path).is_ok_and(|r| r.is_bare());
     let pull_decision = if !already_cloned {
-        "clone (not yet present locally)".to_string()
+        "clone a bare store (not yet present locally), branch from the remote default branch"
+            .to_string()
     } else if cli.no_pull {
-        "skip pull (--no-pull)".to_string()
+        "skip fetch (--no-pull)".to_string()
+    } else if managed_store {
+        "fetch, branch from the latest remote default branch".to_string()
     } else {
-        "pull/fast-forward".to_string()
+        "pull/fast-forward (full checkout, not a cw-managed store)".to_string()
     };
 
     let (worktree_path, worktree_exists) = worktree_precheck(&local_path, slug);
@@ -572,7 +590,7 @@ fn run_dry_run(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
     let agent_cfg = config::resolve_agent(Some(&agent_name), config)?;
 
     println!("would resolve repo: {repo_label}");
-    println!("clone/pull: {pull_decision}");
+    println!("clone/fetch: {pull_decision}");
     println!("worktree path: {}", worktree_path.display());
     println!("worktree exists already: {worktree_exists}");
     if worktree_exists {
@@ -594,7 +612,11 @@ fn run_dry_run(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
 
 fn print_create_hook_preview(hook: &Option<String>, repo_root: &Path) {
     match hook.as_deref() {
-        Some("auto") => match hooks::detect_auto_hook(repo_root) {
+        Some("auto") => match git2::Repository::open(repo_root)
+            .ok()
+            .and_then(|repo| hooks::detect_auto_hook_in_repo(&repo))
+            .or_else(|| hooks::detect_auto_hook(repo_root))
+        {
             Some((prog, args)) => {
                 println!(
                     "would run post_create_hook (auto): {prog} {}",
@@ -656,7 +678,7 @@ fn run_scratch_fast_path(
         .unwrap_or_else(|| config.default_agent.clone());
 
     let (_, was_existing) = worktree_precheck(&repo_root, &slug);
-    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &slug, "HEAD")?;
+    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &repo_root, &slug, "HEAD")?;
 
     if !was_existing {
         finish_worktree_creation(
@@ -671,10 +693,10 @@ fn run_scratch_fast_path(
     }
 
     let agent_cfg = config::resolve_agent(Some(&agent_name), config)?;
-    agent::launch(&agent_cfg, &worktree_path)
+    agent::launch_reporting(&agent_cfg, &worktree_path)
 }
 
-/// Same rationale as the top-level `--dry-run` (F17): a real invocation of
+/// Same rationale as the top-level `--dry-run`: a real invocation of
 /// this path is interactive (the dashboard opens for a worktree choice), so
 /// a dry-run preview requires an explicit SLUG to bypass it rather than
 /// blocking a TTY-less invocation.
@@ -838,6 +860,7 @@ mod tests {
             dry_run: false,
             repo: None,
             yes: false,
+            yolo: false,
             cmd: Some(Cmd::Resume),
         };
         assert!(needs_dashboard(&cli_resume, &cfg, dir.path()).unwrap());
@@ -863,6 +886,7 @@ mod tests {
             dry_run: false,
             repo: Some("acme/proj".to_string()),
             yes: false,
+            yolo: false,
             cmd: None,
         };
         assert!(
@@ -889,6 +913,7 @@ mod tests {
             dry_run: false,
             repo: Some("acme/proj".to_string()),
             yes: false,
+            yolo: false,
             cmd: None,
         };
         assert!(needs_dashboard(&cli, &cfg, dir.path()).unwrap());
