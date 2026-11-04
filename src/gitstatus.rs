@@ -132,7 +132,8 @@ mod tests {
         let repo = git2::Repository::init(&root).unwrap();
         commit_file(&repo, &root, "README.md", "init");
 
-        let wt_path = crate::worktree::create_or_resume_worktree(&repo, "feat", "HEAD").unwrap();
+        let wt_path =
+            crate::worktree::create_or_resume_worktree(&repo, &root, "feat", "HEAD").unwrap();
         let clean = work_state(&wt_path, &root).unwrap();
         assert_eq!(clean, WorkState::default());
         assert!(!clean.has_unsaved_work());

@@ -1418,7 +1418,12 @@ impl DashboardModel {
             worktree::worktree_path_and_exists(&pending.repo_root, &pending.ctx.slug);
         let repo = git2::Repository::open(&pending.repo_root)
             .with_context(|| format!("opening {}", pending.repo_root.display()))?;
-        let path = worktree::create_or_resume_worktree(&repo, &pending.ctx.slug, "HEAD")?;
+        let path = worktree::create_or_resume_worktree(
+            &repo,
+            &pending.repo_root,
+            &pending.ctx.slug,
+            "HEAD",
+        )?;
         pending.worktree_path = Some(path.clone());
         pending.freshly_created = !was_existing;
 

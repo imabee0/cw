@@ -121,8 +121,9 @@ mod tests {
             .unwrap();
         repo.reference("refs/remotes/origin/main", oid, true, "fetched")
             .unwrap();
-        let first = worktree::create_or_resume_worktree(&repo, "first", "HEAD").unwrap();
-        worktree::create_or_resume_worktree(&repo, "second", "HEAD").unwrap();
+        let first =
+            worktree::create_or_resume_worktree(&repo, &container, "first", "HEAD").unwrap();
+        worktree::create_or_resume_worktree(&repo, &container, "second", "HEAD").unwrap();
         std::fs::write(first.join("unsaved"), "work").unwrap();
         let entries = worktree::scan_worktrees(tmp.path()).unwrap();
         let a = entries.iter().find(|e| e.slug == "first").unwrap();
@@ -152,7 +153,7 @@ mod tests {
             .unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
             .unwrap();
-        worktree::create_or_resume_worktree(&repo, "s", "HEAD").unwrap();
+        worktree::create_or_resume_worktree(&repo, &container, "s", "HEAD").unwrap();
         let entry = worktree::scan_worktrees(tmp.path())
             .unwrap()
             .into_iter()
@@ -191,7 +192,7 @@ mod tests {
             .unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
             .unwrap();
-        let path = worktree::create_or_resume_worktree(&repo, "s", "HEAD").unwrap();
+        let path = worktree::create_or_resume_worktree(&repo, &container, "s", "HEAD").unwrap();
         std::fs::write(path.join("wip"), "x").unwrap();
         let entry = worktree::scan_worktrees(tmp.path())
             .unwrap()

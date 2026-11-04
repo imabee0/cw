@@ -516,7 +516,7 @@ fn run_default_fast_path(cli: &Cli, config: &Config, root: &Path) -> Result<()> 
     let (existing_path, exists) = worktree_precheck(&local_root, &slug);
     if exists {
         let repo = git2::Repository::open(&local_root)?;
-        let path = worktree::create_or_resume_worktree(&repo, &slug, "HEAD")?;
+        let path = worktree::create_or_resume_worktree(&repo, &local_root, &slug, "HEAD")?;
         debug_assert_eq!(path, existing_path);
         return agent::launch_reporting(&agent_cfg, &path);
     }
@@ -525,12 +525,12 @@ fn run_default_fast_path(cli: &Cli, config: &Config, root: &Path) -> Result<()> 
         sync::clone_or_pull(root, &repo_choice.owner, &repo_choice.name, !cli.no_pull)?;
     report_pull_outcome(&repo_label, pull_outcome);
 
-    let repo_root = worktree::repository_root(&git_repo)?.to_path_buf();
+    let repo_root = local_root;
     let (_, was_existing) = worktree_precheck(&repo_root, &slug);
 
     // A fresh clone is a bare store with no checkout of its own, so the
     // clone hook runs in the first session worktree, once it exists.
-    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &slug, "HEAD")?;
+    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &repo_root, &slug, "HEAD")?;
 
     if matches!(pull_outcome, sync::PullOutcome::Cloned) {
         run_post_clone_hook_step(
@@ -688,7 +688,7 @@ fn run_scratch_fast_path(
         .unwrap_or_else(|| config.default_agent.clone());
 
     let (_, was_existing) = worktree_precheck(&repo_root, &slug);
-    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &slug, "HEAD")?;
+    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &repo_root, &slug, "HEAD")?;
 
     if !was_existing {
         finish_worktree_creation(

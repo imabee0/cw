@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(rev(&repo, "HEAD"), rev(&origin_repo, "trunk"));
 
         // A session worktree is a normal clone as far as git is concerned.
-        let wt = crate::worktree::create_or_resume_worktree(&repo, "s", "HEAD").unwrap();
+        let wt = crate::worktree::create_or_resume_worktree(&repo, &store, "s", "HEAD").unwrap();
         git(&wt, &["fetch", "-q"]);
         git(&wt, &["rev-parse", "--verify", "origin/feature"]);
 
@@ -446,7 +446,7 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, PullOutcome::UpToDate);
         assert_eq!(rev(&repo, "HEAD"), rev(&origin_repo, "trunk"));
-        let wt2 = crate::worktree::create_or_resume_worktree(&repo, "t", "HEAD").unwrap();
+        let wt2 = crate::worktree::create_or_resume_worktree(&repo, &store, "t", "HEAD").unwrap();
         let wt2_repo = git2::Repository::open(wt2).unwrap();
         assert_eq!(rev(&wt2_repo, "HEAD"), rev(&origin_repo, "trunk"));
         // The earlier session's branch is untouched by the fetch.

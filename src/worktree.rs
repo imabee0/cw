@@ -86,13 +86,6 @@ pub fn unflatten_slug(flat: &str) -> String {
     flat.replace('+', "/")
 }
 
-/// Storage container for either a legacy checkout or a managed bare repo.
-pub fn repository_root(repo: &git2::Repository) -> Result<&Path> {
-    repo.workdir()
-        .or_else(|| repo.path().parent())
-        .context("repository has no storage container")
-}
-
 /// The on-disk path a worktree for `slug` would live at under `repo_root`,
 /// plus whether it already exists there (the fast-resume predicate). Shared
 /// by `create_or_resume_worktree` below and by callers (main.rs's
@@ -112,13 +105,17 @@ pub fn worktree_path_and_exists(repo_root: &Path, slug: &str) -> (PathBuf, bool)
 /// silently discard in-progress work in an existing worktree on repeat runs.
 /// This wrapper is what makes re-running `cw <same-slug>` a genuine no-op
 /// fast-resume instead.
+/// `repo_root` is the path the caller resolved from its configured `root`,
+/// never one derived from `repo`: git2 reports a repo's location with
+/// symlinks resolved (macOS `/var` → `/private/var`, a symlinked `$HOME`),
+/// which would differ textually from the paths cw scans and displays.
 pub fn create_or_resume_worktree(
     repo: &git2::Repository,
+    repo_root: &Path,
     slug: &str,
     base_ref: &str,
 ) -> Result<PathBuf> {
     validate_worktree_slug(slug)?;
-    let repo_root = repository_root(repo)?;
     let (path, existed) = worktree_path_and_exists(repo_root, slug);
     if existed {
         let existing = git2::Repository::open(&path).context("opening existing worktree")?;
@@ -129,13 +126,18 @@ pub fn create_or_resume_worktree(
         }
         return Ok(path); // fast-resume: skip creation AND both hooks entirely
     }
-    create_worktree(repo, slug, base_ref)
+    create_worktree(repo, &path, slug, base_ref)
 }
 
-fn create_worktree(repo: &git2::Repository, slug: &str, base_ref: &str) -> Result<PathBuf> {
+fn create_worktree(
+    repo: &git2::Repository,
+    path: &Path,
+    slug: &str,
+    base_ref: &str,
+) -> Result<PathBuf> {
     let flat = flatten_slug(slug);
     let branch_name = format!("worktree-{flat}");
-    let path = repository_root(repo)?.join(".claude/worktrees").join(&flat);
+    let path = path.to_path_buf();
 
     // Zero-commit repos (a genuinely fresh `git init`, before §5n's
     // scratch-repo fix or a real empty GitHub repo) have no HEAD to peel —
@@ -473,7 +475,7 @@ mod tests {
             .unwrap();
         repo.branch("worktree-saved", &repo.find_commit(oid).unwrap(), false)
             .unwrap();
-        let path = create_or_resume_worktree(&repo, "saved", "HEAD").unwrap();
+        let path = create_or_resume_worktree(&repo, tmp.path(), "saved", "HEAD").unwrap();
         assert_eq!(
             git2::Repository::open(path)
                 .unwrap()
@@ -482,6 +484,37 @@ mod tests {
                 .target(),
             Some(oid)
         );
+    }
+
+    /// git2 reports a repo's location with symlinks resolved; the worktree
+    /// path must still be built from the root the caller configured, or it
+    /// drifts from what `scan_worktrees` and the dashboard show (macOS's
+    /// `/var` → `/private/var` tempdirs, a symlinked `$HOME`).
+    #[cfg(unix)]
+    #[test]
+    fn worktree_path_keeps_the_callers_root_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        fs::create_dir_all(real.join("acme/proj")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let container = link.join("acme/proj");
+        let repo = git2::Repository::init_bare(container.join(".git")).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+        let repo = git2::Repository::open(&container).unwrap();
+
+        let created = create_or_resume_worktree(&repo, &container, "s", "HEAD").unwrap();
+        assert_eq!(created, container.join(".claude/worktrees/s"));
+        let scanned = scan_worktrees(&link).unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].path, created);
+        let resumed = create_or_resume_worktree(&repo, &container, "s", "HEAD").unwrap();
+        assert_eq!(resumed, created);
     }
 
     #[test]
@@ -525,7 +558,7 @@ mod tests {
         let repo = init_repo_with_commit(&repo_dir);
 
         let raw_slug = "myfeat/x";
-        let created = create_or_resume_worktree(&repo, raw_slug, "HEAD").unwrap();
+        let created = create_or_resume_worktree(&repo, &repo_dir, raw_slug, "HEAD").unwrap();
 
         let scanned = scan_worktrees(root).unwrap();
         let entry = scanned
@@ -543,7 +576,7 @@ mod tests {
         // The actual regression: feeding the unflattened slug back through
         // `create_or_resume_worktree` must fast-resume the same path, not
         // error on a rejected '+' segment.
-        let resumed = create_or_resume_worktree(&repo, &resumed_slug, "HEAD").unwrap();
+        let resumed = create_or_resume_worktree(&repo, &repo_dir, &resumed_slug, "HEAD").unwrap();
         assert_eq!(resumed, created);
     }
 
@@ -616,7 +649,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = init_repo_with_commit(dir.path());
 
-        create_worktree(&repo, "foo", "HEAD").unwrap();
+        create_worktree(
+            &repo,
+            &dir.path().join(".claude/worktrees/foo"),
+            "foo",
+            "HEAD",
+        )
+        .unwrap();
 
         assert!(
             repo.find_branch("worktree-foo", git2::BranchType::Local)
@@ -634,8 +673,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = init_repo_with_commit(dir.path());
 
-        create_worktree(&repo, "foo", "HEAD").unwrap();
-        create_worktree(&repo, "bar", "HEAD").unwrap();
+        create_worktree(
+            &repo,
+            &dir.path().join(".claude/worktrees/foo"),
+            "foo",
+            "HEAD",
+        )
+        .unwrap();
+        create_worktree(
+            &repo,
+            &dir.path().join(".claude/worktrees/bar"),
+            "bar",
+            "HEAD",
+        )
+        .unwrap();
 
         let exclude_path = repo.path().join("info/exclude");
         let content = fs::read_to_string(&exclude_path).unwrap();
