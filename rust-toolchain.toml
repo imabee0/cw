@@ -1,3 +1,6 @@
 [toolchain]
 channel = "1.98"
 components = ["rustfmt", "clippy"]
+# Every shipped target (see the TARGETS config in .github/workflows/ci.yml and
+# scripts/check).
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
