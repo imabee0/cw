@@ -691,7 +691,15 @@ jobs:
               done || true)
               [ -z "$lines" ] || printf '### %s\n\n%s\n\n' "$title" "$lines" >> "$notes"
             done
-            [ -s "$notes" ] || echo "Initial release." >> "$notes"
+            if [ ! -s "$notes" ]; then
+              # Reached only by a component's first tag or a re-run: version
+              # never releases a range without a feat/fix/perf/breaking commit.
+              if [ -n "$prev" ]; then
+                printf 'No feature, fix or performance commits since %s.\n\n' "$prev" >> "$notes"
+              else
+                printf 'Initial release.\n\n' >> "$notes"
+              fi
+            fi
             # shellcheck disable=SC2016 # the backticks are Markdown, not a command substitution
             printf '**Install:** `curl -fsSL https://raw.githubusercontent.com/%s/main/install/%s.sh | bash`\n' \
               "$GITHUB_REPOSITORY" "$name" >> "$notes"
