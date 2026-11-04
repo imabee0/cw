@@ -7,7 +7,9 @@ Rust CLI: fuzzy-pick a GitHub repo (personal + every org, most-recent-first), cl
 ```bash
 cargo build                          # debug build
 cargo install --path . --locked      # install the real binary onto PATH — use this, not `cargo run --`, for anything that must reflect a real install (doctor, completions, --dry-run)
-scripts/check.sh                     # fmt --check, clippy -D warnings, cargo test, cargo deny check — run before every push
+scripts/check                        # fast (default): fmt, hakari, clippy, nextest for affected crates — run while iterating
+scripts/check gate                   # before every push: + deny, commit lint, doctests, MSRV, cross-target checks this host can do
+scripts/check build                  # release binaries + SHA256SUMS into dist/cw/<triple>/ (runs no tests)
 cw --help
 cw doctor                            # exits nonzero on any failed check; needs a real controlling tty (`script -q /dev/null cw doctor` if testing from a non-tty harness — plain `cw doctor` there fails the terminal check, not a bug)
 cw completions zsh                   # source only after `autoload -U compinit && compinit` has run, same as any zsh completion script
@@ -15,11 +17,11 @@ cw finish OWNER/NAME SLUG             # remove one clean, pushed session; delete
 cw --repo OWNER/NAME --root PATH --dry-run SLUG   # only non-interactive way to preview clone/fetch + worktree + agent decision with zero mutation
 ```
 
-`cargo test` alone does not need `cargo deny`; `scripts/check.sh` is the full local gate CI mirrors.
+`scripts/check` uses its own `target/check` dir (MSRV: `target/check-msrv`), logs to `target/check-logs/<mode>-<stage>.log`, and exits 0 pass / 1 check failed / 2 setup error. On Linux, `gate` cannot check `aarch64-apple-darwin` (libgit2's Secure Transport needs the macOS SDK) and says so; the merge queue checks and tests it on a macOS runner. `cargo test` alone needs none of the extra tools.
 
 ## File map
 
-Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
+Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`. The Cargo workspace is `cw` plus `workspace-hack/` (cargo-hakari's generated crate, config `.config/hakari.toml` — never hand-edit its `Cargo.toml`; after any dependency change run `cargo hakari generate && cargo hakari manage-deps`). `build.rs` turns CI's `CI_VERSION_CW` into `CW_VERSION` (the `--version` string; `CARGO_PKG_VERSION` when unset) and sets `CW_RELEASE_BUILD`/`CW_TARGET`. `install/cw.sh` is the curl-pipe installer.
 
 | File | Responsibility |
 |---|---|
@@ -44,7 +46,7 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 | `agent.rs` | launches the resolved agent CLI in the worktree, git-locking the worktree (`LOCK_REASON_PREFIX` + cw's pid) for the session's lifetime; can't-start is an `Err`, a nonzero exit only a note |
 | `clean.rs` | `cw clean`: thin `dashboard::run(Entry::Clean)` entry point; `remove_one` (re-checks lock + work state, git2 prune + branch delete, deletes a `cw.managed` bare store with no worktrees left), shared by `cw finish` and the dashboard's in-TUI delete flow |
 | `doctor.rs` | `cw doctor`: gh auth, git on PATH, credential helper, terminal, install source, update status, each configured agent on PATH (only `default_agent` fails the exit code if missing) |
-| `selfupdate.rs` | background self-update check (`spawn_check`) + apply (`apply_update`, the dashboard's `u` key), also backing `cw doctor`'s stale-binary diagnostic; every failure (no install receipt, offline, rate-limited) degrades silently, never an error |
+| `selfupdate.rs` | background self-update check (`spawn_check`, newest `cw-vX.Y.Z` release via `gh api`) + apply (`apply_update`, the dashboard's `u` key: `gh release download` → SHA256 verify → atomic replace of the running binary), also backing `cw doctor`'s stale-binary diagnostic; every check failure (from-source build, offline, rate-limited) degrades silently, never an error |
 
 ## Conventions
 
@@ -69,12 +71,13 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 - **`tracing_appender`'s `WorkerGuard` must stay a named local bound in `main()`** — dropping it early silently loses buffered log lines.
 - Config/cache paths are fixed at `~/.config/cw/config.toml` and `~/.cache/cw/{repos.json,cw.log.*}` (the session `root` default is the one XDG-aware exception) on both macOS and Linux — not `directories::ProjectDirs`, deliberately, to avoid diverging per platform.
 - `cw` shells out to `gh` for GitHub API access and the first clone (`gh auth status` must be green), and to system `git` for every later fetch (`GIT_TERMINAL_PROMPT=0`, so it never blocks on a prompt). `cw doctor` checks both.
-- **One event-driven GitHub Actions workflow:** `.github/workflows/ci.yml`. `pull_request` validates (cheap jobs in parallel, `build-test` needs lint). `push` to `main` lints (seeds rust-cache) and runs release-plz. `push` of `v*.*.*` runs `dist-build` → `publish` → `verify`. No `schedule`. `RELEASE_PLZ_TOKEN` (not `GITHUB_TOKEN`) must tag, or the tag push never retriggers this workflow. `release-plz.toml` `git_release_enable = false` — the `publish` job creates the GitHub Release. Dist targets: `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`. Rustc 1.98. Never add a second file under `.github/workflows/`.
-- **Self-update degrades completely silently when no install receipt is present** — a `cargo install --path .` (from-source) build has no `~/.config/cw/cw-receipt.json`, so `selfupdate`'s check and apply fail quietly to a `tracing::debug!` line and the dashboard's `u` key never activates; by design, not a bug, but a from-source install never learns about updates.
+- **One event-driven GitHub Actions workflow:** `.github/workflows/ci.yml`, triggered only by `pull_request`, push to `main`, and `merge_group` — no schedule, no manual trigger, no Dependabot/Renovate or any other bot. Its `CI_CONFIG` env block (COMPONENTS, TARGETS) is the one place to add a component or target. `changes` decides what runs (docs-only diffs skip everything but `ci-ok`); `gates` (fmt, clippy, commit + PR-title lint, deny + hakari when deps change) runs before everything expensive; PRs test Tier 1 (Linux); the merge queue adds the macOS check + tests, doctests and MSRV; `main` warms caches, then `version` → `build` → `release`. **`ci-ok` is the only required status check** (ruleset on `main`, merge queue on). Never add a second file under `.github/workflows/`.
+- **Releases are git tags `cw-vX.Y.Z` and nothing else.** The `version` job bumps from conventional commits touching cw's paths since the last `cw-v*` tag (`feat` minor, `fix`/`perf` patch, `!`/`BREAKING CHANGE` major; anything else releases nothing) and passes it to `build.rs` as `CI_VERSION_CW` — CI never commits a version bump, so `Cargo.toml`'s `version` is only the seed for the first tag and goes stale by design; the tag is the truth. Squash merges take the PR title as the commit subject, which is why the PR title is linted. Release assets `cw-<triple>.tar.gz` (binary at its root) + `cw-<triple>.tar.gz.sha256` (`<hex>  <name>`) are a contract shared by the `build` job, `install/cw.sh` and `selfupdate.rs` — change all three together. The `release` job tags with `GITHUB_TOKEN`, which never retriggers workflows. Legacy `v0.1.x`/`v0.2.0` tags are history; don't touch them. `cw` is `publish = false` (the crates.io name belongs to another crate).
+- **Self-update is for release builds only** — `CW_RELEASE_BUILD` is empty for a `cargo install --path .` build, so `selfupdate`'s check skips quietly to a `tracing::debug!` line and the dashboard's `u` key never activates; by design, not a bug. Pre-`cw-v` installs (axoupdater, `~/.cargo/bin`) can't update to `cw-v*` releases; they reinstall once with `install/cw.sh`.
 - **A click on a registered hotspot (agent segment, help-line key, mark column, modal button) performs that action; a click on a table row only focuses it; a second click on the same row within 400ms opens it, same as Enter.** Keys and clicks converge on `tui::update::perform` so neither can drift from the other.
 - **Any single-char key binding that doubles as filter text must be gated on the *focused pane's* `query.is_empty()`**, same as `q`-quit. `Space` marks/unmarks the focused worktree row when that query is empty and types a space into the filter otherwise; `d` opens the removal confirm for the checked set, or the focused row alone when nothing is checked. Confirm with `y`; worktrees with changed files or unpushed commits are kept unless `f` includes them (`cw clean --force` starts with them included). `n` (new session), `r` (rescan) and `u` (apply a pending self-update) are gated the same way. `/` enters an explicit search mode (`DashboardModel::editing_filter`) in which every letter, shortcuts and `j`/`k` included, types into the filter; Enter/Tab leave it keeping the filter, Esc leaves it clearing the filter. Each pane owns its own query; gating always checks whichever pane `DashboardModel::focus` currently points at. `j`/`k` are always navigation; `←`/`→` always cycle the agent.
 
 ## Standards exceptions
 
 - **This repo's own source is hosted on GitHub** (`imabee0/cw`, public, ruleset + auto-merge on `main`) instead of the house Gitea-only default (global CLAUDE.md § Structure and forge). Explicit, repeated user direction for this one project. Do not migrate this to Gitea without the same explicit direction.
-- **`.github/workflows/ci.yml` is the only Actions workflow.** cargo-dist does not generate CI (`dist-workspace.toml` has no `ci = "github"`). Third-party actions in it are SHA-pinned.
+- **`.github/workflows/ci.yml` is the only Actions workflow,** hand-written (no cargo-dist, no release-plz). Third-party actions in it are SHA-pinned with a version comment; tools come from `taiki-e/install-action`, never `cargo install`; no `RUSTFLAGS` or linker settings in the workflow (they belong in `.cargo/config.toml`).

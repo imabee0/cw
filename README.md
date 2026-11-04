@@ -4,11 +4,13 @@
 
 ## Install
 
-**macOS or Linux, one line** (installs the latest release to `~/.cargo/bin`, verifying a checksum first):
+**macOS (Apple silicon) or Linux (x86_64), one line** — installs the newest release to `~/.local/bin`, verifying its SHA256 first; re-run it to upgrade:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/imabee0/cw/releases/latest/download/cw-installer.sh | sh
+curl -fsSL https://raw.githubusercontent.com/imabee0/cw/main/install/cw.sh | bash
 ```
+
+Releases are tagged `cw-vX.Y.Z`. A 0.1.x or 0.2.0 install (the old `cw-installer.sh` into `~/.cargo/bin`) can't self-update to them: run the line above once, then remove the old `~/.cargo/bin/cw`.
 
 **From source** (an unreleased change, or a platform without a prebuilt binary):
 
@@ -117,7 +119,17 @@ args = []
 
 ## Self-update
 
-`cw` checks for a newer release in the background (at most once a day) and, once it finds one, shows an "update available" notice in the dashboard footer — press `u` to download and apply it in place. Only works for a binary installed via the one-line install script above; a `cargo install --path .` build has no install receipt to update against, so the check silently finds nothing to do.
+`cw` checks for a newer release in the background (at most once a day) and, once it finds one, shows an "update available" notice in the dashboard footer — press `u` to download it with `gh`, verify its SHA256, and replace the running binary in place. Only release builds (the install script above) update themselves; a from-source build silently skips the check — reinstall it from source, or switch to the install script. `cw doctor` reports which kind you have.
+
+## Development
+
+```bash
+scripts/check          # fast: fmt, hakari, clippy and tests for the crates your change affects
+scripts/check gate     # everything CI's merge queue checks that this host can: deny, commit lint, doctests, MSRV, cross-target checks
+scripts/check build    # release binaries + SHA256SUMS in dist/cw/<target>/ (does not run tests)
+```
+
+`.github/workflows/ci.yml` is the whole pipeline: pull requests and the merge queue validate, and every push to `main` with a `feat`/`fix`/`perf` (or breaking) commit is released — the version is bumped from conventional commits since the last `cw-vX.Y.Z` tag, built for both targets, tagged, and published as a GitHub Release. Nothing commits back to `main`.
 
 ## License
 
