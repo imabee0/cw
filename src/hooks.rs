@@ -7,8 +7,8 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use tracing::warn;
 
-/// Fixed precedence for `post_create_hook = "auto"` (§3): the first
-/// matching lockfile under `repo_root` wins, deterministically — never
+/// Fixed precedence for `post_create_hook = "auto"`: the first matching
+/// lockfile in the new worktree wins, deterministically — never
 /// "whichever `read_dir` happens to return first".
 const LOCKFILE_PRECEDENCE: &[(&str, &str, &[&str])] = &[
     ("Cargo.lock", "cargo", &["build"]),
@@ -16,14 +16,14 @@ const LOCKFILE_PRECEDENCE: &[(&str, &str, &[&str])] = &[
     ("pnpm-lock.yaml", "pnpm", &["install"]),
 ];
 
-/// Resolves `post_create_hook = "auto"` against `repo_root`'s lockfiles, per
-/// §3's fixed precedence. `None` if no known lockfile is present — auto mode
+/// Resolves `post_create_hook = "auto"` against the lockfiles in `dir` (the
+/// new worktree), per the fixed precedence above. `None` if no known lockfile is present — auto mode
 /// is then a no-op, not an error, since plenty of repos have no lockfile at
 /// all.
-pub fn detect_auto_hook(repo_root: &Path) -> Option<(&'static str, &'static [&'static str])> {
+pub fn detect_auto_hook(dir: &Path) -> Option<(&'static str, &'static [&'static str])> {
     LOCKFILE_PRECEDENCE
         .iter()
-        .find(|(lockfile, _, _)| repo_root.join(lockfile).exists())
+        .find(|(lockfile, _, _)| dir.join(lockfile).exists())
         .map(|(_, program, args)| (*program, *args))
 }
 
@@ -45,7 +45,7 @@ pub fn detect_auto_hook_in_repo(
 }
 
 /// One resolved hook invocation — the program, its argv, and the directory
-/// it runs in — everything the confirm-once-per-repo prompt (§5h) needs to
+/// it runs in — everything the confirm-once-per-repo prompt needs to
 /// print before the very first execution against a given repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedHook {
@@ -54,13 +54,13 @@ pub struct ResolvedHook {
     pub cwd: PathBuf,
 }
 
-/// Resolves `post_clone_hook` (§3: `None` = unset, cw's shipped default;
+/// Resolves `post_clone_hook` (`None` = unset, cw's shipped default;
 /// `Some(path)` = that repo-relative script). Runs once, only right after a
 /// FRESH `gh repo clone`. Clones are bare stores with no checkout of their
 /// own, so `checkout` is the first session worktree created from that clone:
 /// the script is resolved against it and runs with it as cwd. The path is
 /// repo-relative, so the CLONED REPO supplies the script body cw is about
-/// to execute, not the user (§0's "repo-supplied hook execution" decision).
+/// to execute, not the user — hence the consent gate.
 pub fn resolve_post_clone_hook(checkout: &Path, hook: Option<&Path>) -> Option<ResolvedHook> {
     let rel = hook?;
     Some(ResolvedHook {
@@ -95,7 +95,7 @@ pub fn resolve_post_create_hook(worktree_path: &Path, hook: Option<&str>) -> Opt
     })
 }
 
-/// Per-repo hook consent (§5h), persisted at
+/// Per-repo hook consent, persisted at
 /// `~/.cache/cw/hook-consent.json`: `"owner/repo" -> confirmed`, so the
 /// confirmation prompt fires once per repo, not once per worktree.
 pub type HookConsent = HashMap<String, bool>;
@@ -132,7 +132,7 @@ pub fn save_consent(path: &Path, consent: &HookConsent) -> Result<()> {
 /// whether the hook is cleared to run.
 ///
 /// `auto_yes` is checked BEFORE the cache, not after: it's the documented
-/// non-interactive escape hatch (§0/§3/§4's `--yes`), so it must be able to
+/// non-interactive escape hatch (`--yes`), so it must be able to
 /// override a previously *declined* consent for THIS run, not just skip
 /// prompting on a first encounter. Checking the cache first would let one
 /// earlier "n" permanently disable a repo's hooks with no way back short of
@@ -196,7 +196,7 @@ pub enum HookOutcome {
 }
 
 /// Direct exec (`Command::new`, no shell) — preserves whatever shebang the
-/// script declares. No timeout, deliberately (§5h): `cargo build`/`npm ci`
+/// script declares. No timeout, deliberately: `cargo build`/`npm ci`
 /// can legitimately run long, and a timeout would actively break legitimate
 /// use; Ctrl-C remains available. On `PermissionDenied` (script exists but
 /// isn't executable), maps to an actionable `chmod +x` message instead of a
@@ -246,7 +246,7 @@ pub struct HookSession<'a> {
 }
 
 /// Runs `post_clone_hook` if configured, gated by the confirm-once-per-repo
-/// consent check (§5h).
+/// consent check.
 pub fn run_post_clone_hook(
     session: &mut HookSession,
     checkout: &Path,
@@ -317,7 +317,7 @@ mod tests {
         fs::write(root.join("pnpm-lock.yaml"), "").unwrap();
 
         // Cargo.lock absent -> package-lock.json wins over pnpm-lock.yaml,
-        // per the fixed §3 order, not whichever the filesystem lists first.
+        // per LOCKFILE_PRECEDENCE, not whichever the filesystem lists first.
         let (program, args) = detect_auto_hook(root).unwrap();
         assert_eq!(program, "npm");
         assert_eq!(args, &["ci"]);

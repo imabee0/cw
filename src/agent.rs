@@ -41,7 +41,7 @@ fn acquire_lock(worktree: &Path) -> SessionLock {
 }
 
 /// Launches the configured agent CLI inside `worktree` with inherited
-/// stdio, so the agent gets a real interactive terminal (§5i). While it
+/// stdio, so the agent gets a real interactive terminal. While it
 /// runs, the worktree is git-locked so `cw finish`/`cw clean` can't remove
 /// it out from under the session.
 ///

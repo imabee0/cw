@@ -67,7 +67,7 @@ fn default_agents() -> HashMap<String, AgentConfig> {
     for name in ["claude", "codex", "grok", "opencode"] {
         agents.insert(name.to_string(), plain(name));
     }
-    // `$SHELL` is expanded by `resolve_agent()` itself (F13): `Command::new("$SHELL")`
+    // `$SHELL` is expanded by `resolve_agent()` itself: `Command::new("$SHELL")`
     // would NOT go through a shell and fails with ENOENT — see `expand_var` below.
     agents.insert("shell".to_string(), plain("$SHELL"));
     agents
@@ -89,7 +89,7 @@ impl Default for Config {
 }
 
 /// `$HOME`-based dotfile convention (matches `gh`/`cargo`/`rustup`), not
-/// `directories::ProjectDirs` — see plan §0: `ProjectDirs` would put macOS
+/// `directories::ProjectDirs`: `ProjectDirs` would put macOS
 /// config at `~/Library/Application Support/cw`, diverging from Linux.
 pub fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
@@ -115,7 +115,7 @@ pub fn log_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".cache/cw"))
 }
 
-/// Per-repo hook confirm-once consent store (§5h) — `"owner/repo" -> confirmed`.
+/// Per-repo hook confirm-once consent store — `"owner/repo" -> confirmed`.
 pub fn hook_consent_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".cache/cw/hook-consent.json"))
 }
@@ -131,14 +131,12 @@ pub fn load() -> Result<Config> {
     toml::from_str(&text).with_context(|| format!("parsing config at {}", path.display()))
 }
 
-// No `save()`: nothing in the CLI surface (§4) ever writes config.toml back —
-// it's hand-edited by the user, only ever loaded by cw. Adding a write path
-// with no caller would sit as permanent dead code once `scripts/check.sh`'s
-// `cargo clippy --all-targets -- -D warnings` starts running in phase 4.
+// No `save()`: cw never writes config.toml — it's hand-edited by the user,
+// only ever loaded.
 
 /// Resolves `--agent`/`default_agent` against `config.agents`. Never panics
 /// on a `HashMap` miss: an unknown name errors listing the configured agents.
-/// Expands a leading `$VAR`/`${VAR}` in the resolved `cmd`/`args` (F13), so
+/// Expands a leading `$VAR`/`${VAR}` in the resolved `cmd`/`args`, so
 /// returns an owned `AgentConfig` rather than a borrow.
 pub fn resolve_agent(name: Option<&str>, cfg: &Config) -> Result<AgentConfig> {
     let name = name.unwrap_or(cfg.default_agent.as_str());
@@ -162,7 +160,7 @@ pub fn resolve_agent(name: Option<&str>, cfg: &Config) -> Result<AgentConfig> {
 
 /// Expands a leading `$VAR` or `${VAR}` by reading the env var directly
 /// (never routes through `sh -c`). `$SHELL` specifically falls back to
-/// `/bin/sh` when unset (§3). Anything else that fails to resolve — a
+/// `/bin/sh` when unset. Anything else that fails to resolve — a
 /// malformed `${VAR}suffix` form (no closing brace, or trailing text after
 /// one), or any other variable that's simply unset — is an error naming the
 /// exact string that didn't resolve, rather than silently substituting an

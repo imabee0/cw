@@ -314,7 +314,7 @@ fn handle_pane_key(model: &mut DashboardModel, key: KeyEvent) -> Option<Dashboar
 }
 
 /// Enter (or a double-click) on a repo row starts a new worktree under it —
-/// clone/pull, create, launch — since that's the only thing a repo row is
+/// clone/fetch, create, launch — since that's the only thing a repo row is
 /// for; the worktree pane already lists every repo's worktrees. Enter on
 /// the Worktrees pane starts the launch pipeline for the focused row
 /// (resuming it, or creating one for the synthetic "+ new worktree" row) —
@@ -871,8 +871,8 @@ mod tests {
     #[test]
     fn enter_on_existing_row_uses_that_rows_repo_not_the_repo_pane_cursor() {
         // Repo pane cursor sits on acme/first (row 0); the only worktree
-        // belongs to acme/second. Resuming it must never clone/pull
-        // acme/first — the bug this pins: "cloning/pulling <some other
+        // belongs to acme/second. Resuming it must never clone/fetch
+        // acme/first — the bug this pins: "fetching <some other
         // repo>…" (and its failure) on every resume.
         let mut model = browse_model(
             vec![("acme", "first"), ("acme", "second")],
@@ -891,7 +891,7 @@ mod tests {
                 );
             }
             other => panic!(
-                "an existing worktree must launch directly, no clone/pull, got {}",
+                "an existing worktree must launch directly, no clone/fetch, got {}",
                 describe(&other)
             ),
         }
@@ -915,7 +915,7 @@ mod tests {
         let pending = model
             .pending
             .as_ref()
-            .expect("Enter on a repo row must start the clone/pull + create pipeline");
+            .expect("Enter on a repo row must start the clone/fetch + create pipeline");
         assert_eq!(pending.ctx.repo_label, "acme/proj");
         assert_eq!(pending.stage, super::super::model::Stage::Cloning);
         assert!(pending.worktree_path.is_none());
@@ -1283,7 +1283,7 @@ mod tests {
     /// Drives a real `Scope::SingleRepo` (`cw scratch`) worktree-creation
     /// pipeline against a tempdir-backed git repo — `Scope::SingleRepo`'s
     /// "+ new worktree" selection reaches `Stage::CreatingWorktree` directly
-    /// (no clone/pull stage, unlike `Scope::Browse`), so this is the cheapest
+    /// (no clone/fetch stage, unlike `Scope::Browse`), so this is the cheapest
     /// real path to `DashboardModel::do_create_worktree` without a
     /// background clone thread.
     #[test]

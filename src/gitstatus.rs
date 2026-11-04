@@ -10,9 +10,9 @@ use anyhow::Result;
 pub struct WorkState {
     /// Modified, staged, or untracked (non-ignored) files.
     pub changed_files: usize,
-    /// Commits reachable from the worktree's HEAD but from neither the main
-    /// checkout's HEAD nor any remote-tracking ref — history that would be
-    /// lost with the branch.
+    /// Commits reachable from the worktree's HEAD but from no remote-tracking
+    /// ref (nor, for a full checkout, its HEAD) — history that would be lost
+    /// with the branch.
     pub unpushed_commits: usize,
 }
 
@@ -41,9 +41,10 @@ fn changed_file_count(repo: &git2::Repository) -> Result<usize> {
     Ok(repo.statuses(Some(&mut opts))?.len())
 }
 
-/// Full work-state read for one worktree. `repo_root` is the main checkout
-/// the worktree hangs off — its HEAD counts as "already saved" when
-/// deciding which of the worktree's commits are unique to it.
+/// Full work-state read for one worktree. `repo_root` is the repo the
+/// worktree hangs off: a bare store (only `origin/*` counts as saved — the
+/// store's own HEAD is just the fetched default branch, already among them)
+/// or a full checkout, whose HEAD also counts as saved.
 pub fn work_state(worktree_path: &Path, repo_root: &Path) -> Result<WorkState> {
     let wt = git2::Repository::open(worktree_path)?;
     let changed_files = changed_file_count(&wt)?;
@@ -54,8 +55,8 @@ pub fn work_state(worktree_path: &Path, repo_root: &Path) -> Result<WorkState> {
     })
 }
 
-/// Commits reachable from `wt`'s HEAD that are hidden by neither the main
-/// checkout's HEAD nor any `refs/remotes/*` ref. A branch that was pushed
+/// Commits reachable from `wt`'s HEAD that are hidden by no `refs/remotes/*`
+/// ref (nor a full checkout's HEAD). A branch that was pushed
 /// (even if never merged) counts as saved; a scratch worktree, which has no
 /// remote at all, counts every commit — correct, since that history exists
 /// nowhere else. An unborn HEAD (no commits yet) is simply 0.

@@ -288,7 +288,7 @@ fn worktree_footer(model: &DashboardModel) -> Option<Line<'static>> {
     if let Some(pending) = &model.pending {
         let spinner = SPINNER[(model.ticks % SPINNER.len() as u64) as usize];
         let text = match pending.stage {
-            Stage::Cloning => format!("cloning/pulling {}…", pending.ctx.repo_label),
+            Stage::Cloning => format!("fetching {}…", pending.ctx.repo_label),
             Stage::CloneHook | Stage::CreateHook => "running hook…".to_string(),
             Stage::CreatingWorktree => format!("creating worktree {}…", pending.ctx.slug),
             Stage::Launching => format!("launching {}…", pending.ctx.agent),

@@ -22,7 +22,7 @@ pub enum Msg {
     /// `r` key (`DashboardModel::rescan_requested`, handled in
     /// `dashboard.rs`) — see `WorktreesLoad`.
     WorktreesLoaded(Result<WorktreesLoad, String>),
-    /// Background clone/pull thread result for a repo the user committed to
+    /// Background clone/fetch thread result for a repo the user committed to
     /// (Enter on a worktree row) — see `CloneOutcome`.
     CloneDone(Result<CloneOutcome, String>),
     /// A fresh `gitstatus::work_state` read for one worktree path, reported
@@ -69,7 +69,7 @@ pub struct WorktreesLoad {
     pub work: HashMap<PathBuf, Option<WorkState>>,
 }
 
-/// Background clone/pull thread result — carries only plain `Clone`-able
+/// Background clone/fetch thread result — carries only plain `Clone`-able
 /// data, never a `git2::Repository` (not worth making `Send` do the work of
 /// crossing the channel when the dashboard just reopens the repo locally on
 /// the main thread the moment this lands — see `dashboard.rs`).
