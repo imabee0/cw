@@ -2,11 +2,13 @@
 ignore = []
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CDLA-Permissive-2.0"]
-# CDLA-Permissive-2.0: `webpki-root-certs`, the Mozilla root-certificate
-# bundle pulled in transitively via axoupdater -> reqwest ->
-# rustls-platform-verifier — a data license (root cert data, not code), no
-# copyleft, permissive in the same spirit as the rest of this list.
+# Exactly the licenses the current dependency tree uses (an OR expression is
+# satisfied by any one allowed alternative). A new dependency under any other
+# license fails `cargo deny check` until it is reviewed and added here.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "Zlib"]
+# This workspace's own unpublished crates (cw, and the hakari-generated
+# workspace-hack, whose manifest must not be hand-edited to add a license).
+private = { ignore = true }
 
 [bans]
 multiple-versions = "warn"
