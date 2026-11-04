@@ -1,17 +1,20 @@
 name: CI
 
-# Event-driven. pull_request → validate. push to main → cache + tag.
-# push of v*.*.* → dist-build → publish → verify.
+# The one pipeline: lint, check, test, version, build, release. Purely
+# event-driven — no schedule, no manual trigger, no bots. Every job is gated
+# on the event and on what the diff touched (the `changes` job), cheap jobs
+# run first, and `ci-ok` is the single required status check.
 on:
   pull_request:
   push:
     branches: [main]
-    tags:
-      - "v*.*.*"
-  workflow_dispatch:
+  merge_group:
 
+# One run per ref. Stale PR runs are cancelled; main runs always finish —
+# versions come from git tags, so a later main run releases everything an
+# earlier, superseded one would have.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -21,310 +24,715 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
-  DIST_VERSION: "0.32.0"
+  # Adding a component or a target means editing only this block.
+  # COMPONENTS: name, paths (globs), crates, targets (shipped triples),
+  #   versioned (git-tag releases), publish (crates.io).
+  # TARGETS: name, triple, runner, method (native|zigbuild), tier (1|2),
+  #   tested, paths (globs of files that only matter to this target).
+  # x86_64 Linux builds on ubuntu-22.04 so released binaries run on older
+  # glibc; every x86_64 job uses that runner so restored caches match it.
+  CI_CONFIG: >-
+    {
+      "COMPONENTS": [
+        {"name": "cw",
+         "paths": ["src/**", "build.rs", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
+                   ".cargo/**", "workspace-hack/**"],
+         "crates": ["cw"],
+         "targets": ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"],
+         "versioned": true, "publish": false}
+      ],
+      "TARGETS": [
+        {"name": "linux", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-22.04",
+         "method": "native", "tier": 1, "tested": true, "paths": []},
+        {"name": "macos-arm", "triple": "aarch64-apple-darwin", "runner": "macos-26",
+         "method": "native", "tier": 2, "tested": true, "paths": []}
+      ]
+    }
 
 jobs:
   # ------------------------------------------------------------------
-  # Validate (pull_request, push to main, workflow_dispatch — not tags)
+  # 1. What changed, and therefore what runs.
   # ------------------------------------------------------------------
-  lint:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, resolved 2026-08-21 (no version tags on this repo)
-        with: { toolchain: "1.98", components: "rustfmt,clippy" }
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: "1.98"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-
-  workflows:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+  changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.detect.outputs.skip }}
+      deps_changed: ${{ steps.detect.outputs.deps_changed }}
+      components: ${{ steps.detect.outputs.components }}
+      targets: ${{ steps.detect.outputs.targets }}
+      lint_pflags: ${{ steps.detect.outputs.lint_pflags }}
+      check_matrix: ${{ steps.detect.outputs.check_matrix }}
+      test_matrix: ${{ steps.detect.outputs.test_matrix }}
+      warm_matrix: ${{ steps.detect.outputs.warm_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: this directory contains exactly one workflow
+        with:
+          fetch-depth: 0 # history for the diff base, tags for versioning
+          persist-credentials: false
+      - id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          # cargo metadata only reads manifests; the runner's preinstalled
+          # stable cargo does that without installing the pinned toolchain.
+          RUSTUP_TOOLCHAIN: stable
         run: |
           set -euo pipefail
-          n=$(find .github/workflows -maxdepth 1 \( -name '*.yml' -o -name '*.yaml' \) | wc -l)
-          if [ "$n" -ne 1 ]; then
-            echo "::error::expected exactly one file in .github/workflows, found $n"
-            find .github/workflows -maxdepth 1 \( -name '*.yml' -o -name '*.yaml' \) -print
-            exit 1
-          fi
-          if ! grep -qE '^on:' .github/workflows/ci.yml; then
-            echo "::error file=.github/workflows/ci.yml::missing top-level on:"
-            exit 1
-          fi
-
-  secrets:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: { fetch-depth: 0 }
-      - name: Install gitleaks
-        run: |
-          curl -sSfL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
-          tar -xzf gitleaks.tar.gz gitleaks
-          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
-      - run: gitleaks detect --no-banner --redact
-
-  dist-plan:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install cargo-dist
-        run: curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" | sh
-      - run: dist plan
-
-  build-test:
-    name: build-test (${{ matrix.os }})
-    needs: [lint]
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, resolved 2026-08-21 (no version tags on this repo)
-        with: { toolchain: "1.98", components: "rustfmt,clippy" }
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: "1.98"
-          save-if: false
-      - run: cargo build --all-targets --locked
-      - run: cargo test --locked
-      - if: matrix.os == 'ubuntu-latest'
-        run: cargo build --release --locked
-      - if: matrix.os == 'ubuntu-latest'
-        run: ./target/release/cw --version
-
-  # ------------------------------------------------------------------
-  # Tag (push to main only). PAT so the tag push retriggers this workflow.
-  # ------------------------------------------------------------------
-  tag:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, resolved 2026-08-21 (no version tags on this repo)
-        with: { toolchain: "1.98" }
-      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-
-  bump:
-    needs: [tag]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, resolved 2026-08-21 (no version tags on this repo)
-        with: { toolchain: "1.98" }
-      - id: release-plz
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - if: fromJSON(steps.release-plz.outputs.pr).number
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-        run: gh pr merge --squash --auto "${{ fromJSON(steps.release-plz.outputs.pr).number }}" --repo "${{ github.repository }}"
+          case "$EVENT" in
+            pull_request) files=$(git diff --name-only "$PR_BASE...$PR_HEAD") ;;
+            merge_group)  files=$(git diff --name-only "$MG_BASE...$GITHUB_SHA") ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ] \
+                 && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+                files=$(git diff --name-only "$PUSH_BEFORE" "$GITHUB_SHA")
+              else
+                files=$(git ls-files) # no usable "before": treat everything as changed
+              fi ;;
+            *) echo "::error::unsupported event $EVENT"; exit 1 ;;
+          esac
+          printf 'changed files:\n%s\n' "$files"
+          files_json=$(printf '%s\n' "$files" | jq -R . | jq -sc 'map(select(length > 0))')
+          hack=$(sed -n 's/^hakari-package[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' .config/hakari.toml)
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          jq -n --argjson cfg "$CI_CONFIG" --argjson files "$files_json" --arg event "$EVENT" \
+                --arg hack "$hack" --slurpfile meta "$RUNNER_TEMP/metadata.json" '
+            def g2r: "^" + (gsub("(?<c>[.+()^$|{}\\[\\]])"; "\\\(.c)")
+                            | gsub("\\*\\*/"; "\u0001") | gsub("\\*\\*"; "\u0002")
+                            | gsub("\\*"; "[^/]*") | gsub("\u0001"; "(.*/)?") | gsub("\u0002"; ".*")) + "$";
+            def matches($globs): . as $f | any($globs[]; . as $g | $f | test($g | g2r));
+            def docs: test("^docs/|\\.md$|^LICENSE|^\\.github/ISSUE_TEMPLATE/");
+            def pflags: map("-p " + .) | join(" ");
+            $meta[0] as $m
+            | ($m.workspace_root) as $root
+            | [$m.packages[] | select(.id as $id | $m.workspace_members | index($id))] as $members
+            | ($members | map({key: .id, value: .name}) | from_entries) as $names
+            | ($members | map(select(.name == $hack)) | .[0].manifest_path
+               | ltrimstr($root + "/")) as $hack_manifest
+            | [$m.resolve.nodes[] | select(.id as $id | $names | has($id))
+               | {from: $names[.id], to: [.deps[] | select(.pkg as $p | $names | has($p)) | $names[.pkg]]}] as $edges
+            | def rdeps: . as $set
+                | ([$edges[] | select(any(.to[]; . as $t | $set | index($t))) | .from] + $set | unique) as $next
+                | if ($next | length) == ($set | length) then $set else ($next | rdeps) end;
+            # Crates in no component or in several are shared: touching one affects everything.
+            ([$members[].name | select(. != $hack)] - [$cfg.COMPONENTS[].crates[]]) as $unowned
+            | ([$cfg.COMPONENTS[].crates[]] | group_by(.) | map(select(length > 1) | .[0])) as $multi
+            | ($unowned + $multi) as $shared
+            | ($members | map(select(.name as $n | $shared | index($n))
+                | .manifest_path | ltrimstr($root + "/") | rtrimstr("Cargo.toml"))) as $shared_dirs
+            | (($files | length) > 0 and all($files[]; docs)) as $skip
+            | any($files[]; test("(^|/)Cargo\\.toml$|^Cargo\\.lock$|^\\.config/hakari\\.toml$")) as $deps
+            | any($files[]; . as $f
+                | (["Cargo.lock", "rust-toolchain.toml", $hack_manifest, ".config/hakari.toml",
+                    ".cargo/config.toml", ".config/nextest.toml", ".github/workflows/ci.yml"] | index($f))
+                  or any($shared_dirs[]; . as $d | $d != "" and ($f | startswith($d)))) as $all
+            | [$cfg.COMPONENTS[] | . as $c | select($all or any($files[]; matches($c.paths)))] as $direct
+            | ([$direct[].crates[]] | unique | rdeps) as $crate_closure
+            | [$cfg.COMPONENTS[] | select(any(.crates[]; . as $c | $crate_closure | index($c)))] as $affected
+            | (if $skip then [] else $affected end) as $comps
+            | def crates_on($t): [$comps[] | select(.targets | index($t)) | .crates[]] | unique - [$hack];
+            def all_crates_on($t): [$cfg.COMPONENTS[] | select(.targets | index($t)) | .crates[]] | unique - [$hack];
+            [$cfg.TARGETS[] | select(.triple as $t | any($comps[]; .targets | index($t)))] as $targets
+            | {
+                skip: $skip,
+                deps_changed: $deps,
+                components: [$comps[].name],
+                targets: [$targets[].triple],
+                lint_pflags: ([$comps[].crates[]] | unique - [$hack] | pflags),
+                check_matrix: [$targets[] | select(.tier == 2)
+                  | select(. as $t | $event == "merge_group" or any($files[]; matches($t.paths))) as $t
+                  | $t + {pflags: (crates_on($t.triple) | pflags)}],
+                test_matrix: [$targets[] | select(.tier == 1 or ($event == "merge_group" and .tested))
+                  | . + {pflags: (crates_on(.triple) | pflags)}],
+                warm_matrix: [$cfg.TARGETS[] | . as $t
+                  | (if .tier == 2 then [$t + {kind: "check"}] else [] end)
+                    + (if .tested then [$t + {kind: "test"}] else [] end)
+                  | .[] | . + {pflags: (all_crates_on(.triple) | pflags)}]
+              }' > "$RUNNER_TEMP/changes.json"
+          jq . "$RUNNER_TEMP/changes.json"
+          jq -r 'to_entries[] | "\(.key)=\(.value | if type == "string" or type == "boolean" then tostring else tojson end)"' \
+            "$RUNNER_TEMP/changes.json" >> "$GITHUB_OUTPUT"
 
   # ------------------------------------------------------------------
-  # Publish (version tags only). Native linux + Apple Silicon.
+  # 2. Cheap, broad gates. Also the Tier 1 compile check (clippy).
   # ------------------------------------------------------------------
-  dist-build:
-    name: dist-build (${{ matrix.target }})
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - os: macos-26
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    permissions:
-      attestations: write
-      contents: read
-      id-token: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup update 1.98 --no-self-update && rustup default 1.98
-      - name: Install cargo-dist
-        run: curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" | sh
-      - name: Build
-        id: dist
-        run: |
-          dist build --tag="${{ github.ref_name }}" --print=linkage --output-format=json --artifacts=local --target="${{ matrix.target }}" > dist-manifest.json
-          {
-            echo "paths<<EOF"
-            dist print-upload-files-from-manifest --manifest dist-manifest.json
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          mkdir -p target/distrib
-          cp dist-manifest.json "target/distrib/${{ matrix.target }}-dist-manifest.json"
-      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
-        with:
-          subject-path: "target/distrib/*${{ matrix.target }}*"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: artifacts-build-local-${{ matrix.target }}
-          path: |
-            ${{ steps.dist.outputs.paths }}
-            target/distrib/${{ matrix.target }}-dist-manifest.json
-
-  dist-global:
-    needs: [dist-build]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+  gates:
+    needs: [changes]
+    if: needs.changes.outputs.skip != 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 10
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0 # the PR's commits for commit lint
           persist-credentials: false
-      - run: rustup update 1.98 --no-self-update && rustup default 1.98
-      - name: Install cargo-dist
-        run: curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" | sh
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-      - id: dist
+      - name: Commit lint
+        if: github.event_name == 'pull_request'
+        env:
+          RANGE: ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+          # A squash merge uses the PR title as the commit subject on main,
+          # and the version job bumps from that subject, so lint it too.
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          dist build --tag="${{ github.ref_name }}" --output-format=json --artifacts=global > dist-manifest.json
-          {
-            echo "paths<<EOF"
-            jq --raw-output ".upload_files[]" dist-manifest.json
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          mkdir -p target/distrib
-          cp dist-manifest.json target/distrib/global-dist-manifest.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+          set -euo pipefail
+          re='^(feat|fix|perf|docs|chore|ci|test|style|refactor|build|revert)(\([^)]+\))?!?: .+'
+          bad=0
+          if ! printf '%s\n' "$PR_TITLE" | grep -Eq "$re"; then
+            echo "::error::PR title '$PR_TITLE' must match $re"
+            bad=1
+          fi
+          for sha in $(git rev-list --reverse "$RANGE"); do
+            subject=$(git log -1 --format=%s "$sha")
+            if ! printf '%s\n' "$subject" | grep -Eq "$re"; then
+              echo "::error::$(git rev-parse --short "$sha") '$subject' — subject must match $re"
+              bad=1
+            fi
+            # GitHub drops CI for these, leaving required checks pending forever.
+            for s in '[skip ci]' '[ci skip]' '[no ci]' '[skip actions]' '[actions skip]' 'skip-checks:'; do
+              if git log -1 --format=%B "$sha" | grep -qiF -- "$s"; then
+                echo "::error::$(git rev-parse --short "$sha") '$subject' contains '$s'"
+                bad=1
+              fi
+            done
+          done
+          exit "$bad"
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - run: cargo fmt --all --check
+      - name: Install cargo-deny and cargo-hakari
+        if: needs.changes.outputs.deps_changed == 'true'
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          name: artifacts-build-global
-          path: |
-            ${{ steps.dist.outputs.paths }}
-            target/distrib/global-dist-manifest.json
+          tool: cargo-deny@0.20.2,cargo-hakari@0.9.39
+      - name: Hakari (workspace-hack is current)
+        if: needs.changes.outputs.deps_changed == 'true'
+        run: |
+          if ! cargo hakari generate --diff || ! cargo hakari manage-deps --dry-run; then
+            echo "::error::Fix: cargo hakari generate && cargo hakari manage-deps"
+            exit 1
+          fi
+      - if: needs.changes.outputs.deps_changed == 'true'
+        run: cargo deny --locked check
+      # Hits: main runs this job with --workspace and saves the lint key;
+      # PRs and the merge queue restore it (same manifests, lockfile, toolchain).
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: x86_64-unknown-linux-gnu-lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+      - name: Clippy (affected crates)
+        if: github.event_name != 'push' && needs.changes.outputs.lint_pflags != ''
+        env:
+          PFLAGS: ${{ needs.changes.outputs.lint_pflags }}
+        run: |
+          read -ra crate_args <<<"$PFLAGS" # space-separated -p list
+          cargo clippy --all-targets --locked "${crate_args[@]}" -- -D warnings
+      - name: Clippy (workspace — keeps main's lint cache whole)
+        if: github.event_name == 'push'
+        run: cargo clippy --all-targets --locked --workspace -- -D warnings
 
-  publish:
-    needs: [dist-global]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
+  # ------------------------------------------------------------------
+  # 3. Tier 2 compile checks (Tier 1 is covered by clippy).
+  # ------------------------------------------------------------------
+  check-targets:
+    needs: [changes, gates]
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+      && needs.changes.outputs.check_matrix != '[]'
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.check_matrix) }}
+    name: check-targets (${{ matrix.triple }})
+    runs-on: ${{ matrix.method == 'zigbuild' && 'ubuntu-latest' || matrix.runner }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup update 1.98 --no-self-update && rustup default 1.98
-      - name: Install cargo-dist
-        run: curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" | sh
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-      - id: host
+      - run: rustup toolchain install # reads rust-toolchain.toml (lists every target)
+      - name: Linker tools for .cargo/config.toml
+        if: runner.os == 'Linux' && matrix.method == 'native'
+        env:
+          TRIPLE: ${{ matrix.triple }}
         run: |
-          dist host --tag="${{ github.ref_name }}" --steps=upload --steps=release --output-format=json > dist-manifest.json
-          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+          if grep -q "^\[target\.$TRIPLE\]" .cargo/config.toml; then
+            sudo apt-get update && sudo apt-get install -y clang lld
+          fi
+      - if: matrix.method == 'zigbuild'
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          pattern: artifacts-*
-          path: artifacts
-          merge-multiple: true
-      - run: rm -f artifacts/*-dist-manifest.json
+          tool: cargo-zigbuild@0.23.4
+      - if: matrix.method == 'zigbuild'
+        run: python3 -m pip install --user ziglang
+      # Hits: warm-cache on main runs this exact check per target and saves
+      # this key; PRs and the merge queue only restore it.
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ${{ matrix.triple }}-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+      - name: cargo check
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          PFLAGS: ${{ matrix.pflags }}
+          METHOD: ${{ matrix.method }}
+        run: |
+          read -ra crate_args <<<"$PFLAGS" # space-separated -p list
+          if [ "$METHOD" = zigbuild ]; then
+            cargo-zigbuild check --target "$TRIPLE" --locked "${crate_args[@]}"
+          else
+            cargo check --target "$TRIPLE" --locked "${crate_args[@]}"
+          fi
+
+  # ------------------------------------------------------------------
+  # 4. Tests, natively on each target's runner.
+  # ------------------------------------------------------------------
+  test:
+    needs: [changes, gates]
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+      && needs.changes.outputs.test_matrix != '[]'
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.test_matrix) }}
+    name: test (${{ matrix.triple }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-nextest@0.9.148
+      # Hits: warm-cache on main builds these test binaries (nextest --no-run)
+      # per target and saves this key; PRs and the merge queue only restore it.
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ${{ matrix.triple }}-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
       - env:
-          PRERELEASE_FLAG: ${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}
-          ANNOUNCEMENT_TITLE: ${{ fromJson(steps.host.outputs.manifest).announcement_title }}
-          ANNOUNCEMENT_BODY: ${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}
+          PFLAGS: ${{ matrix.pflags }}
         run: |
-          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
-          gh release create "${{ github.ref_name }}" --target "${{ github.sha }}" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          read -ra crate_args <<<"$PFLAGS" # space-separated -p list
+          cargo nextest run --locked --profile gate "${crate_args[@]}"
+      - if: github.event_name == 'merge_group' && matrix.tier == 1
+        run: cargo test --doc --locked --workspace
 
-  verify:
-    needs: [publish]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    name: verify (${{ matrix.target }})
+  # ------------------------------------------------------------------
+  # 5. Minimum supported Rust version.
+  # ------------------------------------------------------------------
+  msrv:
+    needs: [changes, gates]
+    if: >-
+      needs.changes.outputs.skip != 'true'
+      && (github.event_name == 'merge_group'
+          || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - id: msrv
+        run: |
+          m=$(cargo metadata --locked --format-version 1 --no-deps | jq -r '
+            [.packages[] | .rust_version // empty | split(".") | map(tonumber)] | max
+            | if . == null then "" else map(tostring) | join(".") end')
+          if [ -z "$m" ]; then echo "MSRV: not configured"; fi
+          echo "version=$m" >> "$GITHUB_OUTPUT"
+      - if: steps.msrv.outputs.version != ''
+        run: rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
+      # Hits: this job runs on every push to main and saves the msrv key;
+      # merge-queue runs restore it.
+      - id: cache
+        if: steps.msrv.outputs.version != ''
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: x86_64-unknown-linux-gnu-msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: steps.msrv.outputs.version != ''
+        run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+      - if: steps.msrv.outputs.version != ''
+        run: cargo "+${{ steps.msrv.outputs.version }}" check --workspace --locked
+
+  # ------------------------------------------------------------------
+  # 6. Keep main's caches warm for PRs and the merge queue (no tests:
+  #    they already passed in the merge queue).
+  # ------------------------------------------------------------------
+  warm-cache:
+    needs: [changes, gates]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.changes.outputs.skip != 'true' && needs.changes.outputs.warm_matrix != '[]'
     strategy:
-      fail-fast: false
+      fail-fast: true
+      max-parallel: 6
       matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-26
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
+        include: ${{ fromJSON(needs.changes.outputs.warm_matrix) }}
+    name: warm-cache (${{ matrix.triple }}, ${{ matrix.kind }})
+    runs-on: ${{ matrix.method == 'zigbuild' && matrix.kind == 'check' && 'ubuntu-latest' || matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - name: Linker tools for .cargo/config.toml
+        if: runner.os == 'Linux' && matrix.method == 'native'
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          if grep -q "^\[target\.$TRIPLE\]" .cargo/config.toml; then
+            sudo apt-get update && sudo apt-get install -y clang lld
+          fi
+      - if: matrix.kind == 'check' && matrix.method == 'zigbuild'
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-zigbuild@0.23.4
+      - if: matrix.kind == 'check' && matrix.method == 'zigbuild'
+        run: python3 -m pip install --user ziglang
+      - if: matrix.kind == 'test'
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-nextest@0.9.148
+      # Saves the exact key the PR/merge-queue job of this kind restores
+      # (<triple>-check or <triple>-test); one leg per key, so no two legs
+      # write the same key.
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ${{ matrix.triple }}-${{ matrix.kind }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+      - name: cargo check (all components)
+        if: matrix.kind == 'check'
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          PFLAGS: ${{ matrix.pflags }}
+          METHOD: ${{ matrix.method }}
+        run: |
+          read -ra crate_args <<<"$PFLAGS" # space-separated -p list
+          if [ "$METHOD" = zigbuild ]; then
+            cargo-zigbuild check --target "$TRIPLE" --locked "${crate_args[@]}"
+          else
+            cargo check --target "$TRIPLE" --locked "${crate_args[@]}"
+          fi
+      - name: nextest --no-run (all components, host triple)
+        if: matrix.kind == 'test'
+        env:
+          PFLAGS: ${{ matrix.pflags }}
+        run: |
+          read -ra crate_args <<<"$PFLAGS" # space-separated -p list
+          cargo nextest run --no-run --locked --profile gate "${crate_args[@]}"
+
+  # ------------------------------------------------------------------
+  # 7. Versions from git tags <component>-vX.Y.Z and conventional commits.
+  #    Never commits to main; versions reach builds as CI_VERSION_<NAME>.
+  # ------------------------------------------------------------------
+  version:
+    needs: [changes, gates]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.changes.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      released: ${{ steps.plan.outputs.released }}
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # every tag and commit
+          persist-credentials: false
+      - id: plan
+        env:
+          RUSTUP_TOOLCHAIN: stable # cargo metadata only; no pinned toolchain needed
+        run: |
+          set -euo pipefail
+          meta=$(cargo metadata --locked --format-version 1 --no-deps)
+          released='[]'
+          for comp in $(jq -r '.COMPONENTS[] | select(.versioned) | @base64' <<<"$CI_CONFIG"); do
+            c=$(printf '%s' "$comp" | base64 -d)
+            name=$(jq -r .name <<<"$c")
+            crate=$(jq -r '.crates[0]' <<<"$c")
+            mapfile -t paths < <(jq -r '.paths[] | ":(glob)" + .' <<<"$c")
+            last=$(git tag --list "$name-v*" | sed "s/^$name-v//" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                   | sort -t. -k1,1n -k2,2n -k3,3n | tail -1 || true)
+            if [ -z "$last" ]; then
+              # No tag yet: the first release is the version in Cargo.toml.
+              version=$(jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version' <<<"$meta")
+              prev=""
+              echo "$name: no tag yet, first release $version"
+            elif [ "$(git rev-list -n1 "$name-v$last")" = "$(git rev-parse HEAD)" ]; then
+              # Re-run on an already tagged commit: reuse the tag and finish the release.
+              version=$last
+              prev=$(git tag --list "$name-v*" | sed "s/^$name-v//" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                     | sort -t. -k1,1n -k2,2n -k3,3n | grep -vx "$last" | tail -1 || true)
+              [ -z "$prev" ] || prev="$name-v$prev"
+              echo "$name: $name-v$last already tags this commit, reusing it"
+            else
+              bump=0 # 0 none, 1 patch, 2 minor, 3 major
+              for sha in $(git rev-list "$name-v$last..HEAD" -- "${paths[@]}"); do
+                subject=$(git log -1 --format=%s "$sha")
+                body=$(git log -1 --format=%b "$sha")
+                b=0
+                if printf '%s\n' "$subject" | grep -Eq '^[a-z]+(\([^)]+\))?!: '; then b=3
+                elif printf '%s\n' "$body" | grep -Eq '^BREAKING[ -]CHANGE:'; then b=3
+                elif printf '%s\n' "$subject" | grep -Eq '^feat(\([^)]+\))?: '; then b=2
+                elif printf '%s\n' "$subject" | grep -Eq '^(fix|perf)(\([^)]+\))?: '; then b=1
+                fi
+                [ "$b" -gt "$bump" ] && bump=$b
+              done
+              IFS=. read -r major minor patch <<<"$last"
+              case "$bump" in
+                3) version="$((major + 1)).0.0" ;;
+                2) version="$major.$((minor + 1)).0" ;;
+                1) version="$major.$minor.$((patch + 1))" ;;
+                *) echo "$name: no releasable commits since $name-v$last"; continue ;;
+              esac
+              prev="$name-v$last"
+              echo "$name: $prev -> $version"
+            fi
+            released=$(jq -c --argjson c "$c" --arg v "$version" --arg prev "$prev" \
+              '. + [{name: $c.name, version: $v, tag: ($c.name + "-v" + $v), prev: $prev,
+                     crates: $c.crates, targets: $c.targets, publish: $c.publish, paths: $c.paths}]' <<<"$released")
+          done
+          build_matrix=$(jq -c --argjson cfg "$CI_CONFIG" '. as $rel | [$cfg.TARGETS[] | . as $t
+            | [$rel[] | select(.targets | index($t.triple))] as $r | select($r | length > 0)
+            | $t + {pflags: ([$r[].crates[]] | unique | map("-p " + .) | join(" ")),
+                    components: ([$r[].name] | join(" ")),
+                    versions: ([$r[] | "CI_VERSION_" + (.name | ascii_upcase | gsub("-"; "_")) + "=" + .version] | join(" "))}]' \
+            <<<"$released")
+          echo "released: $released"
+          echo "build matrix: $build_matrix"
+          {
+            echo "release=$(jq -r 'if length > 0 then "true" else "false" end' <<<"$released")"
+            echo "released=$released"
+            echo "build_matrix=$build_matrix"
+          } >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------
+  # 8. Release builds, one leg per target building every released component.
+  # ------------------------------------------------------------------
+  build:
+    needs: [version]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.version.outputs.release == 'true'
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJSON(needs.version.outputs.build_matrix) }}
+    name: build (${{ matrix.triple }})
+    runs-on: ${{ matrix.method == 'zigbuild' && 'ubuntu-latest' || matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - name: Linker tools for .cargo/config.toml
+        if: runner.os == 'Linux' && matrix.method == 'native'
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          if grep -q "^\[target\.$TRIPLE\]" .cargo/config.toml; then
+            sudo apt-get update && sudo apt-get install -y clang lld
+          fi
+      - if: matrix.method == 'zigbuild'
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-zigbuild@0.23.4
+      - if: matrix.method == 'zigbuild'
+        run: python3 -m pip install --user ziglang
+      - name: Release versions for build.rs
+        env:
+          VERSIONS: ${{ matrix.versions }}
+        run: for kv in $VERSIONS; do echo "$kv" >> "$GITHUB_ENV"; done
+      # Hits: every release build on main saves and restores this
+      # target's own -release key (release profile, never shared with dev).
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ${{ matrix.triple }}-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+      - name: Build
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          PFLAGS: ${{ matrix.pflags }}
+          METHOD: ${{ matrix.method }}
+        run: |
+          read -ra crate_args <<<"$PFLAGS" # space-separated -p list
+          if [ "$METHOD" = zigbuild ]; then
+            cargo zigbuild --release --locked --target "$TRIPLE" "${crate_args[@]}"
+          else
+            cargo build --release --locked --target "$TRIPLE" "${crate_args[@]}"
+          fi
+      - name: Package, checksum, and check the version each binary reports
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          COMPONENTS: ${{ matrix.components }}
+          METHOD: ${{ matrix.method }}
+        run: |
+          set -euo pipefail
+          meta=$(cargo metadata --locked --format-version 1 --no-deps)
+          mkdir -p dist
+          for comp in $COMPONENTS; do
+            var="CI_VERSION_$(printf '%s' "$comp" | tr '[:lower:]-' '[:upper:]_')"
+            want=${!var}
+            bins=()
+            for crate in $(jq -r --arg n "$comp" '.COMPONENTS[] | select(.name == $n) | .crates[]' <<<"$CI_CONFIG"); do
+              while IFS= read -r b; do [ -n "$b" ] && bins+=("$b"); done \
+                < <(jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .targets[] | select(.kind | index("bin")) | .name' <<<"$meta")
+            done
+            [ ${#bins[@]} -gt 0 ] || continue
+            if [ "$METHOD" = native ]; then
+              for b in "${bins[@]}"; do
+                got=$("target/$TRIPLE/release/$b" --version | awk '{print $2}')
+                [ "$got" = "$want" ] || { echo "::error::$b reports $got, expected $want"; exit 1; }
+                echo "$b --version: $got"
+              done
+            fi
+            archive="$comp-$TRIPLE.tar.gz"
+            tar -czf "dist/$archive" -C "target/$TRIPLE/release" "${bins[@]}"
+            (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
+            cat "dist/$archive.sha256"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # 9. Tags, GitHub Releases, crates.io. The only job that can write.
+  #    Tags and releases created with GITHUB_TOKEN do not trigger
+  #    workflows, so releasing can never start another run of this one.
+  # ------------------------------------------------------------------
+  release:
+    needs: [version, build]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
-      attestations: read
+      id-token: write # build-provenance attestation
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ github.ref_name }}
-      ASSET: cw-${{ matrix.target }}.tar.xz
+      RELEASED: ${{ needs.version.outputs.released }}
     steps:
-      - run: gh release download "$TAG" --repo "${{ github.repository }}" --pattern "$ASSET" --pattern "$ASSET.sha256"
-      - run: shasum -a 256 -c "$ASSET.sha256"
-      - run: gh attestation verify "$ASSET" --repo "${{ github.repository }}"
-      - run: tar -xJf "$ASSET"
-      - run: |
-          bin="cw-${{ matrix.target }}/cw"
-          chmod +x "$bin"
-          actual_output="$("$bin" --version)"
-          expected_version="${TAG#v}"
-          actual_version="$(printf '%s' "$actual_output" | awk '{print $2}')"
-          echo "binary printed: $actual_output"
-          if [ "$actual_version" != "$expected_version" ]; then
-            echo "::error::version mismatch: binary reports '$actual_version', tag is '$TAG'"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # commits since the previous tag, for notes
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Tag and publish GitHub Releases
+        run: |
+          set -euo pipefail
+          for row in $(jq -r '.[] | @base64' <<<"$RELEASED"); do
+            r=$(printf '%s' "$row" | base64 -d)
+            name=$(jq -r .name <<<"$r"); tag=$(jq -r .tag <<<"$r"); prev=$(jq -r .prev <<<"$r")
+            mapfile -t paths < <(jq -r '.paths[] | ":(glob)" + .' <<<"$r")
+            # Tag the pushed commit; an existing tag (a re-run) is reused.
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+              gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA" >/dev/null
+              echo "created tag $tag at $GITHUB_SHA"
+            fi
+            # Notes from this component's conventional commits since its last
+            # tag; a component's first tag starts from the newest older tag of
+            # any name (e.g. a pre-<component>-v release scheme), if one exists.
+            [ -n "$prev" ] || prev=$(git describe --tags --abbrev=0 "$GITHUB_SHA^" 2>/dev/null || true)
+            range=${prev:+$prev..}$GITHUB_SHA
+            notes="$RUNNER_TEMP/$name-notes.md"
+            : > "$notes"
+            # One section per commit: breaking (`!` or a BREAKING CHANGE footer)
+            # wins over its type; other types (docs, ci, chore, ...) are omitted.
+            for title in "Breaking changes" Features Fixes Performance; do
+              lines=$(git log --format=%h "$range" -- "${paths[@]}" | while read -r sha; do
+                subject=$(git log -1 --format=%s "$sha")
+                if printf '%s\n' "$subject" | grep -Eq '^[a-z]+(\([^)]+\))?!: ' \
+                   || git log -1 --format=%b "$sha" | grep -Eq '^BREAKING[ -]CHANGE:'; then
+                  section="Breaking changes"
+                else
+                  case "$subject" in
+                    feat:* | feat\(*) section=Features ;;
+                    fix:* | fix\(*) section=Fixes ;;
+                    perf:* | perf\(*) section=Performance ;;
+                    *) continue ;;
+                  esac
+                fi
+                [ "$section" = "$title" ] && echo "- $subject ($sha)"
+              done || true)
+              [ -z "$lines" ] || printf '### %s\n\n%s\n\n' "$title" "$lines" >> "$notes"
+            done
+            [ -s "$notes" ] || echo "Initial release." >> "$notes"
+            # shellcheck disable=SC2016 # the backticks are Markdown, not a command substitution
+            printf '**Install:** `curl -fsSL https://raw.githubusercontent.com/%s/main/install/%s.sh | bash`\n' \
+              "$GITHUB_REPOSITORY" "$name" >> "$notes"
+            files=()
+            for f in dist/"$name"-*; do [ -e "$f" ] && files+=("$f"); done
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release edit "$tag" --notes-file "$notes"
+              gh release upload "$tag" --clobber "${files[@]}"
+            else
+              gh release create "$tag" --verify-tag --title "$name $(jq -r .version <<<"$r")" \
+                --notes-file "$notes" "${files[@]}"
+            fi
+            echo "released $tag with ${#files[@]} files"
+          done
+      - name: Publish to crates.io (components with publish=true)
+        if: contains(needs.version.outputs.released, '"publish":true')
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          for crate in $(jq -r '.[] | select(.publish) | .crates[]' <<<"$RELEASED"); do
+            cargo publish --locked -p "$crate"
+          done
+
+  # ------------------------------------------------------------------
+  # 10. The one required status check.
+  # ------------------------------------------------------------------
+  ci-ok:
+    needs: [changes, gates, check-targets, test, msrv, warm-cache, version, build, release]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # Skipped is fine (docs-only, wrong event, nothing to release);
+          # failure or cancelled anywhere is not.
+          if echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' >/dev/null; then
+            echo "::error::a required job failed or was cancelled"
             exit 1
           fi
-      - if: failure()
-        run: |
-          gh release edit "$TAG" --repo "${{ github.repository }}" --draft
-          exit 1
