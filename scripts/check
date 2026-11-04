@@ -1,0 +1,703 @@
+#!/usr/bin/env bash
+# scripts/check — local check/build gate for this Cargo workspace.
+#
+#   scripts/check [fast]                 scoped to crates affected by your changes
+#   scripts/check gate                   full workspace; run before pushing
+#   scripts/check build [component ...] [--target <triple|all>]
+#
+# Flags: --base <ref>  --full  --no-fail-fast  --force  --target (build only)
+# Exit codes: 0 pass or skip, 1 a check failed, 2 usage error or missing tool.
+#
+# Bash 3.2 compatible (macOS default): no associative arrays, no mapfile, and
+# every possibly-empty array expands as ${a[@]+"${a[@]}"} so `set -u` holds.
+# jq programs are single-quoted on purpose: their $names are jq variables.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Config — adding a component or target means editing only this block.
+# COMPONENTS: name, crates (Cargo package names), targets (triples it ships on).
+# TARGETS: triple, method ("cargo" or "zigbuild"). Clippy and tests always run
+# on the host triple; TARGETS drive gate cross-checks and build mode.
+# FEATURES: "default" or "all" ("all" adds --all-features to gate clippy/tests).
+# ---------------------------------------------------------------------------
+CONFIG='{
+  "BASE_REF": "origin/main",
+  "FEATURES": "default",
+  "COMPONENTS": [
+    {"name": "cw", "crates": ["cw"],
+     "targets": ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]}
+  ],
+  "TARGETS": [
+    {"triple": "x86_64-unknown-linux-gnu", "method": "cargo"},
+    {"triple": "aarch64-apple-darwin", "method": "cargo"}
+  ]
+}'
+
+MIN_HAKARI="0.9.9"
+MIN_NEXTEST="0.9.89"
+# One target dir for every mode (rule: -p and --workspace runs share compiled
+# dependencies because workspace-hack pins the feature set). MSRV is the only
+# exception: it runs a different rustc.
+TARGET_DIR="target/check"
+MSRV_TARGET_DIR="target/check-msrv"
+LOG_DIR="target/check-logs"
+SKIP_STRINGS='[skip ci]
+[ci skip]
+[no ci]
+[skip actions]
+[actions skip]
+skip-checks:'
+COMMIT_RE='^(feat|fix|perf|docs|chore|ci|test|style|refactor|build|revert)(\([^)]+\))?!?: .+'
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+  C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_OFF=$'\033[0m'
+else
+  C_RED='' C_GREEN='' C_YELLOW='' C_OFF=''
+fi
+say() { printf '%s\n' "$*"; }
+usage_error() { printf '%s\n' "${C_RED}error:${C_OFF} $*" >&2; exit 2; }
+tool_error() { printf '%s\n' "${C_RED}error:${C_OFF} $*" >&2; exit 2; }
+
+usage() {
+  cat <<'EOF'
+usage: scripts/check [fast|gate] [--base <ref>] [--full] [--no-fail-fast] [--force]
+       scripts/check build [component ...] [--target <triple|all>] [--full] [--no-fail-fast]
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+MODE="fast"
+BASE_OVERRIDE=""
+FULL=0
+NO_FAIL_FAST=0
+FORCE=0
+BUILD_TARGET=""
+BUILD_COMPONENTS=()
+mode_set=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    fast|gate|build)
+      if [ "$mode_set" -eq 0 ]; then MODE="$1"; mode_set=1
+      elif [ "$MODE" = build ]; then BUILD_COMPONENTS+=("$1")
+      else usage >&2; usage_error "unexpected argument: $1"; fi ;;
+    --base) [ $# -ge 2 ] || usage_error "--base needs a ref"; BASE_OVERRIDE="$2"; shift ;;
+    --base=*) BASE_OVERRIDE="${1#--base=}" ;;
+    --full) FULL=1 ;;
+    --no-fail-fast) NO_FAIL_FAST=1 ;;
+    --force) FORCE=1 ;;
+    --target) [ $# -ge 2 ] || usage_error "--target needs a triple or 'all'"; BUILD_TARGET="$2"; shift ;;
+    --target=*) BUILD_TARGET="${1#--target=}" ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; usage_error "unknown flag: $1" ;;
+    *)
+      if [ "$MODE" = build ] && [ "$mode_set" -eq 1 ]; then BUILD_COMPONENTS+=("$1")
+      else usage >&2; usage_error "unknown argument: $1"; fi ;;
+  esac
+  shift
+done
+if [ -n "$BUILD_TARGET" ] && [ "$MODE" != build ]; then
+  usage_error "--target is only valid in build mode"
+fi
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+export CARGO_TARGET_DIR="$TARGET_DIR"
+mkdir -p "$LOG_DIR"
+START=$SECONDS
+
+# ---------------------------------------------------------------------------
+# Stage runner. Compiling stages run one at a time in the foreground; only
+# non-compiling tools (fmt, deny, hakari, git) run as background lanes beside
+# them. A foreground stage is itself run as a child and polled, so a failing
+# background lane can stop it immediately.
+# ---------------------------------------------------------------------------
+FAILURES=()   # "stage|rerun command"
+BG_NAMES=() BG_PIDS=() BG_STARTS=() BG_RERUNS=()
+FG_PID=""     # the running foreground stage, killed with the lanes on failure
+BASE_COMMIT=""
+
+kill_tree() {
+  local pid=$1 child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do kill_tree "$child"; done
+  kill "$pid" 2>/dev/null || true
+}
+
+kill_background() {
+  local pid
+  for pid in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do
+    [ "$pid" = - ] || kill_tree "$pid"
+  done
+  if [ -n "$FG_PID" ]; then kill_tree "$FG_PID"; FG_PID=""; fi
+}
+trap 'kill_background' EXIT
+trap 'kill_background; exit 130' INT TERM
+
+log_file() { printf '%s/%s-%s.log' "$LOG_DIR" "$MODE" "$1"; }
+status_file() { printf '%s/%s-%s.status' "$LOG_DIR" "$MODE" "$1"; }
+
+quote_cmd() {
+  local out="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      *[!A-Za-z0-9_./:=+@%^,-]*|'') out="$out '${arg//\'/\'\\\'\'}'" ;;
+      *) out="$out $arg" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
+final_failure_report() {
+  local entry
+  for entry in ${FAILURES[@]+"${FAILURES[@]}"}; do
+    say "${C_RED}FAIL: ${entry%%|*}. Rerun: ${entry#*|}${C_OFF}"
+  done
+}
+
+# record_failure <stage> <seconds> <rerun> — prints the captured log and the
+# [FAIL] line; under fail-fast, stops everything and exits 1.
+record_failure() {
+  local stage=$1 secs=$2 rerun=$3
+  if [ "$FULL" -eq 0 ] && [ -f "$(log_file "$stage")" ]; then cat "$(log_file "$stage")"; fi
+  say "${C_RED}[FAIL] $stage ${secs}s${C_OFF}"
+  FAILURES+=("$stage|$rerun")
+  if [ "$NO_FAIL_FAST" -eq 0 ]; then
+    kill_background
+    final_failure_report
+    exit 1
+  fi
+}
+
+# start_bg <stage> <scope> <rerun-command-string> <cmd...> — a background
+# lane. It writes its exit status to a file when done, so the foreground can
+# notice a failure without blocking on it.
+start_bg() {
+  local stage=$1 scope=$2 rerun=$3; shift 3
+  say "[run] $stage ($scope)"
+  rm -f "$(status_file "$stage")"
+  ( set +e; "$@" >"$(log_file "$stage")" 2>&1; echo "$?" >"$(status_file "$stage")" ) &
+  BG_NAMES+=("$stage"); BG_PIDS+=("$!"); BG_STARTS+=("$SECONDS"); BG_RERUNS+=("$rerun")
+}
+
+# collect_bg <index> — waits for one lane and reports it.
+collect_bg() {
+  local i=$1 status
+  [ "${BG_PIDS[$i]}" = - ] && return 0
+  wait "${BG_PIDS[$i]}" 2>/dev/null || true
+  BG_PIDS[i]=-
+  status=$(cat "$(status_file "${BG_NAMES[$i]}")" 2>/dev/null || echo 1)
+  local secs=$((SECONDS - BG_STARTS[i]))
+  if [ "$status" -eq 0 ]; then
+    [ "$FULL" -eq 1 ] && cat "$(log_file "${BG_NAMES[$i]}")"
+    say "${C_GREEN}[ok]${C_OFF} ${BG_NAMES[$i]} ${secs}s"
+  else
+    if [ "$FULL" -eq 1 ]; then cat "$(log_file "${BG_NAMES[$i]}")"; fi
+    record_failure "${BG_NAMES[$i]}" "$secs" "${BG_RERUNS[$i]}"
+  fi
+}
+
+# poll_bg — reports any lane that has already finished (non-blocking).
+poll_bg() {
+  local i
+  for i in ${BG_PIDS[@]+"${!BG_PIDS[@]}"}; do
+    [ "${BG_PIDS[$i]}" = - ] && continue
+    [ -f "$(status_file "${BG_NAMES[$i]}")" ] && collect_bg "$i"
+  done
+  return 0
+}
+
+collect_all_bg() {
+  local i
+  for i in ${BG_PIDS[@]+"${!BG_PIDS[@]}"}; do collect_bg "$i"; done
+}
+
+# run_stage <stage> <scope> <cmd...> — the foreground (compiling) lane.
+run_stage() {
+  local stage=$1 scope=$2; shift 2
+  local log rerun status=0 begin=$SECONDS pid
+  log=$(log_file "$stage")
+  rerun="$(env_prefix "$1")$(quote_cmd "$@")"
+  say "[run] $stage ($scope)"
+  if [ "$FULL" -eq 1 ]; then
+    ( set -o pipefail; "$@" 2>&1 | tee "$log" ) &
+  else
+    ( "$@" >"$log" 2>&1 ) &
+  fi
+  pid=$!
+  FG_PID=$pid
+  while kill -0 "$pid" 2>/dev/null; do
+    # A background lane failing stops this stage now, not when it ends
+    # (record_failure kills FG_PID and exits under fail-fast).
+    [ "$NO_FAIL_FAST" -eq 1 ] || poll_bg
+    sleep 0.2
+  done
+  wait "$pid" || status=$?
+  FG_PID=""
+  local secs=$((SECONDS - begin))
+  if [ "$status" -eq 0 ]; then
+    say "${C_GREEN}[ok]${C_OFF} $stage ${secs}s"
+  else
+    record_failure "$stage" "$secs" "$rerun"
+  fi
+}
+
+# Rerun lines carry the shared target dir, so a manual rerun reuses this
+# script's build output (a command that sets its own env is left as is).
+env_prefix() { [ "$1" = env ] || printf 'CARGO_TARGET_DIR=%s ' "$TARGET_DIR"; }
+
+skip_stage() { say "${C_YELLOW}[skip]${C_OFF} $1: $2"; }
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+version_ge() {  # version_ge <have> <need>: numeric x.y.z comparison
+  local have=$1 need=$2 h n i
+  for i in 1 2 3; do
+    h=$(printf '%s' "$have" | cut -d. -f"$i"); n=$(printf '%s' "$need" | cut -d. -f"$i")
+    h=${h%%[!0-9]*}; n=${n%%[!0-9]*}
+    h=${h:-0}; n=${n:-0}
+    [ "$h" -gt "$n" ] && return 0
+    [ "$h" -lt "$n" ] && return 1
+  done
+  return 0
+}
+
+require_tool() {  # require_tool <command> <install hint>
+  command -v "$1" >/dev/null 2>&1 || tool_error "$1 not found. $2"
+}
+
+require_cargo_sub() {  # require_cargo_sub <subcommand> <min version>
+  local out ver
+  out=$(cargo "$1" --version 2>/dev/null) ||
+    tool_error "cargo-$1 not found. Install cargo-$1 $2 or newer."
+  ver=$(printf '%s' "$out" | sed -n 's/^cargo-[a-z]* \([0-9][0-9.]*\).*/\1/p')
+  version_ge "$ver" "$2" || tool_error "cargo-$1 $ver is too old; $2 or newer is required."
+}
+
+HOST_TRIPLE=""
+HAKARI_PKG=""
+METADATA=""
+CHANGED=""
+
+# Triples .cargo/config.toml sets a linker for.
+linker_triples() {
+  [ -f .cargo/config.toml ] || return 0
+  awk '/^\[target\./ { t=$0; sub(/^\[target\./, "", t); sub(/\].*$/, "", t); gsub(/"/, "", t) }
+       /^[[:space:]]*linker[[:space:]]*=/ && t != "" { print t }' .cargo/config.toml
+}
+
+check_linker_tools() {  # check_linker_tools <triple...>
+  local t lt
+  for t in "$@"; do
+    for lt in $(linker_triples); do
+      if [ "$t" = "$lt" ]; then
+        require_tool clang "Install clang (and lld): .cargo/config.toml links $t with them."
+        command -v ld.lld >/dev/null 2>&1 || command -v lld >/dev/null 2>&1 ||
+          tool_error "lld not found. Install lld: .cargo/config.toml links $t with it."
+      fi
+    done
+  done
+}
+
+preflight() {
+  require_tool git "Install git."
+  require_tool jq "Install jq."
+  require_tool cargo "Install Rust with rustup."
+  require_cargo_sub hakari "$MIN_HAKARI"
+  [ "$MODE" = build ] || require_cargo_sub nextest "$MIN_NEXTEST"
+  if [ ! -f .config/hakari.toml ]; then
+    printf '%s\n' "${C_RED}error:${C_OFF} .config/hakari.toml is missing. One-time setup:" \
+      "  cargo hakari init workspace-hack" \
+      "  # set platforms in .config/hakari.toml to every shipped triple plus the host" \
+      "  cargo hakari generate" "  cargo hakari manage-deps" "  cargo hakari verify" >&2
+    exit 2
+  fi
+  HAKARI_PKG=$(sed -n 's/^hakari-package[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' .config/hakari.toml)
+  [ -n "$HAKARI_PKG" ] || tool_error ".config/hakari.toml has no hakari-package"
+  HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+  if ! METADATA=$(cargo metadata --locked --format-version 1 2>"$(log_file metadata)"); then
+    cat "$(log_file metadata)"
+    say "${C_RED}[FAIL] preflight: Cargo.lock is out of date or the workspace does not load${C_OFF}"
+    say "${C_RED}FAIL: preflight. Rerun: cargo metadata --locked --format-version 1${C_OFF}"
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Config helpers (jq)
+# ---------------------------------------------------------------------------
+cfg() { printf '%s' "$CONFIG" | jq -r "$@"; }
+
+component_exists() { [ "$(cfg --arg c "$1" '[.COMPONENTS[] | select(.name == $c)] | length')" -gt 0 ]; }
+target_method() { cfg --arg t "$1" '(.TARGETS[] | select(.triple == $t) | .method) // ""'; }
+# crates of the given components that ship on triple $1 (workspace-hack excluded)
+crates_for_triple() {
+  local triple=$1; shift
+  cfg --arg t "$triple" --arg hack "$HAKARI_PKG" --args '
+    [.COMPONENTS[] | select(($ARGS.positional | length == 0) or (.name as $n | $ARGS.positional | index($n)))
+     | select(.targets | index($t)) | .crates[]] | unique | map(select(. != $hack)) | .[]' "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Change detection
+# ---------------------------------------------------------------------------
+detect_changes() {
+  local base_ref merge_base
+  base_ref=${BASE_OVERRIDE:-$(cfg '.BASE_REF')}
+  git rev-parse --verify --quiet "$base_ref^{commit}" >/dev/null ||
+    usage_error "base ref '$base_ref' not found (fetch it, or pass --base <ref>)"
+  merge_base=$(git merge-base HEAD "$base_ref") ||
+    usage_error "no merge base between HEAD and $base_ref"
+  BASE_COMMIT=$merge_base
+  CHANGED=$( {
+    git diff --name-only "$merge_base" HEAD
+    git diff --name-only --cached
+    git diff --name-only
+    git ls-files --others --exclude-standard
+  } | sort -u | sed '/^$/d')
+}
+
+is_docs_file() {
+  case "$1" in
+    docs/*|*.md|LICENSE*|.github/ISSUE_TEMPLATE/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+non_docs_changes() {
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    is_docs_file "$f" || printf '%s\n' "$f"
+  done <<EOF
+$CHANGED
+EOF
+}
+
+# Exits 0 for a docs-only (or, in fast mode, empty) change set unless --force.
+apply_skip_rule() {
+  [ "$FORCE" -eq 1 ] && return 0
+  if [ -z "$CHANGED" ]; then
+    if [ "$MODE" = fast ]; then say "no changes: nothing to check"; exit 0; fi
+    return 0
+  fi
+  if [ -z "$(non_docs_changes)" ]; then say "docs-only: nothing to check"; exit 0; fi
+}
+
+changes_match() {  # changes_match <case-pattern-regex for grep -E>
+  printf '%s\n' "$CHANGED" | grep -Eq "$1"
+}
+
+deps_changed() { changes_match '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.config/hakari\.toml$'; }
+
+# Workspace members as "name<TAB>dir" (dir relative to the repo root, "." for root).
+members_tsv() {
+  local root
+  root=$(printf '%s' "$METADATA" | jq -r '.workspace_root')
+  printf '%s' "$METADATA" | jq -r --arg root "$root" '
+    .workspace_members as $m | .packages[] | select(.id as $id | $m | index($id))
+    | [.name, (.manifest_path | rtrimstr("/Cargo.toml") | ltrimstr($root) | ltrimstr("/") | if . == "" then "." else . end)]
+    | @tsv'
+}
+
+# Prints affected crate names (workspace-hack excluded), one per line.
+affected_crates() {
+  local all=0 f members seeds="" best best_len name dir len
+  members=$(members_tsv)
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      Cargo.lock|Cargo.toml|rust-toolchain*|.cargo/*|.config/nextest.toml|.config/hakari.toml|deny.toml|scripts/check) all=1 ;;
+    esac
+    [ "$f" = "$(member_dir "$HAKARI_PKG" "$members")/Cargo.toml" ] && all=1
+    best="" best_len=-1
+    while IFS="$(printf '\t')" read -r name dir; do
+      if [ "$dir" = "." ]; then len=0
+      else case "$f" in "$dir"/*) len=${#dir} ;; *) continue ;; esac
+      fi
+      if [ "$len" -gt "$best_len" ]; then best=$name; best_len=$len; fi
+    done <<EOF
+$members
+EOF
+    # A changed file inside no member can't be attributed: check everything.
+    if [ -z "$best" ]; then all=1; else seeds="$seeds$best"$'\n'; fi
+  done <<EOF
+$(non_docs_changes)
+EOF
+  if [ "$all" -eq 1 ]; then
+    printf '%s\n' "$members" | cut -f1 | { grep -vx "$HAKARI_PKG" || true; } | sort -u
+    return
+  fi
+  reverse_closure "$(printf '%s' "$seeds" | sort -u)" | grep -vx "$HAKARI_PKG" || true
+}
+
+member_dir() {  # member_dir <name> <members_tsv>
+  printf '%s\n' "$2" | awk -F'\t' -v n="$1" '$1 == n { print $2 }'
+}
+
+# Seeds plus every workspace member that depends on them, transitively,
+# through normal, build, and dev edges.
+reverse_closure() {
+  printf '%s' "$METADATA" | jq -r --arg seeds "$1" '
+    .workspace_members as $m
+    | (.packages | map({key: .id, value: .name}) | from_entries) as $names
+    | [.resolve.nodes[] | select(.id as $id | $m | index($id))
+       | {from: $names[.id], to: [.deps[] | select(.pkg as $p | $m | index($p)) | $names[.pkg]]}] as $edges
+    | ($seeds | split("\n") | map(select(. != ""))) as $start
+    | def grow: . as $set
+        | ([$edges[] | select(any(.to[]; . as $t | $set | index($t))) | .from] + $set | unique) as $next
+        | if ($next | length) == ($set | length) then $set else ($next | grow) end;
+      $start | unique | grow | .[]'
+}
+
+# ---------------------------------------------------------------------------
+# Lanes
+# ---------------------------------------------------------------------------
+hakari_lane() {
+  if ! cargo hakari generate --diff; then
+    echo "Fix: cargo hakari generate && cargo hakari manage-deps"; return 1
+  fi
+  if ! cargo hakari manage-deps --dry-run; then
+    echo "Fix: cargo hakari generate && cargo hakari manage-deps"; return 1
+  fi
+}
+
+commit_lint() {
+  local sha subject body bad=0 s
+  for sha in $(git rev-list --reverse "$BASE_COMMIT..HEAD"); do
+    subject=$(git log -1 --format=%s "$sha")
+    body=$(git log -1 --format=%B "$sha")
+    if ! printf '%s\n' "$subject" | grep -Eq "$COMMIT_RE"; then
+      echo "$(git rev-parse --short "$sha") $subject"
+      echo "  subject must match: $COMMIT_RE"
+      bad=1
+    fi
+    while IFS= read -r s; do
+      if printf '%s\n' "$body" | grep -qiF -- "$s"; then
+        echo "$(git rev-parse --short "$sha") $subject"
+        echo "  contains '$s' — GitHub would silently drop CI for this commit"
+        bad=1
+      fi
+    done <<EOF
+$SKIP_STRINGS
+EOF
+  done
+  return "$bad"
+}
+
+p_flags() {  # p_flags <crate...> -> "-p a -p b" words
+  local c
+  for c in "$@"; do printf -- '-p\n%s\n' "$c"; done
+}
+
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
+run_fast() {
+  preflight
+  check_linker_tools "$HOST_TRIPLE"
+  detect_changes
+  apply_skip_rule
+  local crates=() line pflags=() n short=()
+  while IFS= read -r line; do [ -n "$line" ] && crates+=("$line"); done <<EOF
+$(affected_crates)
+EOF
+  n=${#crates[@]}
+  if [ "$n" -eq 0 ]; then say "no affected crates: nothing to check"; exit 0; fi
+  say "affected: ${crates[*]}"
+  while IFS= read -r line; do pflags+=("$line"); done <<EOF
+$(p_flags "${crates[@]}")
+EOF
+  [ "$FULL" -eq 1 ] || short=(--message-format short)
+
+  start_bg fmt "$n crates" "cargo fmt ${pflags[*]} --check" cargo fmt "${pflags[@]}" --check
+  if deps_changed; then
+    start_bg hakari "workspace" "cargo hakari generate --diff && cargo hakari manage-deps --dry-run" hakari_lane
+  fi
+  local nff=()
+  [ "$NO_FAIL_FAST" -eq 1 ] && nff=(--no-fail-fast)
+  run_stage clippy "$n crates" cargo clippy "${pflags[@]}" --all-targets --locked ${short[@]+"${short[@]}"} -- -D warnings
+  run_stage test "$n crates" cargo nextest run "${pflags[@]}" --locked --profile fast --no-tests=pass ${nff[@]+"${nff[@]}"}
+  collect_all_bg
+  finish "${C_GREEN}PASS fast in $((SECONDS - START))s.${C_OFF} Not verified: unaffected crates, doc tests, cross-target checks, MSRV, commit messages. Run scripts/check gate before pushing."
+}
+
+run_gate() {
+  preflight
+  # shellcheck disable=SC2046 # one word per triple
+  check_linker_tools "$HOST_TRIPLE" $(cfg '.TARGETS[].triple')
+  detect_changes
+  apply_skip_rule
+  local feats=() nff=() not_verified=""
+  [ "$(cfg '.FEATURES')" = all ] && feats=(--all-features)
+  [ "$NO_FAIL_FAST" -eq 1 ] && nff=(--no-fail-fast)
+
+  start_bg fmt "workspace" "cargo fmt --all --check" cargo fmt --all --check
+  start_bg hakari "workspace" "cargo hakari generate --diff && cargo hakari manage-deps --dry-run" hakari_lane
+  start_bg commit-lint "$(git rev-list --count "$BASE_COMMIT..HEAD") commits" "git log --format='%h %s' $BASE_COMMIT..HEAD" commit_lint
+  if deps_changed; then
+    start_bg deny "workspace" "cargo deny --locked check" cargo deny --locked check
+  fi
+
+  run_stage clippy "workspace" cargo clippy --workspace --all-targets --locked ${feats[@]+"${feats[@]}"} -- -D warnings
+  run_stage test "workspace" cargo nextest run --workspace --locked --profile gate ${feats[@]+"${feats[@]}"} ${nff[@]+"${nff[@]}"}
+  run_stage doctest "workspace" cargo test --doc --workspace --locked ${feats[@]+"${feats[@]}"}
+
+  # Cross-target checks, one at a time (one cargo already uses every core).
+  local triple crates=() line pflags=()
+  for triple in $(cfg '.TARGETS[].triple'); do
+    if [ "$triple" = "$HOST_TRIPLE" ]; then
+      skip_stage "check-$triple" "host triple — the clippy stage already checked it"
+      continue
+    fi
+    case "$triple" in
+      *-apple-*)
+        case "$HOST_TRIPLE" in
+          *-apple-*) ;;
+          *)
+            # C dependencies (libgit2's Secure Transport backend) need the
+            # macOS SDK, which exists only on macOS hosts. CI checks this
+            # target on a macOS runner.
+            skip_stage "check-$triple" "needs a macOS host (Apple SDK headers); CI covers it"
+            not_verified="$not_verified $triple"
+            continue ;;
+        esac ;;
+    esac
+    if ! rustup target list --installed 2>/dev/null | grep -qx "$triple"; then
+      say "${C_RED}[FAIL] check-$triple 0s${C_OFF}"
+      FAILURES+=("check-$triple|rustup target add $triple")
+      [ "$NO_FAIL_FAST" -eq 1 ] || { kill_background; final_failure_report; exit 1; }
+      continue
+    fi
+    crates=(); pflags=()
+    while IFS= read -r line; do [ -n "$line" ] && crates+=("$line"); done <<EOF
+$(crates_for_triple "$triple")
+EOF
+    [ ${#crates[@]} -gt 0 ] || continue
+    while IFS= read -r line; do pflags+=("$line"); done <<EOF
+$(p_flags "${crates[@]}")
+EOF
+    if [ "$(target_method "$triple")" = zigbuild ]; then
+      require_cargo_sub zigbuild 0.0.0
+      run_stage "check-$triple" "${#crates[@]} crates" cargo-zigbuild check --target "$triple" --locked "${pflags[@]}"
+    else
+      run_stage "check-$triple" "${#crates[@]} crates" cargo check --target "$triple" --locked "${pflags[@]}"
+    fi
+  done
+
+  # MSRV last: the costliest, and a separate target dir (different rustc).
+  local msrv
+  msrv=$(printf '%s' "$METADATA" | jq -r '
+    .workspace_members as $m | [.packages[] | select(.id as $id | $m | index($id)) | .rust_version // empty]
+    | map(split(".") | map(tonumber)) | max | if . == null then "" else map(tostring) | join(".") end')
+  if [ -z "$msrv" ]; then
+    say "MSRV: not configured"
+  elif ! rustup toolchain list 2>/dev/null | grep -q "^${msrv}[-.]"; then
+    say "${C_RED}[FAIL] msrv 0s${C_OFF}"
+    FAILURES+=("msrv|rustup toolchain install $msrv --profile minimal")
+    [ "$NO_FAIL_FAST" -eq 1 ] || { kill_background; final_failure_report; exit 1; }
+  else
+    run_stage msrv "workspace, rust $msrv" env CARGO_TARGET_DIR="$MSRV_TARGET_DIR" cargo "+$msrv" check --workspace --locked
+  fi
+
+  collect_all_bg
+  if [ -n "$not_verified" ]; then
+    finish "${C_GREEN}PASS gate in $((SECONDS - START))s.${C_OFF} Not verified on this host:${not_verified} (cross-target check; CI covers it)."
+  else
+    finish "${C_GREEN}PASS gate in $((SECONDS - START))s.${C_OFF}"
+  fi
+}
+
+run_build() {
+  preflight
+  local comp triples=() triple line
+  for comp in ${BUILD_COMPONENTS[@]+"${BUILD_COMPONENTS[@]}"}; do
+    component_exists "$comp" || usage_error "unknown component: $comp (known: $(cfg '[.COMPONENTS[].name] | join(", ")'))"
+  done
+  [ ${#BUILD_COMPONENTS[@]} -gt 0 ] || while IFS= read -r line; do BUILD_COMPONENTS+=("$line"); done <<EOF
+$(cfg '.COMPONENTS[].name')
+EOF
+  case "$BUILD_TARGET" in
+    "") triples=("$HOST_TRIPLE") ;;
+    all)
+      while IFS= read -r line; do [ -n "$line" ] && triples+=("$line"); done <<EOF
+$(cfg --args '[.COMPONENTS[] | select(.name as $n | $ARGS.positional | index($n)) | .targets[]] | unique | .[]' "${BUILD_COMPONENTS[@]}")
+EOF
+      ;;
+    *) triples=("$BUILD_TARGET") ;;
+  esac
+  check_linker_tools "${triples[@]}"
+
+  local crates=() pflags=() method out_dir bin c stage artifacts=()
+  for triple in "${triples[@]}"; do
+    crates=(); pflags=()
+    while IFS= read -r line; do [ -n "$line" ] && crates+=("$line"); done <<EOF
+$(crates_for_triple "$triple" "${BUILD_COMPONENTS[@]}")
+EOF
+    if [ ${#crates[@]} -eq 0 ]; then
+      usage_error "no selected component ships on $triple"
+    fi
+    while IFS= read -r line; do pflags+=("$line"); done <<EOF
+$(p_flags "${crates[@]}")
+EOF
+    stage="build-$triple"
+    method=$(target_method "$triple")
+    if [ "$triple" = "$HOST_TRIPLE" ] && [ "$method" != zigbuild ]; then
+      run_stage "$stage" "${#crates[@]} crates" cargo build --release --locked "${pflags[@]}"
+      out_dir="$TARGET_DIR/release"
+    else
+      if [ "$method" = zigbuild ]; then
+        require_cargo_sub zigbuild 0.0.0
+        run_stage "$stage" "${#crates[@]} crates" cargo zigbuild --release --locked --target "$triple" "${pflags[@]}"
+      else
+        case "$triple" in
+          *-apple-*) case "$HOST_TRIPLE" in *-apple-*) ;; *)
+            say "${C_RED}[FAIL] $stage 0s${C_OFF}: building $triple needs a macOS host (Apple SDK)"
+            FAILURES+=("$stage|scripts/check build --target $triple   # on a macOS host")
+            [ "$NO_FAIL_FAST" -eq 1 ] || { final_failure_report; exit 1; }
+            continue ;; esac ;;
+        esac
+        run_stage "$stage" "${#crates[@]} crates" cargo build --release --locked --target "$triple" "${pflags[@]}"
+      fi
+      out_dir="$TARGET_DIR/$triple/release"
+    fi
+    # Copy each selected component's binaries to dist/<component>/<triple>/.
+    for comp in "${BUILD_COMPONENTS[@]}"; do
+      [ "$(cfg --arg c "$comp" --arg t "$triple" '[.COMPONENTS[] | select(.name == $c) | .targets | index($t)] | .[0] != null')" = true ] || continue
+      local dest="dist/$comp/$triple" bins=()
+      mkdir -p "$dest"
+      for c in $(cfg --arg c "$comp" '.COMPONENTS[] | select(.name == $c) | .crates[]'); do
+        for bin in $(printf '%s' "$METADATA" | jq -r --arg c "$c" '.packages[] | select(.name == $c) | .targets[] | select(.kind | index("bin")) | .name'); do
+          cp "$out_dir/$bin" "$dest/$bin"
+          bins+=("$bin")
+        done
+      done
+      [ ${#bins[@]} -gt 0 ] || continue
+      ( cd "$dest" && shasum -a 256 "${bins[@]}" > SHA256SUMS )
+      for bin in "${bins[@]}"; do artifacts+=("$dest/$bin"); done
+    done
+  done
+  local a
+  for a in ${artifacts[@]+"${artifacts[@]}"}; do
+    printf '%s  %s bytes\n' "$a" "$(wc -c < "$a" | tr -d ' ')"
+  done
+  finish "${C_GREEN}PASS build in $((SECONDS - START))s.${C_OFF} Build mode does not run tests."
+}
+
+finish() {
+  if [ ${#FAILURES[@]} -gt 0 ]; then
+    final_failure_report
+    exit 1
+  fi
+  say "$1"
+}
+
+case "$MODE" in
+  fast) run_fast ;;
+  gate) run_gate ;;
+  build) run_build ;;
+esac

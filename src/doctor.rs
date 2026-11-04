@@ -1,10 +1,9 @@
 use std::env;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
 
 use crate::config::{self, Config};
 use crate::selfupdate;
@@ -86,49 +85,22 @@ pub fn run_doctor(config: &Config) -> Vec<(String, Result<String>)> {
     checks
 }
 
-/// Raw fields read directly off the install receipt JSON — not through
-/// `axoupdater::AxoUpdater::load_receipt()`, which only reports whether a
-/// receipt loaded, never its contents (`InstallReceipt`/`ReceiptProvider`
-/// live in axoupdater's private `receipt` module, confirmed against its
-/// 0.10.2 source — not part of its public API).
-#[derive(Deserialize)]
-struct ReceiptSummary {
-    version: String,
-    provider: ReceiptProvider,
-}
-
-#[derive(Deserialize)]
-struct ReceiptProvider {
-    source: String,
-    version: String,
-}
-
-fn receipt_path() -> Result<PathBuf> {
-    Ok(config::home_dir()?.join(".config/cw/cw-receipt.json"))
-}
-
-/// Which install method put this binary on disk — whether there's an
-/// install receipt to self-update from at all. Without one a binary can sit
-/// releases behind with no visible symptom.
+/// Which kind of binary this is — whether it can self-update at all. A
+/// release build (made by the CI pipeline, installed by `install/cw.sh` or
+/// updated by `u`) can; a from-source build can sit releases behind with no
+/// visible symptom, so doctor says so.
 fn check_install_source() -> Result<String> {
-    let path = receipt_path()?;
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Ok(
-            "from-source build (cargo install --path .) — no install receipt, self-update \
-             unavailable"
-                .to_string(),
-        );
-    };
-    match serde_json::from_slice::<ReceiptSummary>(&bytes) {
-        Ok(r) => Ok(format!(
-            "installed via {} {} (receipt records version {})",
-            r.provider.source, r.provider.version, r.version
-        )),
-        Err(_) => Ok(format!(
-            "install receipt at {} is present but unreadable",
-            path.display()
-        )),
-    }
+    Ok(if selfupdate::is_release_build() {
+        format!(
+            "release build {} for {} — self-update with 'u' in the dashboard",
+            selfupdate::CURRENT_VERSION,
+            env!("CW_TARGET")
+        )
+    } else {
+        "from-source build — self-update unavailable; install releases with \
+         `curl -fsSL https://raw.githubusercontent.com/imabee0/cw/main/install/cw.sh | bash`"
+            .to_string()
+    })
 }
 
 /// Current vs. latest-known version — reuses `selfupdate.rs`'s cache
@@ -139,7 +111,7 @@ fn check_install_source() -> Result<String> {
 /// value `run_doctor` reads from the cache file once, shared with
 /// `stale_binary_message` below, rather than each check re-reading it.
 fn update_status_message(pending_version: Option<&str>) -> String {
-    let current = env!("CARGO_PKG_VERSION");
+    let current = env!("CW_VERSION");
     match pending_version {
         Some(latest) => format!("current {current}, {latest} available"),
         None => format!(
@@ -154,9 +126,9 @@ fn update_status_message(pending_version: Option<&str>) -> String {
 /// "update status" line above.
 fn stale_binary_message(latest: &str) -> String {
     format!(
-        "cw {latest} is available (current: {}) — run cw and press 'u', or re-run the \
-         installer script",
-        env!("CARGO_PKG_VERSION")
+        "cw {latest} is available (current: {}) — run cw and press 'u', or re-run \
+         install/cw.sh",
+        env!("CW_VERSION")
     )
 }
 

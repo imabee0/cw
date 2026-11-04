@@ -1,0 +1,20 @@
+# Shared by scripts/check and .github/workflows/ci.yml — profile settings
+# live here, never in RUSTFLAGS or workflow env.
+
+[profile.dev]
+# Enough debug info for line numbers in backtraces, at a fraction of full
+# debug info's compile and link cost.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# No debug info for dependencies: nobody steps through them, and it is the
+# bulk of debug-build time and target/ size.
+debug = false
+
+# Linker settings: none. The only Linux target shipped is
+# x86_64-unknown-linux-gnu, which links with rust-lld from Rust 1.90 on
+# (rust-toolchain.toml pins 1.98), and aarch64-apple-darwin is built natively
+# on macOS. A future cross-built Linux triple with method "native" gets
+#   [target.<triple>]
+#   linker = "clang"
+#   rustflags = ["-C", "link-arg=--target=<triple>", "-C", "link-arg=-fuse-ld=lld"]

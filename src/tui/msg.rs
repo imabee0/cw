@@ -34,7 +34,7 @@ pub enum Msg {
     WorkRefreshed(PathBuf, Result<WorkState, String>),
     /// Background self-update check result (`selfupdate::spawn_check`) —
     /// `Some(version)` when a newer release is pending, `None` when up to
-    /// date. Never sent at all on a failed check (no install receipt,
+    /// date. Never sent at all on a failed check (a from-source build,
     /// offline, rate-limited — see `selfupdate.rs`), so this simply never
     /// arrives on those runs, same as if the check hadn't happened.
     UpdateChecked(Option<String>),

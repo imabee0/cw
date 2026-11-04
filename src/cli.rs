@@ -7,7 +7,7 @@ use clap_complete::Shell;
 /// branch into an on-demand store, and launch an agent CLI in a fresh git
 /// worktree. Finishing a repo's last session deletes the store.
 #[derive(Debug, Parser)]
-#[command(name = "cw", version, about)]
+#[command(name = "cw", version = env!("CW_VERSION"), about)]
 pub struct Cli {
     /// Worktree slug — root command only. Omitted: auto-generate a timestamp
     /// slug, or offer to resume an existing worktree of the picked repo.

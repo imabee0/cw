@@ -1,0 +1,14 @@
+# Requires cargo-nextest 0.9.89 or newer. Shared by scripts/check and CI.
+
+[profile.fast]
+# scripts/check (fast mode): stop at the first failure, right away.
+fail-fast = { max-fail = 1, terminate = "immediate" }
+failure-output = "immediate-final"
+
+[profile.gate]
+# scripts/check gate and CI.
+fail-fast = { max-fail = 1 }
+failure-output = "immediate-final"
+# A test still running after 5 periods (5 minutes) is killed. Raise this if a
+# legitimate test needs longer.
+slow-timeout = { period = "60s", terminate-after = 5 }

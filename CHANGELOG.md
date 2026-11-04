@@ -1,11 +1,9 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+This file covers releases up to 0.2.0. From 0.2.1 on, each release's notes are generated from its conventional commits and published with it as a [GitHub Release](https://github.com/imabee0/cw/releases) tagged `cw-vX.Y.Z`; this file is no longer updated.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
 
 ## [0.2.0](https://github.com/imabee0/cw/compare/v0.1.16...v0.2.0) - 2026-11-04
 

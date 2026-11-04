@@ -169,7 +169,7 @@ fn draw_top_line(frame: &mut Frame, model: &DashboardModel, area: Rect) {
             Action::ApplyUpdate,
         ));
     }
-    right.push(dim(format!("cw {} ", env!("CARGO_PKG_VERSION"))).into());
+    right.push(dim(format!("cw {} ", env!("CW_VERSION"))).into());
 
     let right_width = segs_width(&right).min(area.width);
     let cols = Layout::default()
