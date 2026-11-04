@@ -32,7 +32,11 @@ pub struct AgentConfig {
 }
 
 fn default_root() -> PathBuf {
-    PathBuf::from("~/repos")
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        .join("cw/sessions")
 }
 
 fn default_ttl() -> u64 {
@@ -183,9 +187,40 @@ fn expand_var(s: &str) -> Result<String> {
     })
 }
 
+/// Apply only to the two supported agent entries; preserve custom arguments.
+pub fn enable_agent_permission_bypass(config: &mut Config) {
+    for (name, flag) in [
+        ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+        ("claude", "--dangerously-skip-permissions"),
+    ] {
+        if let Some(agent) = config.agents.get_mut(name) {
+            if !agent.args.iter().any(|arg| arg == flag) {
+                agent.args.push(flag.into());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_bypass_is_idempotent_and_scoped() {
+        let mut config = Config::default();
+        let shell = config.agents["shell"].args.clone();
+        enable_agent_permission_bypass(&mut config);
+        enable_agent_permission_bypass(&mut config);
+        assert_eq!(
+            config.agents["codex"].args,
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert_eq!(
+            config.agents["claude"].args,
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(config.agents["shell"].args, shell);
+    }
 
     #[test]
     fn resolve_agent_missing_name() {

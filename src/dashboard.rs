@@ -165,10 +165,11 @@ fn run_suspend_chain(screen: &mut DashboardScreen, mut req: SuspendReq) -> Resul
                 // A launch that couldn't even start (binary not on PATH) is
                 // reported in the dashboard and the session continues —
                 // never a hard exit that tears the whole TUI down.
-                if let Err(e) = result {
-                    screen
+                match result {
+                    Ok(note) => screen.model.status = note,
+                    Err(e) => screen
                         .model
-                        .report_launch_failure(&agent_cfg.cmd, format!("{e:#}"));
+                        .report_launch_failure(&agent_cfg.cmd, format!("{e:#}")),
                 }
                 return Ok(false);
             }
@@ -337,7 +338,7 @@ fn build_screen(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result
                 vec![repo]
             } else {
                 repo_rx = Some(spawn_repo_thread(cli, config)?);
-                load_cached_repos()?
+                load_cached_repos(&cli.org)?
             };
             let mut m = DashboardModel::new_browse(
                 initial,
@@ -416,8 +417,8 @@ fn build_screen(entry: Entry, cli: &Cli, config: &Config, root: &Path) -> Result
     Ok(DashboardScreen {
         model,
         no_pull: cli.no_pull,
-        repo_rx,
         worktrees_rx: Some(spawn_worktrees_thread(root.to_path_buf())),
+        repo_rx,
         clone_rx: None,
         update_rx,
     })
@@ -438,18 +439,19 @@ fn spawn_repo_thread(cli: &Cli, config: &Config) -> Result<mpsc::Receiver<RepoLo
     thread::spawn(move || {
         let warnings = std::cell::RefCell::new(Vec::new());
         let result = cache::refresh_if_needed(&cache_path, ttl, force_refresh, || {
-            let discovered = github::discover_repos(&org_filter)?;
+            let discovered = github::discover_repos(&[])?;
             *warnings.borrow_mut() = discovered.warnings;
             Ok(discovered.repos)
         });
 
         let load = match result {
             Ok((repos, outcome)) => {
-                let repos = cache::RepoCache {
+                let mut repos = cache::RepoCache {
                     repos,
                     fetched_at: chrono::Utc::now(),
                 }
                 .sorted_repos();
+                filter_repos(&mut repos, &org_filter);
                 let stale_warning = match outcome {
                     cache::RefreshOutcome::Stale { warning } => Some(warning),
                     cache::RefreshOutcome::Cached | cache::RefreshOutcome::Fresh => None,
@@ -475,11 +477,19 @@ fn spawn_repo_thread(cli: &Cli, config: &Config) -> Result<mpsc::Receiver<RepoLo
     Ok(rx)
 }
 
-fn load_cached_repos() -> Result<Vec<github::Repo>> {
+fn filter_repos(repos: &mut Vec<github::Repo>, orgs: &[String]) {
+    if !orgs.is_empty() {
+        repos.retain(|repo| orgs.iter().any(|org| org.eq_ignore_ascii_case(&repo.owner)));
+    }
+}
+
+fn load_cached_repos(orgs: &[String]) -> Result<Vec<github::Repo>> {
     let cache_path = config::cache_path()?;
-    Ok(cache::load(&cache_path)?
+    let mut repos = cache::load(&cache_path)?
         .map(|c| c.sorted_repos())
-        .unwrap_or_default())
+        .unwrap_or_default();
+    filter_repos(&mut repos, orgs);
+    Ok(repos)
 }
 
 /// Spawned at dashboard construction regardless of `Entry`, and again by
@@ -497,7 +507,7 @@ fn spawn_worktrees_thread(root: PathBuf) -> mpsc::Receiver<Result<WorktreesLoad,
             .map(|entries| {
                 let mut work = HashMap::new();
                 for e in &entries {
-                    let state = match gitstatus::work_state(&e.path, &root.join(&e.repo)) {
+                    let state = match gitstatus::work_state(&e.path, &e.repo_root()) {
                         Ok(s) => Some(s),
                         Err(err) => {
                             tracing::warn!(

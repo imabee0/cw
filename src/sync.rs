@@ -41,21 +41,6 @@ pub enum PullOutcome {
     Skipped,
 }
 
-/// git2 credentials callback for the *pull* path only — `gh repo clone`
-/// authenticates itself via its own subprocess (§5b), so this is never
-/// consulted during a fresh clone. Reuses `gh`'s own credential helper,
-/// already wired into `~/.gitconfig` as `!gh auth git-credential` for
-/// `https://github.com`; cw never stores or otherwise handles a token
-/// itself.
-fn credentials_callback(
-    url: &str,
-    username_from_url: Option<&str>,
-    _allowed_types: git2::CredentialType,
-) -> std::result::Result<git2::Cred, git2::Error> {
-    let cfg = git2::Config::open_default()?;
-    git2::Cred::credential_helper(&cfg, url, username_from_url)
-}
-
 /// Which stdio a `gh repo clone` subprocess should use — `Inherit` for the
 /// plain-terminal fast path (unchanged today's behavior: the user sees raw
 /// `gh` output directly), `Capture` for the dashboard's background clone
@@ -102,6 +87,13 @@ pub fn clone_or_pull_ex(
         if !pull {
             return Ok((repo, PullOutcome::Skipped));
         }
+        if repo.is_bare() {
+            fetch_default(&repo)?;
+            return Ok((repo, PullOutcome::UpToDate));
+        }
+        if repo.head_detached()? {
+            bail!("{owner}/{name} has a detached HEAD; check out a branch before updating, or use --no-pull to explicitly use local code");
+        }
         let branch = {
             let head = repo.head().with_context(|| {
                 format!(
@@ -114,6 +106,11 @@ pub fn clone_or_pull_ex(
                 .to_string()
         };
         let outcome = fetch_and_ff(&repo, &branch)?;
+        match outcome {
+            PullOutcome::Diverged => bail!("{owner}/{name} has diverged from origin; reconcile the branch before continuing, or use --no-pull to explicitly use local code"),
+            PullOutcome::DirtyLocalChanges => bail!("{owner}/{name} has local changes preventing an update; commit or stash them before continuing, or use --no-pull to explicitly use local code"),
+            _ => {}
+        }
         return Ok((repo, outcome));
     }
 
@@ -122,9 +119,54 @@ pub fn clone_or_pull_ex(
         .context("resolved local path has no parent directory")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
+    // Clone into a private staging dir, then rename it into place: a failed
+    // or interrupted clone never leaves a half-made store where the `.git`
+    // check above would mistake it for a real one, and two `cw`s cloning the
+    // same repo at once can't trample each other — the loser of the rename
+    // discards its copy and uses the winner's. Moving a bare repo is safe
+    // here because it has no worktrees yet.
+    let staging = parent.join(format!(".{name}.cw-clone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging); // leftover from a killed run with a reused pid
+    let result = clone_managed_store(&staging, owner, name, stdio).and_then(|repo| {
+        drop(repo);
+        // An empty dir (nothing else ever creates one here) would block
+        // the rename; `remove_dir` refuses anything non-empty.
+        let _ = std::fs::remove_dir(&path);
+        match std::fs::rename(&staging, &path) {
+            Ok(()) => Ok(PullOutcome::Cloned),
+            Err(_) if path.join(".git").exists() => Ok(PullOutcome::UpToDate),
+            Err(e) => Err(anyhow::Error::new(e)
+                .context(format!("moving fresh clone into {}", path.display()))),
+        }
+    });
+    let _ = std::fs::remove_dir_all(&staging);
+    let outcome = result?;
+    let repo = git2::Repository::open(&path)
+        .with_context(|| format!("opening freshly cloned repo at {}", path.display()))?;
+    Ok((repo, outcome))
+}
+
+/// `gh repo clone -- --bare` into `<path>/.git`: a git store with no main
+/// checkout at all, so nothing but history lives on disk until a session
+/// worktree is created, and `cw finish` on the last session deletes it.
+fn clone_managed_store(
+    path: &Path,
+    owner: &str,
+    name: &str,
+    stdio: CloneStdio,
+) -> Result<git2::Repository> {
     let slug = format!("{owner}/{name}");
     let mut cmd = Command::new("gh");
-    cmd.args(["repo", "clone", &slug, &path.to_string_lossy()]);
+    std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    let git_path = path.join(".git");
+    cmd.args([
+        "repo",
+        "clone",
+        &slug,
+        &git_path.to_string_lossy(),
+        "--",
+        "--bare",
+    ]);
 
     match stdio {
         CloneStdio::Inherit => {
@@ -163,9 +205,80 @@ pub fn clone_or_pull_ex(
         }
     }
 
-    let repo = git2::Repository::open(&path)
+    let repo = git2::Repository::open(path)
         .with_context(|| format!("opening freshly cloned repo at {}", path.display()))?;
-    Ok((repo, PullOutcome::Cloned))
+    configure_managed_store(&repo)?;
+    Ok(repo)
+}
+
+/// Turns a fresh `clone --bare` into a store worktrees can work against
+/// like a normal clone:
+/// - `cw.managed = true` marks it as cw's to delete once the last session
+///   finishes (a user's own bare repo is never touched);
+/// - a standard `origin` fetch refspec, which `--bare` omits, so `git
+///   fetch`/`pull`/`status` inside a worktree see `origin/*` as usual;
+/// - `origin/HEAD` pointing at the default branch;
+/// - the `refs/heads/*` snapshot `--bare` copies from the remote is
+///   dropped — those would silently go stale; sessions branch from the
+///   fetched `refs/cw/default`, and `git switch <branch>` inside a worktree
+///   still creates a tracking branch from `origin/<branch>`.
+fn configure_managed_store(repo: &git2::Repository) -> Result<()> {
+    let default_branch = repo
+        .find_reference("HEAD")
+        .ok()
+        .and_then(|h| h.symbolic_target().ok().flatten().map(str::to_owned))
+        .and_then(|t| t.strip_prefix("refs/heads/").map(str::to_owned));
+    let mut config = repo.config()?;
+    config.set_bool("cw.managed", true)?;
+    config.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")?;
+    // Session branches have no upstream yet; let a plain `git push` from an
+    // agent create `origin/worktree-<slug>` instead of erroring.
+    config.set_bool("push.autoSetupRemote", true)?;
+    fetch_default(repo)?;
+    if let Some(branch) = default_branch {
+        let target = format!("refs/remotes/origin/{branch}");
+        if repo.find_reference(&target).is_ok() {
+            repo.reference_symbolic("refs/remotes/origin/HEAD", &target, true, "cw: origin/HEAD")?;
+        }
+    }
+    let stale: Vec<String> = repo
+        .references_glob("refs/heads/*")?
+        .flatten()
+        .filter_map(|r| r.name().ok().map(str::to_owned))
+        .collect();
+    for name in stale {
+        repo.find_reference(&name)?.delete()?;
+    }
+    Ok(())
+}
+
+/// Fetch remote HEAD directly, so default-branch renames are respected.
+fn fetch_default(repo: &git2::Repository) -> Result<()> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(repo.path())
+        .args([
+            // No `--prune`: a session's `origin/worktree-<slug>` must outlive
+            // the remote branch (deleted on PR merge), or its already-pushed
+            // commits would read as unpushed and block `cw finish`.
+            "fetch",
+            "origin",
+            "+HEAD:refs/cw/default",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .output()
+        .context("fetching remote default branch")?;
+    if !output.status.success() {
+        bail!(
+            "fetching remote default branch failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    repo.set_head("refs/cw/default")?;
+    Ok(())
 }
 
 /// Fetches `origin` and fast-forwards `branch` onto it — dirty-tree guard
@@ -178,18 +291,31 @@ pub fn clone_or_pull_ex(
 /// commit doesn't touch (force-checkout resets the whole tree, not just
 /// the diff).
 pub fn fetch_and_ff(repo: &git2::Repository, branch: &str) -> Result<PullOutcome> {
-    let mut remote = repo
-        .find_remote("origin")
-        .context("repo has no 'origin' remote")?;
-
-    let mut callbacks = git2::RemoteCallbacks::new();
-    callbacks.credentials(credentials_callback);
-    let mut fetch_opts = git2::FetchOptions::new();
-    fetch_opts.remote_callbacks(callbacks);
-
-    remote
-        .fetch(&[branch], Some(&mut fetch_opts), None)
-        .with_context(|| format!("fetching '{branch}' from origin"))?;
+    // Use Git's configured transport and credential helpers (including SSH),
+    // consistently with gh's clone subprocess. Never prompt inside the TUI.
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(
+            repo.workdir()
+                .context("repository has no working directory")?,
+        )
+        .args([
+            "fetch",
+            "--no-tags",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .output()
+        .context("running git fetch")?;
+    if !output.status.success() {
+        bail!(
+            "fetching {branch} from origin failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
 
     let fetch_head = repo
         .find_reference("FETCH_HEAD")
@@ -215,9 +341,15 @@ pub fn fetch_and_ff(repo: &git2::Repository, branch: &str) -> Result<PullOutcome
     let mut reference = repo
         .find_reference(&refname)
         .with_context(|| format!("local branch ref '{refname}' not found"))?;
+    // Check out safely before moving the branch: an obstruction must not
+    // leave HEAD advanced with the old working tree still on disk.
+    let target = repo.find_object(fetch_commit.id(), None)?;
+    repo.checkout_tree(
+        &target,
+        Some(git2::build::CheckoutBuilder::default().safe()),
+    )?;
     reference.set_target(fetch_commit.id(), "cw: fast-forward pull")?;
     repo.set_head(&refname)?;
-    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
 
     Ok(PullOutcome::FastForwarded)
 }
@@ -225,6 +357,132 @@ pub fn fetch_and_ff(repo: &git2::Repository, branch: &str) -> Result<PullOutcome
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn rev(repo: &git2::Repository, spec: &str) -> git2::Oid {
+        repo.revparse_single(spec)
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+    }
+
+    /// The full managed-store lifecycle against a local "remote", minus the
+    /// `gh` subprocess: bare clone → configure → session worktree that
+    /// behaves like a normal clone → a later fetch moves new sessions onto
+    /// the latest default branch.
+    #[test]
+    fn managed_store_tracks_remote_default_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "-b", "trunk"]);
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&origin, &["branch", "feature"]);
+
+        let store = tmp.path().join("store/acme/proj");
+        std::fs::create_dir_all(&store).unwrap();
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &origin.to_string_lossy(),
+                &store.join(".git").to_string_lossy(),
+            ],
+        );
+        let repo = git2::Repository::open(&store).unwrap();
+        configure_managed_store(&repo).unwrap();
+
+        assert!(repo.config().unwrap().get_bool("cw.managed").unwrap());
+        assert_eq!(
+            repo.references_glob("refs/heads/*").unwrap().count(),
+            0,
+            "stale branch snapshots from --bare must be dropped"
+        );
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/HEAD")
+                .unwrap()
+                .symbolic_target()
+                .ok()
+                .flatten(),
+            Some("refs/remotes/origin/trunk")
+        );
+        let origin_repo = git2::Repository::open(&origin).unwrap();
+        assert_eq!(rev(&repo, "HEAD"), rev(&origin_repo, "trunk"));
+
+        // A session worktree is a normal clone as far as git is concerned.
+        let wt = crate::worktree::create_or_resume_worktree(&repo, "s", "HEAD").unwrap();
+        git(&wt, &["fetch", "-q"]);
+        git(&wt, &["rev-parse", "--verify", "origin/feature"]);
+
+        // New upstream work lands in the next session's base.
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let (repo, outcome) = clone_or_pull_ex(
+            &tmp.path().join("store"),
+            "acme",
+            "proj",
+            true,
+            CloneStdio::Capture,
+        )
+        .unwrap();
+        assert_eq!(outcome, PullOutcome::UpToDate);
+        assert_eq!(rev(&repo, "HEAD"), rev(&origin_repo, "trunk"));
+        let wt2 = crate::worktree::create_or_resume_worktree(&repo, "t", "HEAD").unwrap();
+        let wt2_repo = git2::Repository::open(wt2).unwrap();
+        assert_eq!(rev(&wt2_repo, "HEAD"), rev(&origin_repo, "trunk"));
+        // The earlier session's branch is untouched by the fetch.
+        let wt_repo = git2::Repository::open(&wt).unwrap();
+        assert_ne!(rev(&wt_repo, "HEAD"), rev(&origin_repo, "trunk"));
+
+        // A plain `git push` publishes the session branch (no -u needed),
+        // and it stays "pushed" after the remote deletes it on merge.
+        git(
+            &wt,
+            &["commit", "-q", "--allow-empty", "-m", "session work"],
+        );
+        let store_root = store.clone();
+        let unpushed = || {
+            crate::gitstatus::work_state(&wt, &store_root)
+                .unwrap()
+                .unpushed_commits
+        };
+        assert_eq!(unpushed(), 1);
+        git(&wt, &["push", "-q"]);
+        assert_eq!(unpushed(), 0);
+        git(&origin, &["branch", "-D", "worktree-s"]);
+        clone_or_pull_ex(
+            &tmp.path().join("store"),
+            "acme",
+            "proj",
+            true,
+            CloneStdio::Capture,
+        )
+        .unwrap();
+        assert_eq!(
+            unpushed(),
+            0,
+            "a merged-and-deleted branch must stay pushed"
+        );
+    }
 
     #[test]
     fn resolve_local_path_no_collision() {

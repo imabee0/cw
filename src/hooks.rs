@@ -27,6 +27,23 @@ pub fn detect_auto_hook(repo_root: &Path) -> Option<(&'static str, &'static [&'s
         .map(|(_, program, args)| (*program, *args))
 }
 
+/// `detect_auto_hook` for a repo with no checkout on disk (a bare store):
+/// checks the same lockfiles in the HEAD commit's tree instead. Used only by
+/// `--dry-run`'s preview — the real run always resolves against the new
+/// worktree, which is a checkout of exactly that tree.
+pub fn detect_auto_hook_in_repo(
+    repo: &git2::Repository,
+) -> Option<(&'static str, &'static [&'static str])> {
+    if !repo.is_bare() {
+        return detect_auto_hook(repo.workdir()?);
+    }
+    let tree = repo.head().ok()?.peel_to_tree().ok()?;
+    LOCKFILE_PRECEDENCE
+        .iter()
+        .find(|(lockfile, _, _)| tree.get_name(lockfile).is_some())
+        .map(|(_, program, args)| (*program, *args))
+}
+
 /// One resolved hook invocation — the program, its argv, and the directory
 /// it runs in — everything the confirm-once-per-repo prompt (§5h) needs to
 /// print before the very first execution against a given repo.
@@ -38,16 +55,18 @@ pub struct ResolvedHook {
 }
 
 /// Resolves `post_clone_hook` (§3: `None` = unset, cw's shipped default;
-/// `Some(path)` = that repo-relative script). Runs once, cwd = repo root,
-/// only right after a FRESH `gh repo clone` — this path is repo-relative,
-/// so the CLONED REPO supplies the script body cw is about to execute, not
-/// the user (§0's "repo-supplied hook execution" decision).
-pub fn resolve_post_clone_hook(repo_root: &Path, hook: Option<&Path>) -> Option<ResolvedHook> {
+/// `Some(path)` = that repo-relative script). Runs once, only right after a
+/// FRESH `gh repo clone`. Clones are bare stores with no checkout of their
+/// own, so `checkout` is the first session worktree created from that clone:
+/// the script is resolved against it and runs with it as cwd. The path is
+/// repo-relative, so the CLONED REPO supplies the script body cw is about
+/// to execute, not the user (§0's "repo-supplied hook execution" decision).
+pub fn resolve_post_clone_hook(checkout: &Path, hook: Option<&Path>) -> Option<ResolvedHook> {
     let rel = hook?;
     Some(ResolvedHook {
-        program: repo_root.join(rel).to_string_lossy().into_owned(),
+        program: checkout.join(rel).to_string_lossy().into_owned(),
         args: Vec::new(),
-        cwd: repo_root.to_path_buf(),
+        cwd: checkout.to_path_buf(),
     })
 }
 
@@ -56,18 +75,13 @@ pub fn resolve_post_clone_hook(repo_root: &Path, hook: Option<&Path>) -> Option<
 /// script). Runs once, cwd = the NEW worktree, only right after worktree
 /// creation (skipped entirely on resume of an existing worktree — callers
 /// only invoke this from the creation path, never from
-/// `create_or_resume_worktree`'s fast-resume branch). The script path, when
-/// explicit, is resolved against the ORIGINAL repo — same repo-relative
-/// rule as `post_clone_hook` — even though it runs with the worktree as
-/// cwd.
-pub fn resolve_post_create_hook(
-    repo_root: &Path,
-    worktree_path: &Path,
-    hook: Option<&str>,
-) -> Option<ResolvedHook> {
+/// `create_or_resume_worktree`'s fast-resume branch). Lockfiles and an
+/// explicit script are both looked up in the worktree itself — the files of
+/// the commit the session actually starts from.
+pub fn resolve_post_create_hook(worktree_path: &Path, hook: Option<&str>) -> Option<ResolvedHook> {
     let hook = hook?;
     if hook == "auto" {
-        let (program, args) = detect_auto_hook(repo_root)?;
+        let (program, args) = detect_auto_hook(worktree_path)?;
         return Some(ResolvedHook {
             program: program.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
@@ -75,7 +89,7 @@ pub fn resolve_post_create_hook(
         });
     }
     Some(ResolvedHook {
-        program: repo_root.join(hook).to_string_lossy().into_owned(),
+        program: worktree_path.join(hook).to_string_lossy().into_owned(),
         args: Vec::new(),
         cwd: worktree_path.to_path_buf(),
     })
@@ -235,12 +249,12 @@ pub struct HookSession<'a> {
 /// consent check (§5h).
 pub fn run_post_clone_hook(
     session: &mut HookSession,
-    repo_root: &Path,
+    checkout: &Path,
     hook: Option<&Path>,
     env: &HookEnv,
     confirm: impl FnOnce(&ResolvedHook) -> bool,
 ) -> Result<HookOutcome> {
-    let Some(resolved) = resolve_post_clone_hook(repo_root, hook) else {
+    let Some(resolved) = resolve_post_clone_hook(checkout, hook) else {
         return Ok(HookOutcome::NotConfigured);
     };
     if !gate(
@@ -259,13 +273,12 @@ pub fn run_post_clone_hook(
 /// confirm-once-per-repo consent check as `run_post_clone_hook`.
 pub fn run_post_create_hook(
     session: &mut HookSession,
-    repo_root: &Path,
     worktree_path: &Path,
     hook: Option<&str>,
     env: &HookEnv,
     confirm: impl FnOnce(&ResolvedHook) -> bool,
 ) -> Result<HookOutcome> {
-    let Some(resolved) = resolve_post_create_hook(repo_root, worktree_path, hook) else {
+    let Some(resolved) = resolve_post_create_hook(worktree_path, hook) else {
         return Ok(HookOutcome::NotConfigured);
     };
     if !gate(

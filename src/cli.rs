@@ -44,6 +44,10 @@ pub struct Cli {
     #[arg(long)]
     pub yes: bool,
 
+    /// Skip agent permission checks for Codex and Claude
+    #[arg(long, global = true, alias = "skip-permissions")]
+    pub yolo: bool,
+
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
 }
@@ -52,6 +56,14 @@ pub struct Cli {
 pub enum Cmd {
     /// Pick from all known worktrees across every repo, sorted most-recent-first
     Resume,
+
+    /// Finish a clean, pushed session and release its managed storage
+    Finish {
+        /// Repository in OWNER/NAME form
+        repo: String,
+        /// Session slug
+        slug: String,
+    },
 
     /// Scan and remove worktrees interactively
     Clean {

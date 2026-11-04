@@ -521,6 +521,7 @@ enum HookCheckpoint {
 pub struct DashboardModel {
     pub scope: Scope,
     pub focus: Focus,
+    pub editing_filter: bool,
     /// The repo pane's own state — `Some` only in `Scope::Browse`, `None` in
     /// `AllWorktrees`/`SingleRepo`, which have no repo pane at all.
     pub repos: Option<ListState<RepoRow>>,
@@ -630,6 +631,7 @@ impl DashboardModel {
             loading: true,
             rescan_requested: false,
             hotspots: RefCell::new(Vec::new()),
+            editing_filter: false,
             last_click: None,
             ticks: 0,
             config,
@@ -1022,7 +1024,7 @@ impl DashboardModel {
                 kept += 1;
                 continue;
             }
-            match crate::clean::remove_one(&self.root, &entry) {
+            match crate::clean::remove_one(&entry, include_risky) {
                 Ok(()) => {
                     self.all_entries.retain(|e| e != &entry);
                     self.work_cache.remove(&entry.path);
@@ -1097,7 +1099,7 @@ impl DashboardModel {
                     slug: worktree::unflatten_slug(&entry.slug),
                     agent,
                 },
-                repo_root: self.root.join(&entry.repo),
+                repo_root: entry.repo_root(),
                 worktree_path: Some(entry.path),
                 stage: Stage::Launching,
                 freshly_created: false,
@@ -1288,6 +1290,16 @@ impl DashboardModel {
             let stage = self.pending.as_ref()?.stage;
             match stage {
                 Stage::Cloning => return None,
+                // A fresh clone is a bare store with no checkout to run the
+                // clone hook in, so the session worktree is created first
+                // (`CreatingWorktree` then sees `worktree_path` already set
+                // and only advances).
+                Stage::CloneHook if self.pending.as_ref()?.worktree_path.is_none() => {
+                    if let Err(e) = self.do_create_worktree() {
+                        self.fail("worktree creation failed", format!("{e:#}"));
+                        return None;
+                    }
+                }
                 Stage::CloneHook => match self.checkpoint(HookKind::Clone) {
                     HookCheckpoint::Skip => {
                         self.pending.as_mut()?.stage = Stage::CreatingWorktree;
@@ -1308,6 +1320,9 @@ impl DashboardModel {
                         }));
                     }
                 },
+                Stage::CreatingWorktree if self.pending.as_ref()?.worktree_path.is_some() => {
+                    self.pending.as_mut()?.stage = Stage::CreateHook;
+                }
                 Stage::CreatingWorktree => match self.do_create_worktree() {
                     Ok(()) => {
                         self.pending.as_mut()?.stage = Stage::CreateHook;
@@ -1368,16 +1383,11 @@ impl DashboardModel {
             return HookCheckpoint::Skip;
         };
         let resolved = match kind {
-            HookKind::Clone => hooks::resolve_post_clone_hook(
-                &pending.repo_root,
-                self.config.post_clone_hook.as_deref(),
-            ),
+            HookKind::Clone => pending.worktree_path.as_ref().and_then(|wt| {
+                hooks::resolve_post_clone_hook(wt, self.config.post_clone_hook.as_deref())
+            }),
             HookKind::Create => pending.worktree_path.as_ref().and_then(|wt| {
-                hooks::resolve_post_create_hook(
-                    &pending.repo_root,
-                    wt,
-                    self.config.post_create_hook.as_deref(),
-                )
+                hooks::resolve_post_create_hook(wt, self.config.post_create_hook.as_deref())
             }),
         };
         let Some(resolved) = resolved else {

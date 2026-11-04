@@ -67,6 +67,7 @@ fn unpushed_commit_count(wt: &git2::Repository, repo_root: &Path) -> Result<usiz
     walk.push(head)?;
     let base = git2::Repository::open(repo_root)
         .ok()
+        .filter(|main| !main.is_bare())
         .and_then(|main| main.head().ok().and_then(|h| h.target()));
     if let Some(base) = base {
         // A base the worktree's object db can't see (shouldn't happen — they

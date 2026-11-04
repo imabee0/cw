@@ -149,7 +149,11 @@ fn draw_top_line(frame: &mut Frame, model: &DashboardModel, area: Rect) {
         )),
         seg(Span::raw(query.to_string())),
         seg(if query.is_empty() {
-            dim("type to filter")
+            dim(if model.editing_filter {
+                "search: type any letters; Esc clears"
+            } else {
+                "type to filter; / search all letters"
+            })
         } else {
             dim("▏esc clears")
         }),

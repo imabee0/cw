@@ -148,11 +148,26 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let config = config::load()?;
+    let mut config = config::load()?;
+    if cli.yolo {
+        config::enable_agent_permission_bypass(&mut config);
+    }
     let root = resolve_root(cli.root.as_deref(), &config)?;
 
     match &cli.cmd {
         Some(Cmd::Doctor) => run_doctor_cmd(&config),
+        Some(Cmd::Finish { repo, slug }) => {
+            let choice = parse_owner_repo(repo)?;
+            worktree::validate_worktree_slug(slug)?;
+            let label = choice.full_name();
+            let entry = worktree::scan_worktrees(&root)?
+                .into_iter()
+                .find(|e| e.repo == label && e.slug == worktree::flatten_slug(slug))
+                .context("session not found; use cw resume to inspect retained sessions")?;
+            clean::remove_one(&entry, false)?;
+            println!("finished {label}/{slug}");
+            Ok(())
+        }
         Some(Cmd::Resume) => run_resume(&cli, &config, &root),
         Some(Cmd::Clean { force }) => clean::run_clean(&cli, &config, &root, *force),
         Some(Cmd::Scratch { slug, dry_run }) => {
@@ -243,7 +258,7 @@ fn needs_dashboard(cli: &Cli, config: &Config, root: &Path) -> Result<bool> {
             let repo_label = format!("{}/{}", worktree::SCRATCH_OWNER, worktree::SCRATCH_REPO);
             slug_choice_needs_dashboard(root, &repo_label, slug.as_deref())
         }
-        Some(Cmd::Doctor) | Some(Cmd::Completions { .. }) => Ok(false), // unreachable — handled earlier in `run`
+        Some(Cmd::Doctor) | Some(Cmd::Finish { .. }) | Some(Cmd::Completions { .. }) => Ok(false), // unreachable — handled earlier in `run`
         None => {
             if cli.dry_run {
                 return Ok(false);
@@ -326,8 +341,7 @@ fn run_post_clone_hook_step(
     config: &Config,
     auto_yes: bool,
     repo_label: &str,
-    repo_root: &Path,
-    worktree_path_hint: &Path,
+    worktree_path: &Path,
     slug: &str,
     agent_name: &str,
 ) -> Result<()> {
@@ -338,7 +352,7 @@ fn run_post_clone_hook_step(
     let mut consent = hooks::load_consent(&consent_path);
     let env = hooks::HookEnv {
         repo: repo_label,
-        worktree_path: worktree_path_hint,
+        worktree_path,
         slug,
         agent: agent_name,
     };
@@ -349,7 +363,7 @@ fn run_post_clone_hook_step(
     };
     let result = hooks::run_post_clone_hook(
         &mut session,
-        repo_root,
+        worktree_path,
         config.post_clone_hook.as_deref(),
         &env,
         interactive_confirm,
@@ -405,7 +419,6 @@ fn finish_worktree_creation(
     };
     let result = hooks::run_post_create_hook(
         &mut session,
-        repo_root,
         worktree_path,
         config.post_create_hook.as_deref(),
         &env,
@@ -496,29 +509,39 @@ fn run_default_fast_path(cli: &Cli, config: &Config, root: &Path) -> Result<()> 
         .clone()
         .unwrap_or_else(|| config.default_agent.clone());
 
+    worktree::validate_worktree_slug(&slug)?;
+    let agent_cfg = config::resolve_agent(Some(&agent_name), config)?;
+    // An existing session resumes as-is: no fetch, no hooks.
+    let local_root = sync::resolve_local_path(root, &repo_choice.owner, &repo_choice.name);
+    let (existing_path, exists) = worktree_precheck(&local_root, &slug);
+    if exists {
+        let repo = git2::Repository::open(&local_root)?;
+        let path = worktree::create_or_resume_worktree(&repo, &slug, "HEAD")?;
+        debug_assert_eq!(path, existing_path);
+        return agent::launch_reporting(&agent_cfg, &path);
+    }
+
     let (git_repo, pull_outcome) =
         sync::clone_or_pull(root, &repo_choice.owner, &repo_choice.name, !cli.no_pull)?;
     report_pull_outcome(&repo_label, pull_outcome);
 
-    let repo_root = git_repo
-        .workdir()
-        .context("repo has no working directory")?
-        .to_path_buf();
-    let (precreate_path, was_existing) = worktree_precheck(&repo_root, &slug);
+    let repo_root = worktree::repository_root(&git_repo)?.to_path_buf();
+    let (_, was_existing) = worktree_precheck(&repo_root, &slug);
+
+    // A fresh clone is a bare store with no checkout of its own, so the
+    // clone hook runs in the first session worktree, once it exists.
+    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &slug, "HEAD")?;
 
     if matches!(pull_outcome, sync::PullOutcome::Cloned) {
         run_post_clone_hook_step(
             config,
             cli.yes,
             &repo_label,
-            &repo_root,
-            &precreate_path,
+            &worktree_path,
             &slug,
             &agent_name,
         )?;
     }
-
-    let worktree_path = worktree::create_or_resume_worktree(&git_repo, &slug, "HEAD")?;
 
     if !was_existing {
         finish_worktree_creation(
@@ -533,7 +556,7 @@ fn run_default_fast_path(cli: &Cli, config: &Config, root: &Path) -> Result<()> 
     }
 
     let agent_cfg = config::resolve_agent(Some(&agent_name), config)?;
-    agent::launch(&agent_cfg, &worktree_path)
+    agent::launch_reporting(&agent_cfg, &worktree_path)
 }
 
 /// `--dry-run` (requires `--repo` AND an explicit SLUG, F17): prints the
@@ -555,12 +578,17 @@ fn run_dry_run(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
 
     let local_path = sync::resolve_local_path(root, &repo_choice.owner, &repo_choice.name);
     let already_cloned = local_path.join(".git").exists();
+    let managed_store =
+        already_cloned && git2::Repository::open(&local_path).is_ok_and(|r| r.is_bare());
     let pull_decision = if !already_cloned {
-        "clone (not yet present locally)".to_string()
+        "clone a bare store (not yet present locally), branch from the remote default branch"
+            .to_string()
     } else if cli.no_pull {
-        "skip pull (--no-pull)".to_string()
+        "skip fetch (--no-pull)".to_string()
+    } else if managed_store {
+        "fetch, branch from the latest remote default branch".to_string()
     } else {
-        "pull/fast-forward".to_string()
+        "pull/fast-forward (full checkout, not a cw-managed store)".to_string()
     };
 
     let (worktree_path, worktree_exists) = worktree_precheck(&local_path, slug);
@@ -594,7 +622,11 @@ fn run_dry_run(cli: &Cli, config: &Config, root: &Path) -> Result<()> {
 
 fn print_create_hook_preview(hook: &Option<String>, repo_root: &Path) {
     match hook.as_deref() {
-        Some("auto") => match hooks::detect_auto_hook(repo_root) {
+        Some("auto") => match git2::Repository::open(repo_root)
+            .ok()
+            .and_then(|repo| hooks::detect_auto_hook_in_repo(&repo))
+            .or_else(|| hooks::detect_auto_hook(repo_root))
+        {
             Some((prog, args)) => {
                 println!(
                     "would run post_create_hook (auto): {prog} {}",
@@ -671,7 +703,7 @@ fn run_scratch_fast_path(
     }
 
     let agent_cfg = config::resolve_agent(Some(&agent_name), config)?;
-    agent::launch(&agent_cfg, &worktree_path)
+    agent::launch_reporting(&agent_cfg, &worktree_path)
 }
 
 /// Same rationale as the top-level `--dry-run` (F17): a real invocation of
@@ -838,6 +870,7 @@ mod tests {
             dry_run: false,
             repo: None,
             yes: false,
+            yolo: false,
             cmd: Some(Cmd::Resume),
         };
         assert!(needs_dashboard(&cli_resume, &cfg, dir.path()).unwrap());
@@ -863,6 +896,7 @@ mod tests {
             dry_run: false,
             repo: Some("acme/proj".to_string()),
             yes: false,
+            yolo: false,
             cmd: None,
         };
         assert!(
@@ -889,6 +923,7 @@ mod tests {
             dry_run: false,
             repo: Some("acme/proj".to_string()),
             yes: false,
+            yolo: false,
             cmd: None,
         };
         assert!(needs_dashboard(&cli, &cfg, dir.path()).unwrap());

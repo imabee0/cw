@@ -12,6 +12,7 @@ use anyhow::{bail, Context, Result};
 /// special case inside the same subcommand-matching branch as named
 /// subcommands (F12), so `cw help` never reaches slug parsing either.
 pub const RESERVED_SLUGS: &[&str] = &[
+    "finish",
     "resume",
     "clean",
     "doctor",
@@ -85,6 +86,13 @@ pub fn unflatten_slug(flat: &str) -> String {
     flat.replace('+', "/")
 }
 
+/// Storage container for either a legacy checkout or a managed bare repo.
+pub fn repository_root(repo: &git2::Repository) -> Result<&Path> {
+    repo.workdir()
+        .or_else(|| repo.path().parent())
+        .context("repository has no storage container")
+}
+
 /// The on-disk path a worktree for `slug` would live at under `repo_root`,
 /// plus whether it already exists there (the fast-resume predicate). Shared
 /// by `create_or_resume_worktree` below and by callers (main.rs's
@@ -110,9 +118,15 @@ pub fn create_or_resume_worktree(
     base_ref: &str,
 ) -> Result<PathBuf> {
     validate_worktree_slug(slug)?;
-    let repo_root = repo.workdir().context("repo has no working directory")?;
+    let repo_root = repository_root(repo)?;
     let (path, existed) = worktree_path_and_exists(repo_root, slug);
     if existed {
+        let existing = git2::Repository::open(&path).context("opening existing worktree")?;
+        if !existing.is_worktree()
+            || existing.commondir().canonicalize()? != repo.commondir().canonicalize()?
+        {
+            anyhow::bail!("{} is not a worktree of this repository", path.display());
+        }
         return Ok(path); // fast-resume: skip creation AND both hooks entirely
     }
     create_worktree(repo, slug, base_ref)
@@ -121,11 +135,7 @@ pub fn create_or_resume_worktree(
 fn create_worktree(repo: &git2::Repository, slug: &str, base_ref: &str) -> Result<PathBuf> {
     let flat = flatten_slug(slug);
     let branch_name = format!("worktree-{flat}");
-    let path = repo
-        .workdir()
-        .context("repo has no working directory")?
-        .join(".claude/worktrees")
-        .join(&flat);
+    let path = repository_root(repo)?.join(".claude/worktrees").join(&flat);
 
     // Zero-commit repos (a genuinely fresh `git init`, before §5n's
     // scratch-repo fix or a real empty GitHub repo) have no HEAD to peel —
@@ -136,14 +146,14 @@ fn create_worktree(repo: &git2::Repository, slug: &str, base_ref: &str) -> Resul
         .and_then(|r| r.peel_to_commit())
         .context("repository has no commits yet — nothing to branch a worktree from")?;
 
-    // -B semantics: force-create/reset the branch. Deliberate, mirrors
-    // worktree.ts's `git worktree add -B worktree-<flat>` — matches Claude
-    // Code's own worktree tooling exactly, not an independent design choice
-    // (F10 — a prior draft of this plan never actually created this branch
-    // at all; `repo.worktree(name, path, None)` would have named the branch
-    // after the bare worktree name instead of `worktree-<flat>`, silently
-    // breaking the interop this naming scheme exists for).
-    let branch = repo.branch(&branch_name, &target, true)?;
+    // Reuse an orphaned branch without resetting its commits.
+    let branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
+        Ok(branch) => branch,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {
+            repo.branch(&branch_name, &target, false)?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let branch_ref = branch.into_reference();
     let mut opts = git2::WorktreeAddOptions::new();
     opts.reference(Some(&branch_ref));
@@ -162,7 +172,14 @@ fn create_worktree(repo: &git2::Repository, slug: &str, base_ref: &str) -> Resul
         // the metadata, then retry once, git2-native (no shell-out).
         Err(_) if repo.find_worktree(&flat).is_ok() => {
             let wt = repo.find_worktree(&flat)?;
-            wt.prune(Some(&mut git2::WorktreePruneOptions::new().valid(true)))?;
+            if wt.path().exists() || !matches!(wt.is_locked()?, git2::WorktreeLockStatus::Unlocked)
+            {
+                anyhow::bail!(
+                    "worktree metadata is still active or locked; refusing to prune {}",
+                    wt.path().display()
+                );
+            }
+            wt.prune(None)?;
             repo.worktree(&flat, &path, Some(&opts))?;
             Ok(path.clone())
         }
@@ -256,6 +273,20 @@ pub struct WorktreeEntry {
     pub slug: String,
     pub path: PathBuf,
     pub mtime: SystemTime,
+}
+
+impl WorktreeEntry {
+    /// The repo (or bare store container) this worktree hangs off:
+    /// `<repo>/.claude/worktrees/<slug>` → `<repo>`. Derived from the
+    /// entry's own path, so it can never disagree with where the worktree
+    /// actually is.
+    pub fn repo_root(&self) -> PathBuf {
+        self.path
+            .ancestors()
+            .nth(3)
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    }
 }
 
 /// Read a directory's entries, tolerating a missing/unreadable dir as
@@ -423,6 +454,35 @@ pub fn ensure_scratch_repo(root: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_branch_is_not_reset_when_creating_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_commit(tmp.path());
+        let base = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let oid = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "saved work",
+                &base.tree().unwrap(),
+                &[&base],
+            )
+            .unwrap();
+        repo.branch("worktree-saved", &repo.find_commit(oid).unwrap(), false)
+            .unwrap();
+        let path = create_or_resume_worktree(&repo, "saved", "HEAD").unwrap();
+        assert_eq!(
+            git2::Repository::open(path)
+                .unwrap()
+                .head()
+                .unwrap()
+                .target(),
+            Some(oid)
+        );
+    }
 
     #[test]
     fn display_repo_label_maps_scratch() {

@@ -26,6 +26,12 @@ pub fn run_doctor(config: &Config) -> Vec<(String, Result<String>)> {
             check_gh_auth().map(|()| String::new()),
         ),
         (
+            // Fetches shell out to system git (SSH remotes, credential
+            // helpers), so a missing git breaks every new session.
+            "git on PATH".to_string(),
+            check_binary_on_path("git").map(|()| String::new()),
+        ),
+        (
             "git credential helper".to_string(),
             check_credential_helper().map(|()| String::new()),
         ),

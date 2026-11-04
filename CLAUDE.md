@@ -1,6 +1,6 @@
 # cw
 
-Rust CLI: fuzzy-pick a GitHub repo (personal + every org, most-recent-first), clone/pull it, create-or-resume a git worktree, launch an agent CLI inside it.
+Rust CLI: fuzzy-pick a GitHub repo (personal + every org, most-recent-first), clone it on demand as a bare store, create-or-resume a session worktree on the latest default branch, launch an agent CLI inside it; finishing the last session deletes the store.
 
 ## Commands
 
@@ -11,6 +11,7 @@ scripts/check.sh                     # fmt --check, clippy -D warnings, cargo te
 cw --help
 cw doctor                            # exits nonzero on any failed check; needs a real controlling tty (`script -q /dev/null cw doctor` if testing from a non-tty harness — plain `cw doctor` there fails the terminal check, not a bug)
 cw completions zsh                   # source only after `autoload -U compinit && compinit` has run, same as any zsh completion script
+cw finish OWNER/NAME SLUG             # remove one clean, pushed session; deletes the bare store when it was the last
 cw --repo OWNER/NAME --root PATH --dry-run SLUG   # only non-interactive way to preview clone/pull + worktree + agent decision with zero mutation
 ```
 
@@ -23,8 +24,8 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 | File | Responsibility |
 |---|---|
 | `main.rs` | CLI dispatch, default-flow orchestration, `needs_dashboard` fast-path gate, tracing/log init |
-| `cli.rs` | clap-derive `Cli`/`Cmd` (`resume`, `clean`, `scratch`, `doctor`, `completions`) |
-| `config.rs` | `Config` TOML load/save, `~/.config/cw`/`~/.cache/cw` path resolution, `resolve_agent()` |
+| `cli.rs` | clap-derive `Cli`/`Cmd` (`resume`, `finish`, `clean`, `scratch`, `doctor`, `completions`), global `--yolo` |
+| `config.rs` | `Config` TOML load/save, `~/.config/cw`/`~/.cache/cw` path resolution, `resolve_agent()`, `--yolo`'s `enable_agent_permission_bypass` |
 | `github.rs` | `gh` subprocess wrappers: repo/org discovery, per-org failure isolation |
 | `cache.rs` | `RepoCache`, atomic save (tmp+rename), corrupt-file-tolerant load |
 | `dashboard.rs` | the single `tui::run()` entry point: builds the initial `DashboardModel` per `Entry` (bare `cw`/`resume`/`clean`/`scratch`), spawns every background thread (repo discovery, one-shot worktree scan, the reactive clone/pull thread), and drives the suspend/resume loop around hook runs and agent launches |
@@ -36,12 +37,12 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 | `tui/event.rs` | crossterm event polling + tick cadence |
 | `tui/widgets.rs` | `row_at` mouse hit-testing, frizbee-backed `filter_indices` |
 | `gitstatus.rs` | `work_state` (changed files + unpushed commits) for the dashboard; `is_dirty_repo` for sync.rs's pull guard |
-| `sync.rs` | clone/pull (`clone_or_pull_ex`'s `CloneStdio::Capture` variant backs the dashboard's background clone thread), `gh`-credential-helper wiring, dirty-tree guard before force-checkout |
+| `sync.rs` | `clone_or_pull_ex`: fresh clone = `gh repo clone -- --bare` + `configure_managed_store`; existing bare store = `fetch_default` (system `git`, never prompts); legacy full checkouts still fast-forward behind a dirty/diverged/detached guard. `CloneStdio::Capture` backs the dashboard's background clone thread |
 | `worktree.rs` | slug validation/flattening/`unflatten_slug`, worktree create-or-resume, `scan_worktrees`, `remove_worktree`, `display_repo_label`, `WorktreeSelection`/`CleanCandidate`, `generate_timestamp_slug` |
 | `worktreeinclude.rs` | `.worktreeinclude` copy: symlink-preserving, CRLF/BOM-tolerant, continue-on-error |
-| `hooks.rs` | `post_clone_hook`/`post_create_hook` execution, confirm-once-per-repo consent |
-| `agent.rs` | launches the resolved agent CLI in the worktree, distinguishes exit outcomes |
-| `clean.rs` | `cw clean`: thin `dashboard::run(Entry::Clean)` entry point; `remove_one` (git2 prune + branch delete), shared with the dashboard's in-TUI delete flow |
+| `hooks.rs` | `post_clone_hook`/`post_create_hook` execution (both resolved against the new worktree — stores have no checkout), confirm-once-per-repo consent |
+| `agent.rs` | launches the resolved agent CLI in the worktree, git-locking the worktree (reason carries cw's pid) for the session's lifetime; distinguishes exit outcomes |
+| `clean.rs` | `cw clean`: thin `dashboard::run(Entry::Clean)` entry point; `remove_one` (re-checks lock + work state, git2 prune + branch delete, deletes a `cw.managed` bare store with no worktrees left), shared by `cw finish` and the dashboard's in-TUI delete flow |
 | `doctor.rs` | `cw doctor`: gh auth, credential helper, terminal, each configured agent on PATH (only `default_agent` fails the exit code if missing) |
 | `selfupdate.rs` | background self-update check (`spawn_check`) + apply (`apply_update`, the dashboard's `u` key), also backing `cw doctor`'s stale-binary diagnostic; every failure (no install receipt, offline, rate-limited) degrades silently, never an error |
 
@@ -56,6 +57,8 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 
 - **Worktree/branch naming exactly mirrors Claude Code's own scheme** (`flatten_slug`, `.claude/worktrees/<flat>`, branch `worktree-<flat>`) — required for interop with `EnterWorktree`/subagent tooling. Do not change this shape without checking `worktree.ts` first.
 - **`cw` always creates worktrees itself** via git2, never shells out to the agent CLI's own worktree flag — this is what makes resume/clean work identically across every configured agent.
+- **Repos are bare stores, not checkouts.** `root/owner/name/.git` is a `--bare` clone marked `cw.managed = true`, with a standard `origin` fetch refspec and no local `refs/heads/*` except session branches; `HEAD` is detached at `refs/cw/default` (the fetched remote HEAD) and new sessions branch from it. `remove_one` deletes the store only when it's `cw.managed` and has no worktrees left — never a user's own bare repo, never a legacy full checkout. Default `root` is `$XDG_DATA_HOME/cw/sessions` (disk-backed, not `/tmp`). Fresh clones go to a `.<name>.cw-clone-<pid>` staging dir and are renamed into place (no half-made stores, no clone races). `fetch_default` deliberately never `--prune`s — a merged-and-deleted session branch must stay "pushed".
+- **`remove_one` re-reads lock + work state itself** — never trust the dashboard's earlier snapshot at the destructive boundary. A cw-written lock whose pid is dead is cleared (crash recovery); any other lock refuses.
 - **`create_or_resume_worktree`** appends `/.claude/worktrees/` to the cloned repo's `.git/info/exclude` on first create — removing this reopens a dirty-tree false-positive that silently blocks every future pull on that repo.
 - **Hooks (`post_clone_hook`/`post_create_hook`) default to unset.** They execute code the cloned repo supplies, not code the user wrote — never flip either default on, never skip the confirm-once-per-repo consent gate in `hooks.rs`.
 - **`gh repo list` must always carry `--limit 1000`** (`github.rs::repo_list_args`) — `gh`'s own default of 30 silently truncates discovery.
@@ -63,7 +66,7 @@ Flat `src/*.rs` plus one `src/tui/` submodule, binary-only crate, no `lib.rs`.
 - **Dashboard non-interactivity is gated on `/dev/tty` + `stderr().is_terminal()`, never on `stdin().is_terminal()`** — crossterm's unix backend opens `/dev/tty` directly for its event source (`tty_fd()`, falling back to a std fd only if `/dev/tty` is unavailable — confirmed in crossterm 0.29's source, not assumed), and `tui::mod`'s `CrosstermBackend` renders to stderr, not stdout, so a piped stdin over a real controlling terminal must still reach the dashboard, and `cw | cat` must never receive UI escape codes. `script -q /dev/null cw` allocates a real pty for local testing of this path — no automated pass has driven the TUI interactively to confirm it against this backend (no controlling terminal in that environment either), so this still wants a real-terminal check before being trusted.
 - **Any `tracing::warn!`/`error!` firing while a `tui::run` session owns the screen would corrupt the frame** — `main.rs::init_logging` gates the stderr half of its tee behind `tui::TUI_ACTIVE` (an `AtomicBool` set for the duration of every `run()` call) so log lines still reach the day log file but never interleave with in-progress terminal escape codes. Route anything the dashboard needs the user to see into `DashboardModel::status` instead of logging it directly (`dashboard.rs::spawn_repo_thread`'s background thread does this for per-org discovery warnings and a stale-cache notice).
 - **`tracing_appender`'s `WorkerGuard` must stay a named local bound in `main()`** — dropping it early silently loses buffered log lines.
-- Config/cache paths are fixed at `~/.config/cw/config.toml` and `~/.cache/cw/{repos.json,cw.log.*}` on both macOS and Linux — not `directories::ProjectDirs`, deliberately, to avoid diverging per platform.
+- Config/cache paths are fixed at `~/.config/cw/config.toml` and `~/.cache/cw/{repos.json,cw.log.*}` (the session `root` default is the one XDG-aware exception) on both macOS and Linux — not `directories::ProjectDirs`, deliberately, to avoid diverging per platform.
 - `cw` shells out to `gh` for all GitHub API access (repo/org listing, clone auth) — `gh auth status` must be green; `cw doctor` checks this.
 - **One event-driven GitHub Actions workflow:** `.github/workflows/ci.yml`. `pull_request` validates (cheap jobs in parallel, `build-test` needs lint). `push` to `main` lints (seeds rust-cache) and runs release-plz. `push` of `v*.*.*` runs `dist-build` → `publish` → `verify`. No `schedule`. `RELEASE_PLZ_TOKEN` (not `GITHUB_TOKEN`) must tag, or the tag push never retriggers this workflow. `release-plz.toml` `git_release_enable = false` — the `publish` job creates the GitHub Release. Dist targets: `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`. Rustc 1.98. Never add a second file under `.github/workflows/`.
 - **Self-update degrades completely silently when no install receipt is present** — a `cargo install --path .` (from-source) build has no `~/.config/cw/cw-receipt.json`, so `selfupdate`'s check and apply fail quietly to a `tracing::debug!` line and the dashboard's `u` key never activates; by design, not a bug, but a from-source install never learns about updates.

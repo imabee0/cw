@@ -144,6 +144,7 @@ fn modal_cancel(model: &mut DashboardModel) -> Option<DashboardOutcome> {
 // ---------------------------------------------------------------------
 
 fn handle_key(model: &mut DashboardModel, key: KeyEvent) -> Option<DashboardOutcome> {
+    model.last_click = None;
     if is_ctrl_c(key) {
         return Some(DashboardOutcome::Cancelled);
     }
@@ -152,6 +153,30 @@ fn handle_key(model: &mut DashboardModel, key: KeyEvent) -> Option<DashboardOutc
     }
     if is_ctrl_a(key) {
         return perform(model, Action::CycleAgent);
+    }
+    if model.editing_filter {
+        match key.code {
+            KeyCode::Esc => {
+                clear_focused_query(model);
+                model.editing_filter = false;
+                return None;
+            }
+            KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
+                model.editing_filter = false;
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                type_into_focused(model, c);
+                return None;
+            }
+            _ => {}
+        }
+    } else if key.code == KeyCode::Char('/') {
+        model.editing_filter = true;
+        return None;
     }
     handle_pane_key(model, key)
 }
@@ -404,12 +429,14 @@ fn handle_mouse(model: &mut DashboardModel, mouse: MouseEvent) -> Option<Dashboa
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => handle_click(model, at),
         MouseEventKind::ScrollDown => {
+            model.last_click = None;
             if model.modal.is_none() {
                 move_pane(model, pane_at(model, at), 1);
             }
             None
         }
         MouseEventKind::ScrollUp => {
+            model.last_click = None;
             if model.modal.is_none() {
                 move_pane(model, pane_at(model, at), -1);
             }
@@ -430,6 +457,7 @@ fn handle_click(model: &mut DashboardModel, at: Position) -> Option<DashboardOut
         };
     }
     if let Some(action) = hit {
+        model.last_click = None;
         return perform(model, action);
     }
 
@@ -541,7 +569,7 @@ mod tests {
         ScannedEntry {
             repo: repo.to_string(),
             slug: slug.to_string(),
-            path: PathBuf::from(format!("/nonexistent-root/{repo}/{slug}")),
+            path: PathBuf::from(format!("/nonexistent-root/{repo}/.claude/worktrees/{slug}")),
             mtime: SystemTime::now(),
         }
     }
@@ -561,6 +589,20 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn explicit_search_accepts_shortcut_letters_and_escape_clears() {
+        let mut model = all_worktrees_model(vec![]);
+        update_dashboard(&mut model, key(KeyCode::Char('/')));
+        for c in "jdkqnr".chars() {
+            assert!(update_dashboard(&mut model, key(KeyCode::Char(c))).is_none());
+        }
+        assert_eq!(model.worktrees.query, "jdkqnr");
+        assert!(model.modal.is_none());
+        update_dashboard(&mut model, key(KeyCode::Esc));
+        assert!(!model.editing_filter);
+        assert!(model.worktrees.query.is_empty());
+    }
+
     fn config_with_agents(names: &[&str]) -> Config {
         Config {
             agents: agents_map(names),
@@ -578,6 +620,21 @@ mod tests {
             post_clone_hook: Some(PathBuf::from("hook.sh")),
             ..config_with_agents(names)
         }
+    }
+
+    /// A real cw-style bare store (`<tmp>/acme/proj/.git`, one empty
+    /// commit) for pipeline tests that must get past worktree creation.
+    fn bare_store() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let container = tmp.path().join("acme/proj");
+        let repo = git2::Repository::init_bare(container.join(".git")).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+        (tmp, container)
     }
 
     fn load(entries: Vec<ScannedEntry>) -> super::super::msg::WorktreesLoad {
@@ -661,9 +718,9 @@ mod tests {
         model.status = Some("cloned acme/proj".to_string());
         model.worktrees.query.push_str("abc");
         model.worktrees.refilter(|r| r.filter_text.as_str());
-        model
-            .checked
-            .insert(PathBuf::from("/nonexistent-root/acme/proj/one"));
+        model.checked.insert(PathBuf::from(
+            "/nonexistent-root/acme/proj/.claude/worktrees/one",
+        ));
 
         assert!(update_dashboard(&mut model, key(KeyCode::Esc)).is_none());
         assert!(model.status.is_none(), "first Esc dismisses the status");
@@ -690,9 +747,9 @@ mod tests {
     fn ctrl_c_cancels_immediately_regardless_of_state() {
         let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
         model.worktrees.query.push('c');
-        model
-            .checked
-            .insert(PathBuf::from("/nonexistent-root/acme/proj/one"));
+        model.checked.insert(PathBuf::from(
+            "/nonexistent-root/acme/proj/.claude/worktrees/one",
+        ));
         match update_dashboard(&mut model, ctrl_c()) {
             Some(DashboardOutcome::Cancelled) => {}
             _ => panic!("Ctrl-C must cancel even with filter text and a checked row"),
@@ -830,7 +887,7 @@ mod tests {
             Some(DashboardOutcome::Suspend(SuspendReq::LaunchAgent { worktree_path, .. })) => {
                 assert_eq!(
                     worktree_path,
-                    PathBuf::from("/nonexistent-root/acme/second/two")
+                    PathBuf::from("/nonexistent-root/acme/second/.claude/worktrees/two")
                 );
             }
             other => panic!(
@@ -946,7 +1003,7 @@ mod tests {
             scanned_entry("acme/proj", "one"),
             scanned_entry("acme/proj", "two"),
         ]);
-        let second = PathBuf::from("/nonexistent-root/acme/proj/two");
+        let second = PathBuf::from("/nonexistent-root/acme/proj/.claude/worktrees/two");
         model
             .hotspots
             .borrow_mut()
@@ -1167,7 +1224,7 @@ mod tests {
     fn clean_force_starts_with_risky_included() {
         let mut model = all_worktrees_model_force(vec![scanned_entry("acme/proj", "one")], true);
         model.work_cache.insert(
-            PathBuf::from("/nonexistent-root/acme/proj/one"),
+            PathBuf::from("/nonexistent-root/acme/proj/.claude/worktrees/one"),
             Some(WorkState {
                 changed_files: 1,
                 unpushed_commits: 0,
@@ -1338,6 +1395,7 @@ mod tests {
             false,
         );
         std::mem::forget(consent_dir);
+        let (_store_dir, store) = bare_store();
         model.pending = Some(super::super::model::PendingLaunch {
             ctx: super::super::model::LaunchContext {
                 repo_label: "acme/proj".to_string(),
@@ -1346,7 +1404,7 @@ mod tests {
                 slug: "second".to_string(),
                 agent: "claude".to_string(),
             },
-            repo_root: PathBuf::from("/nonexistent-root/acme/proj"),
+            repo_root: store,
             worktree_path: None,
             stage: super::super::model::Stage::Cloning,
             freshly_created: false,
@@ -1363,7 +1421,72 @@ mod tests {
             !matches!(model.modal, Some(Modal::HookConsent { .. })),
             "a repo with a recorded decline must not reopen Modal::HookConsent on a later checkpoint"
         );
+        // Got all the way to launch — proves the checkpoint actually ran
+        // (and skipped), not that worktree creation failed before it.
+        assert!(model.modal.is_none(), "unexpected modal after skip");
         assert_eq!(model.hook_consent.get("acme/proj"), Some(&false));
+    }
+
+    #[test]
+    fn fresh_clone_creates_worktree_before_clone_hook_and_runs_it_there() {
+        let consent_dir = tempfile::tempdir().expect("tempdir");
+        let mut model = DashboardModel::new_all_worktrees(
+            PathBuf::from("/nonexistent-root"),
+            config_with_clone_hook(&["claude"]),
+            HookConsent::new(),
+            consent_dir.path().join("hook-consent.json"),
+            false,
+            false,
+        );
+        let (_store_dir, store) = bare_store();
+        model.pending = Some(super::super::model::PendingLaunch {
+            ctx: super::super::model::LaunchContext {
+                repo_label: "acme/proj".to_string(),
+                owner: "acme".to_string(),
+                name: "proj".to_string(),
+                slug: "fresh".to_string(),
+                agent: "claude".to_string(),
+            },
+            repo_root: store.clone(),
+            worktree_path: None,
+            stage: super::super::model::Stage::Cloning,
+            freshly_created: false,
+        });
+
+        update_dashboard(
+            &mut model,
+            Msg::CloneDone(Ok(super::super::msg::CloneOutcome {
+                repo_label: "acme/proj".to_string(),
+                pull_outcome: crate::sync::PullOutcome::Cloned,
+            })),
+        );
+        let wt = store.join(".claude/worktrees/fresh");
+        assert!(
+            wt.join(".git").exists(),
+            "worktree must exist before the hook"
+        );
+        match &model.modal {
+            Some(Modal::HookConsent { resolved, kind }) => {
+                assert_eq!(*kind, super::super::model::HookKind::Clone);
+                assert_eq!(resolved.cwd, wt);
+                assert_eq!(resolved.program, wt.join("hook.sh").to_string_lossy());
+            }
+            _ => panic!("expected the clone hook's consent modal"),
+        }
+
+        let outcome = update_dashboard(&mut model, key(KeyCode::Char('y')));
+        assert!(matches!(
+            outcome,
+            Some(DashboardOutcome::Suspend(SuspendReq::RunHook { .. }))
+        ));
+        let outcome = model.resume_after_hook(super::super::model::HookKind::Clone, Ok(()));
+        match outcome {
+            Some(DashboardOutcome::Suspend(SuspendReq::LaunchAgent { worktree_path, .. })) => {
+                assert_eq!(worktree_path, wt);
+            }
+            other => panic!("expected launch after the hook, got {}", describe(&other)),
+        }
+        assert!(model.pending.as_ref().unwrap().freshly_created);
     }
 
     // --- PendingLaunch stage advancement on a resumed hook -----------------
@@ -1464,7 +1587,7 @@ mod tests {
             Some(DashboardOutcome::Suspend(SuspendReq::LaunchAgent { worktree_path, .. })) => {
                 assert_eq!(
                     worktree_path,
-                    PathBuf::from("/nonexistent-root/acme/proj/three")
+                    PathBuf::from("/nonexistent-root/acme/proj/.claude/worktrees/three")
                 );
             }
             other => panic!("a double-click must open the row, got {}", describe(&other)),
