@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/imabee0/cw/compare/v0.1.16...v0.2.0) - 2026-11-04
+
+### Added
+
+- [**breaking**] on-demand bare session stores, cw finish, --yolo, / search ([#54](https://github.com/imabee0/cw/pull/54))
+
 ## [0.1.16](https://github.com/imabee0/cw/compare/v0.1.15...v0.1.16) - 2026-10-16
 
 ### Other
