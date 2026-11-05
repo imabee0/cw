@@ -247,7 +247,7 @@ jobs:
       max-parallel: 6
       matrix:
         include: ${{ fromJSON(needs.changes.outputs.check_matrix) }}
-    name: check-targets (${{ matrix.triple }})
+    name: ${{ matrix.triple && format('check-targets ({0})', matrix.triple) || 'check-targets' }}
     runs-on: ${{ matrix.method == 'zigbuild' && 'ubuntu-latest' || matrix.runner }}
     timeout-minutes: 15
     steps:
@@ -303,7 +303,7 @@ jobs:
       max-parallel: 6
       matrix:
         include: ${{ fromJSON(needs.changes.outputs.test_matrix) }}
-    name: test (${{ matrix.triple }})
+    name: ${{ matrix.triple && format('test ({0})', matrix.triple) || 'test' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -382,7 +382,7 @@ jobs:
       max-parallel: 6
       matrix:
         include: ${{ fromJSON(needs.changes.outputs.warm_matrix) }}
-    name: warm-cache (${{ matrix.triple }}, ${{ matrix.kind }})
+    name: ${{ matrix.triple && format('warm-cache ({0}, {1})', matrix.triple, matrix.kind) || 'warm-cache' }}
     runs-on: ${{ matrix.method == 'zigbuild' && matrix.kind == 'check' && 'ubuntu-latest' || matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -498,6 +498,11 @@ jobs:
                 [ "$b" -gt "$bump" ] && bump=$b
               done
               IFS=. read -r major minor patch <<<"$last"
+              # Before 1.0 the minor number is the breaking-change number
+              # (Cargo treats 0.x -> 0.(x+1) as incompatible), so a breaking
+              # change bumps minor; 1.0.0 is a deliberate decision, not a
+              # side effect of a `!`. Release it by tagging cw-v1.0.0 by hand.
+              if [ "$major" -eq 0 ] && [ "$bump" -eq 3 ]; then bump=2; fi
               case "$bump" in
                 3) version="$((major + 1)).0.0" ;;
                 2) version="$major.$((minor + 1)).0" ;;
@@ -538,7 +543,7 @@ jobs:
       max-parallel: 6
       matrix:
         include: ${{ fromJSON(needs.version.outputs.build_matrix) }}
-    name: build (${{ matrix.triple }})
+    name: ${{ matrix.triple && format('build ({0})', matrix.triple) || 'build' }}
     runs-on: ${{ matrix.method == 'zigbuild' && 'ubuntu-latest' || matrix.runner }}
     timeout-minutes: 30
     steps:
