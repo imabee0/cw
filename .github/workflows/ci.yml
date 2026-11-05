@@ -62,9 +62,16 @@ jobs:
       components: ${{ steps.detect.outputs.components }}
       targets: ${{ steps.detect.outputs.targets }}
       lint_pflags: ${{ steps.detect.outputs.lint_pflags }}
+      # Matrices carry only the triple (and, for warm-cache, the kind), so
+      # GitHub names legs "test (x86_64-unknown-linux-gnu)" and a skipped
+      # job plain "test". Everything else a leg needs is looked up by triple
+      # in the matching *_info map.
       check_matrix: ${{ steps.detect.outputs.check_matrix }}
+      check_info: ${{ steps.detect.outputs.check_info }}
       test_matrix: ${{ steps.detect.outputs.test_matrix }}
+      test_info: ${{ steps.detect.outputs.test_info }}
       warm_matrix: ${{ steps.detect.outputs.warm_matrix }}
+      warm_info: ${{ steps.detect.outputs.warm_info }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -151,7 +158,13 @@ jobs:
                   | (if .tier == 2 then [$t + {kind: "check"}] else [] end)
                     + (if .tested then [$t + {kind: "test"}] else [] end)
                   | .[] | . + {pflags: (all_crates_on(.triple) | pflags)}]
-              }' > "$RUNNER_TEMP/changes.json"
+              }
+            | def runner: . + {job_runner: (if .method == "zigbuild" then "ubuntu-latest" else .runner end)};
+              def info: map(runner | {key: .triple, value: .}) | from_entries;
+              . + {check_info: (.check_matrix | info), check_matrix: [.check_matrix[].triple],
+                   test_info: (.test_matrix | info), test_matrix: [.test_matrix[].triple],
+                   warm_info: (.warm_matrix | info), warm_matrix: [.warm_matrix[] | {triple, kind}]}
+            ' > "$RUNNER_TEMP/changes.json"
           jq . "$RUNNER_TEMP/changes.json"
           jq -r 'to_entries[] | "\(.key)=\(.value | if type == "string" or type == "boolean" then tostring else tojson end)"' \
             "$RUNNER_TEMP/changes.json" >> "$GITHUB_OUTPUT"
@@ -246,28 +259,29 @@ jobs:
       fail-fast: true
       max-parallel: 6
       matrix:
-        include: ${{ fromJSON(needs.changes.outputs.check_matrix) }}
-    name: ${{ matrix.triple && format('check-targets ({0})', matrix.triple) || 'check-targets' }}
-    runs-on: ${{ matrix.method == 'zigbuild' && 'ubuntu-latest' || matrix.runner }}
+        triple: ${{ fromJSON(needs.changes.outputs.check_matrix) }}
+    runs-on: ${{ fromJSON(needs.changes.outputs.check_info)[matrix.triple].job_runner }}
     timeout-minutes: 15
+    env:
+      TRIPLE: ${{ matrix.triple }}
+      METHOD: ${{ fromJSON(needs.changes.outputs.check_info)[matrix.triple].method }}
+      PFLAGS: ${{ fromJSON(needs.changes.outputs.check_info)[matrix.triple].pflags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install # reads rust-toolchain.toml (lists every target)
       - name: Linker tools for .cargo/config.toml
-        if: runner.os == 'Linux' && matrix.method == 'native'
-        env:
-          TRIPLE: ${{ matrix.triple }}
+        if: runner.os == 'Linux' && env.METHOD == 'native'
         run: |
           if grep -q "^\[target\.$TRIPLE\]" .cargo/config.toml; then
             sudo apt-get update && sudo apt-get install -y clang lld
           fi
-      - if: matrix.method == 'zigbuild'
+      - if: env.METHOD == 'zigbuild'
         uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-zigbuild@0.23.4
-      - if: matrix.method == 'zigbuild'
+      - if: env.METHOD == 'zigbuild'
         run: python3 -m pip install --user ziglang
       # Hits: warm-cache on main runs this exact check per target and saves
       # this key; PRs and the merge queue only restore it.
@@ -278,10 +292,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
       - name: cargo check
-        env:
-          TRIPLE: ${{ matrix.triple }}
-          PFLAGS: ${{ matrix.pflags }}
-          METHOD: ${{ matrix.method }}
         run: |
           read -ra crate_args <<<"$PFLAGS" # space-separated -p list
           if [ "$METHOD" = zigbuild ]; then
@@ -302,10 +312,12 @@ jobs:
       fail-fast: true
       max-parallel: 6
       matrix:
-        include: ${{ fromJSON(needs.changes.outputs.test_matrix) }}
-    name: ${{ matrix.triple && format('test ({0})', matrix.triple) || 'test' }}
-    runs-on: ${{ matrix.runner }}
+        triple: ${{ fromJSON(needs.changes.outputs.test_matrix) }}
+    runs-on: ${{ fromJSON(needs.changes.outputs.test_info)[matrix.triple].runner }}
     timeout-minutes: 20
+    env:
+      TIER: ${{ fromJSON(needs.changes.outputs.test_info)[matrix.triple].tier }}
+      PFLAGS: ${{ fromJSON(needs.changes.outputs.test_info)[matrix.triple].pflags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -322,12 +334,10 @@ jobs:
           shared-key: ${{ matrix.triple }}-test
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
-      - env:
-          PFLAGS: ${{ matrix.pflags }}
-        run: |
+      - run: |
           read -ra crate_args <<<"$PFLAGS" # space-separated -p list
           cargo nextest run --locked --profile gate "${crate_args[@]}"
-      - if: github.event_name == 'merge_group' && matrix.tier == 1
+      - if: github.event_name == 'merge_group' && env.TIER == '1'
         run: cargo test --doc --locked --workspace
 
   # ------------------------------------------------------------------
@@ -382,29 +392,33 @@ jobs:
       max-parallel: 6
       matrix:
         include: ${{ fromJSON(needs.changes.outputs.warm_matrix) }}
-    name: ${{ matrix.triple && format('warm-cache ({0}, {1})', matrix.triple, matrix.kind) || 'warm-cache' }}
-    runs-on: ${{ matrix.method == 'zigbuild' && matrix.kind == 'check' && 'ubuntu-latest' || matrix.runner }}
+    # Zigbuild targets are never tested, so only their check legs run, on
+    # job_runner (ubuntu-latest); every other leg runs on the target's runner.
+    runs-on: ${{ fromJSON(needs.changes.outputs.warm_info)[matrix.triple].job_runner }}
     timeout-minutes: 20
+    env:
+      TRIPLE: ${{ matrix.triple }}
+      KIND: ${{ matrix.kind }}
+      METHOD: ${{ fromJSON(needs.changes.outputs.warm_info)[matrix.triple].method }}
+      PFLAGS: ${{ fromJSON(needs.changes.outputs.warm_info)[matrix.triple].pflags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install # reads rust-toolchain.toml
       - name: Linker tools for .cargo/config.toml
-        if: runner.os == 'Linux' && matrix.method == 'native'
-        env:
-          TRIPLE: ${{ matrix.triple }}
+        if: runner.os == 'Linux' && env.METHOD == 'native'
         run: |
           if grep -q "^\[target\.$TRIPLE\]" .cargo/config.toml; then
             sudo apt-get update && sudo apt-get install -y clang lld
           fi
-      - if: matrix.kind == 'check' && matrix.method == 'zigbuild'
+      - if: env.KIND == 'check' && env.METHOD == 'zigbuild'
         uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-zigbuild@0.23.4
-      - if: matrix.kind == 'check' && matrix.method == 'zigbuild'
+      - if: env.KIND == 'check' && env.METHOD == 'zigbuild'
         run: python3 -m pip install --user ziglang
-      - if: matrix.kind == 'test'
+      - if: env.KIND == 'test'
         uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-nextest@0.9.148
@@ -418,11 +432,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
       - name: cargo check (all components)
-        if: matrix.kind == 'check'
-        env:
-          TRIPLE: ${{ matrix.triple }}
-          PFLAGS: ${{ matrix.pflags }}
-          METHOD: ${{ matrix.method }}
+        if: env.KIND == 'check'
         run: |
           read -ra crate_args <<<"$PFLAGS" # space-separated -p list
           if [ "$METHOD" = zigbuild ]; then
@@ -431,9 +441,7 @@ jobs:
             cargo check --target "$TRIPLE" --locked "${crate_args[@]}"
           fi
       - name: nextest --no-run (all components, host triple)
-        if: matrix.kind == 'test'
-        env:
-          PFLAGS: ${{ matrix.pflags }}
+        if: env.KIND == 'test'
         run: |
           read -ra crate_args <<<"$PFLAGS" # space-separated -p list
           cargo nextest run --no-run --locked --profile gate "${crate_args[@]}"
@@ -453,6 +461,7 @@ jobs:
       release: ${{ steps.plan.outputs.release }}
       released: ${{ steps.plan.outputs.released }}
       build_matrix: ${{ steps.plan.outputs.build_matrix }}
+      build_info: ${{ steps.plan.outputs.build_info }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -522,12 +531,18 @@ jobs:
                     components: ([$r[].name] | join(" ")),
                     versions: ([$r[] | "CI_VERSION_" + (.name | ascii_upcase | gsub("-"; "_")) + "=" + .version] | join(" "))}]' \
             <<<"$released")
+          # Matrix legs carry only the triple; build_info holds the rest.
+          build_info=$(jq -c 'map(. + {job_runner: (if .method == "zigbuild" then "ubuntu-latest" else .runner end)}
+                              | {key: .triple, value: .}) | from_entries' <<<"$build_matrix")
+          build_matrix=$(jq -c 'map(.triple)' <<<"$build_matrix")
           echo "released: $released"
           echo "build matrix: $build_matrix"
+          echo "build info: $build_info"
           {
             echo "release=$(jq -r 'if length > 0 then "true" else "false" end' <<<"$released")"
             echo "released=$released"
             echo "build_matrix=$build_matrix"
+            echo "build_info=$build_info"
           } >> "$GITHUB_OUTPUT"
 
   # ------------------------------------------------------------------
@@ -542,32 +557,33 @@ jobs:
       fail-fast: true
       max-parallel: 6
       matrix:
-        include: ${{ fromJSON(needs.version.outputs.build_matrix) }}
-    name: ${{ matrix.triple && format('build ({0})', matrix.triple) || 'build' }}
-    runs-on: ${{ matrix.method == 'zigbuild' && 'ubuntu-latest' || matrix.runner }}
+        triple: ${{ fromJSON(needs.version.outputs.build_matrix) }}
+    runs-on: ${{ fromJSON(needs.version.outputs.build_info)[matrix.triple].job_runner }}
     timeout-minutes: 30
+    env:
+      TRIPLE: ${{ matrix.triple }}
+      METHOD: ${{ fromJSON(needs.version.outputs.build_info)[matrix.triple].method }}
+      PFLAGS: ${{ fromJSON(needs.version.outputs.build_info)[matrix.triple].pflags }}
+      COMPONENTS: ${{ fromJSON(needs.version.outputs.build_info)[matrix.triple].components }}
+      VERSIONS: ${{ fromJSON(needs.version.outputs.build_info)[matrix.triple].versions }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install # reads rust-toolchain.toml
       - name: Linker tools for .cargo/config.toml
-        if: runner.os == 'Linux' && matrix.method == 'native'
-        env:
-          TRIPLE: ${{ matrix.triple }}
+        if: runner.os == 'Linux' && env.METHOD == 'native'
         run: |
           if grep -q "^\[target\.$TRIPLE\]" .cargo/config.toml; then
             sudo apt-get update && sudo apt-get install -y clang lld
           fi
-      - if: matrix.method == 'zigbuild'
+      - if: env.METHOD == 'zigbuild'
         uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-zigbuild@0.23.4
-      - if: matrix.method == 'zigbuild'
+      - if: env.METHOD == 'zigbuild'
         run: python3 -m pip install --user ziglang
       - name: Release versions for build.rs
-        env:
-          VERSIONS: ${{ matrix.versions }}
         run: for kv in $VERSIONS; do echo "$kv" >> "$GITHUB_ENV"; done
       # Hits: every release build on main saves and restores this
       # target's own -release key (release profile, never shared with dev).
@@ -578,10 +594,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
       - name: Build
-        env:
-          TRIPLE: ${{ matrix.triple }}
-          PFLAGS: ${{ matrix.pflags }}
-          METHOD: ${{ matrix.method }}
         run: |
           read -ra crate_args <<<"$PFLAGS" # space-separated -p list
           if [ "$METHOD" = zigbuild ]; then
@@ -590,10 +602,6 @@ jobs:
             cargo build --release --locked --target "$TRIPLE" "${crate_args[@]}"
           fi
       - name: Package, checksum, and check the version each binary reports
-        env:
-          TRIPLE: ${{ matrix.triple }}
-          COMPONENTS: ${{ matrix.components }}
-          METHOD: ${{ matrix.method }}
         run: |
           set -euo pipefail
           meta=$(cargo metadata --locked --format-version 1 --no-deps)
