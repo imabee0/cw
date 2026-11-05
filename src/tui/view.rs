@@ -86,7 +86,15 @@ fn render_segments(frame: &mut Frame, model: &DashboardModel, area: Rect, segs: 
     let mut x = area.x;
     let mut spans = Vec::with_capacity(segs.len());
     let mut hotspots = model.hotspots.borrow_mut();
-    for s in segs {
+    for mut s in segs {
+        if x >= area.right() {
+            break;
+        }
+        let room = area.right() - x;
+        if s.span.width() as u16 > room {
+            // Cut where it crosses the edge, visibly: "…" rather than half a word.
+            s.span.content = fit(&s.span.content, room).into();
+        }
         let w = s.span.width() as u16;
         if let Some(action) = s.action {
             let end = x.saturating_add(w).min(area.right());
@@ -110,6 +118,85 @@ fn key(text: &'static str) -> Span<'static> {
 
 fn destructive_key(text: &'static str) -> Span<'static> {
     Span::styled(text, Style::default().fg(KEY_HINT_DESTRUCTIVE))
+}
+
+/// `text` cut to `width` columns, ending in `…` when it had to be cut — so
+/// a truncated name reads as truncated rather than as a different name.
+fn fit(text: &str, width: u16) -> String {
+    let width = width as usize;
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(width - 1).collect();
+    out.push('…');
+    out
+}
+
+/// The widths a `Table` drawn into `area_width` gives its columns (after
+/// the highlight-symbol gutter and ratatui's default 1-column spacing), so
+/// cells can be fitted with `fit` before rendering.
+fn column_widths(area_width: u16, constraints: &[Constraint]) -> Vec<u16> {
+    let avail = area_width.saturating_sub(HIGHLIGHT_SYMBOL.len() as u16);
+    Layout::horizontal(constraints.to_vec())
+        .spacing(1)
+        .split(Rect::new(0, 0, avail, 1))
+        .iter()
+        .map(|r| r.width)
+        .collect()
+}
+
+/// Which of a table's columns to show at `width`. Each column is its
+/// constraint plus a drop rank (0 = always shown); while the `Fill` columns
+/// would get less than `fill_min` each, the highest-ranked column goes —
+/// so on a narrow terminal the names stay readable and the extras give way.
+fn responsive_columns(width: u16, cols: &[(Constraint, u8)], fill_min: u16) -> Vec<usize> {
+    let mut kept: Vec<usize> = (0..cols.len()).collect();
+    loop {
+        let avail = width.saturating_sub(HIGHLIGHT_SYMBOL.len() as u16);
+        let fixed: u16 = kept
+            .iter()
+            .map(|&i| match cols[i].0 {
+                Constraint::Length(n) => n,
+                _ => 0,
+            })
+            .sum();
+        let fills = kept
+            .iter()
+            .filter(|&&i| matches!(cols[i].0, Constraint::Fill(_)))
+            .count() as u16;
+        let spacing = kept.len().saturating_sub(1) as u16;
+        if avail >= fixed + spacing + fills * fill_min {
+            break;
+        }
+        let Some(pos) = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, &i)| cols[i].1 > 0)
+            .max_by_key(|(_, &i)| cols[i].1)
+            .map(|(pos, _)| pos)
+        else {
+            break;
+        };
+        kept.remove(pos);
+    }
+    kept
+}
+
+/// Only the focused pane shows a cursor and a reversed row; the other pane
+/// keeps its row in bold, so it's always clear where keys go.
+fn highlight(table: Table<'_>, focused: bool) -> Table<'_> {
+    if focused {
+        table
+            .row_highlight_style(selected_style())
+            .highlight_symbol(HIGHLIGHT_SYMBOL)
+    } else {
+        table
+            .row_highlight_style(Style::default().add_modifier(Modifier::BOLD))
+            .highlight_symbol("  ")
+    }
 }
 
 fn header_style() -> Style {
@@ -195,15 +282,14 @@ fn draw_body(frame: &mut Frame, model: &DashboardModel, area: Rect) {
         Some(repos) => {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+                // The focused pane gets the larger share: a repo list you're
+                // picking from, or the sessions you're working in.
+                .constraints(match model.focus {
+                    Focus::Repos => [Constraint::Percentage(58), Constraint::Percentage(42)],
+                    Focus::Worktrees => [Constraint::Percentage(40), Constraint::Percentage(60)],
+                })
                 .split(area);
-            draw_repo_pane(
-                frame,
-                repos,
-                model.focus == Focus::Repos,
-                model.loading,
-                cols[0],
-            );
+            draw_repo_pane(frame, model, repos, cols[0]);
             draw_worktree_pane(frame, model, cols[1]);
         }
         None => draw_worktree_pane(frame, model, area),
@@ -220,11 +306,12 @@ fn pane_title(name: &str, shown: usize, total: usize) -> String {
 
 fn draw_repo_pane(
     frame: &mut Frame,
+    model: &DashboardModel,
     repos: &ListState<RepoRow>,
-    focused: bool,
-    loading: bool,
     area: Rect,
 ) {
+    let focused = model.focus == Focus::Repos;
+    let loading = model.loading;
     let block = Block::default()
         .title(pane_title("repos", repos.filtered.len(), repos.items.len()))
         .borders(Borders::ALL)
@@ -245,7 +332,30 @@ fn draw_repo_pane(
     }
 
     let now = chrono::Utc::now();
-    let header = Row::new(vec!["NAME", "OWNER", "UPDATED", "LOCAL"]).style(header_style());
+    let counts = model.session_counts();
+    // OWNER is as wide as the longest owner (capped), NAME takes the rest.
+    let owner_width = repos
+        .items
+        .iter()
+        .map(|r| r.repo.owner.chars().count())
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 20) as u16;
+    // Dropped right to left as the pane narrows: SESSIONS, UPDATED, OWNER.
+    let columns = [
+        ("NAME", Constraint::Fill(1), 0),
+        ("OWNER", Constraint::Length(owner_width), 1),
+        ("UPDATED", Constraint::Length(8), 2),
+        ("SESSIONS", Constraint::Length(8), 3),
+    ];
+    let kept = responsive_columns(inner.width, &columns.map(|(_, c, rank)| (c, rank)), 14);
+    let constraints: Vec<Constraint> = kept.iter().map(|&i| columns[i].1).collect();
+    let mut widths = [0u16; 4];
+    for (&i, w) in kept.iter().zip(column_widths(inner.width, &constraints)) {
+        widths[i] = w;
+    }
+    let header =
+        Row::new(kept.iter().map(|&i| columns[i].0).collect::<Vec<_>>()).style(header_style());
     let rows: Vec<Row> = repos
         .filtered
         .iter()
@@ -253,30 +363,31 @@ fn draw_repo_pane(
         .map(|row| {
             let recent = is_recently_updated(&row.repo.updated_at, now);
             let name = if recent {
-                Span::styled(format!("★ {}", row.repo.name), Style::default().fg(RECENT))
+                Span::styled(
+                    fit(&format!("★ {}", row.repo.name), widths[0]),
+                    Style::default().fg(RECENT),
+                )
             } else {
-                Span::raw(row.repo.name.clone())
+                Span::raw(fit(&row.repo.name, widths[0]))
             };
-            Row::new(vec![
-                name,
-                dim(row.repo.owner.clone()),
-                dim(relative_time(&row.repo.updated_at, now)),
-                Span::raw(if row.local { "✓" } else { "" }),
-            ])
+            let sessions = counts
+                .get(row.repo.full_name().as_str())
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let mut cells = [
+                Some(name),
+                Some(dim(fit(&row.repo.owner, widths[1]))),
+                Some(dim(relative_time(&row.repo.updated_at, now))),
+                Some(Span::raw(sessions)),
+            ];
+            Row::new(
+                kept.iter()
+                    .map(|&i| cells[i].take().unwrap_or_default())
+                    .collect::<Vec<_>>(),
+            )
         })
         .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Fill(4),
-            Constraint::Fill(3),
-            Constraint::Length(9),
-            Constraint::Length(5),
-        ],
-    )
-    .header(header)
-    .row_highlight_style(selected_style())
-    .highlight_symbol(HIGHLIGHT_SYMBOL);
+    let table = highlight(Table::new(rows, constraints).header(header), focused);
 
     let mut table_state = repos.table.borrow_mut();
     frame.render_stateful_widget(table, inner, &mut table_state);
@@ -291,7 +402,18 @@ fn worktree_footer(model: &DashboardModel) -> Option<Line<'static>> {
             Stage::Cloning => format!("fetching {}…", pending.ctx.repo_label),
             Stage::CloneHook | Stage::CreateHook => "running hook…".to_string(),
             Stage::CreatingWorktree => format!("creating worktree {}…", pending.ctx.slug),
-            Stage::Launching => format!("launching {}…", pending.ctx.agent),
+            Stage::Launching => {
+                let skipping = model
+                    .agents
+                    .iter()
+                    .find(|a| a.name == pending.ctx.agent)
+                    .is_some_and(|a| a.skips_permissions(model.skip_permissions()));
+                if skipping {
+                    format!("launching {} — skipping permissions…", pending.ctx.agent)
+                } else {
+                    format!("launching {}…", pending.ctx.agent)
+                }
+            }
         };
         return Some(Line::from(Span::styled(
             format!(" {spinner} {text} "),
@@ -351,28 +473,57 @@ fn draw_worktree_pane(frame: &mut Frame, model: &DashboardModel, area: Rect) {
         return;
     }
 
-    let header = Row::new(vec!["", "REPO", "WORKTREE", "STATUS", "AGE"]).style(header_style());
+    // STATUS is as wide as its longest entry ("clean" … "3 changed · +2 unpushed").
+    let status_width = model
+        .worktrees
+        .items
+        .iter()
+        .map(|r| match r.selection {
+            WorktreeSelection::Existing(_) => Line::from(status_cell(r.state)).width(),
+            WorktreeSelection::New => 0,
+        })
+        .max()
+        .unwrap_or(0)
+        .max("STATUS".len()) as u16;
+    // Dropped as the pane narrows: AGE, then STATUS. The mark column stays
+    // first so its click hotspots (below) line up whatever is shown.
+    let columns = [
+        ("", Constraint::Length(MARK_WIDTH), 0),
+        // The session name is what you're scanning for: it gets the larger share.
+        ("REPO", Constraint::Fill(2), 0),
+        ("WORKTREE", Constraint::Fill(3), 0),
+        ("STATUS", Constraint::Length(status_width), 1),
+        ("AGE", Constraint::Length(8), 2),
+    ];
+    let kept = responsive_columns(inner.width, &columns.map(|(_, c, rank)| (c, rank)), 10);
+    let constraints: Vec<Constraint> = kept.iter().map(|&i| columns[i].1).collect();
+    let mut widths = [0u16; 5];
+    for (&i, w) in kept.iter().zip(column_widths(inner.width, &constraints)) {
+        widths[i] = w;
+    }
+    let header =
+        Row::new(kept.iter().map(|&i| columns[i].0).collect::<Vec<_>>()).style(header_style());
+    let short_names = short_repo_names(model);
     let rows: Vec<Row> = model
         .worktrees
         .filtered
         .iter()
         .filter_map(|&idx| model.worktrees.items.get(idx))
-        .map(|row| build_worktree_row(row, model))
+        .map(|row| {
+            let repo = short_names
+                .get(row.repo_label.as_str())
+                .copied()
+                .unwrap_or(row.repo_label.as_str());
+            let mut cells = build_worktree_cells(row, model, repo, widths[1], widths[2]);
+            Row::new(
+                kept.iter()
+                    .map(|&i| std::mem::take(&mut cells[i]))
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(MARK_WIDTH),
-            Constraint::Fill(5),
-            Constraint::Fill(4),
-            Constraint::Length(22),
-            Constraint::Length(9),
-        ],
-    )
-    .header(header)
-    .row_highlight_style(selected_style())
-    .highlight_symbol(HIGHLIGHT_SYMBOL);
+    let table = highlight(Table::new(rows, constraints).header(header), focused);
 
     let mut table_state = model.worktrees.table.borrow_mut();
     frame.render_stateful_widget(table, inner, &mut table_state);
@@ -420,21 +571,29 @@ fn status_cell(state: Option<WorkState>) -> Vec<Span<'static>> {
     }
 }
 
-fn build_worktree_row<'a>(row: &'a WorktreeRow, model: &DashboardModel) -> Row<'a> {
+/// The five cells of a worktree row (mark, repo, worktree, status, age);
+/// the caller picks the ones that fit.
+fn build_worktree_cells(
+    row: &WorktreeRow,
+    model: &DashboardModel,
+    repo: &str,
+    repo_width: u16,
+    slug_width: u16,
+) -> [Line<'static>; 5] {
     match &row.selection {
-        WorktreeSelection::New => Row::new(vec![
+        WorktreeSelection::New => [
             Line::from(""),
             Line::from(Span::styled(
-                row.repo_label.clone(),
+                fit(repo, repo_width),
                 Style::default().fg(NEW_ROW),
             )),
             Line::from(Span::styled(
-                "+ new worktree",
+                "+ new",
                 Style::default().fg(NEW_ROW).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(""),
-        ]),
+        ],
         WorktreeSelection::Existing(entry) => {
             let checked = model.checked.contains(&entry.path);
             let mark = if checked {
@@ -457,15 +616,40 @@ fn build_worktree_row<'a>(row: &'a WorktreeRow, model: &DashboardModel) -> Row<'
             } else {
                 Span::raw(row.age_label.clone())
             };
-            Row::new(vec![
+            [
                 Line::from(mark),
-                Line::from(Span::styled(row.repo_label.clone(), name_style)),
-                Line::from(Span::styled(entry.slug.clone(), name_style)),
+                Line::from(Span::styled(fit(repo, repo_width), name_style)),
+                Line::from(Span::styled(fit(&entry.slug, slug_width), name_style)),
                 Line::from(status_cell(row.state)),
                 Line::from(age),
-            ])
+            ]
         }
     }
+}
+
+/// Repo labels as the worktree pane shows them: just the repo name, or
+/// `owner/name` when two listed repos share a name.
+fn short_repo_names(model: &DashboardModel) -> std::collections::HashMap<&str, &str> {
+    let labels: std::collections::BTreeSet<&str> = model
+        .worktrees
+        .items
+        .iter()
+        .map(|r| r.repo_label.as_str())
+        .collect();
+    let name_of =
+        |label: &'_ str| -> String { label.rsplit_once('/').map_or(label, |(_, n)| n).to_string() };
+    labels
+        .iter()
+        .map(|&label| {
+            let name = label.rsplit_once('/').map_or(label, |(_, n)| n);
+            let shared = labels
+                .iter()
+                .filter(|&&other| name_of(other) == name)
+                .count()
+                > 1;
+            (label, if shared { label } else { name })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -494,63 +678,134 @@ fn draw_agent_bar(frame: &mut Frame, model: &DashboardModel, area: Rect) {
         ));
         segs.push(seg(Span::raw(" ")));
     }
-    if let Some(current) = model.agents.get(model.agent_index) {
-        if current.installed {
-            segs.push(seg(dim(format!(" {} ", current.cmd_preview))));
+    let Some(current) = model.current_agent() else {
+        render_segments(frame, model, area, segs);
+        return;
+    };
+    let toggle = model.skip_permissions();
+    segs.push(seg(dim("│ ")));
+    // The permissions control: a red badge whenever the selected agent will
+    // launch without prompts, a quiet hint otherwise. Always clickable (it's
+    // one session-wide setting); `p` does the same.
+    if current.skips_permissions(toggle) {
+        let label = if current.bypass_in_args {
+            " ⚠ skip permissions (config args) "
         } else {
-            segs.push(seg(Span::styled(
-                format!(" not installed — '{}' is not on PATH ", current.cmd_preview),
-                Style::default().fg(DANGER),
-            )));
-        }
+            " ⚠ skip permissions "
+        };
+        segs.push(button(
+            Span::styled(
+                label,
+                Style::default()
+                    .bg(DANGER)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Action::ToggleSkipPermissions,
+        ));
+    } else if current.supports_skip_permissions() {
+        segs.push(button(
+            Span::styled(" asks permission ", Style::default().fg(DIM)),
+            Action::ToggleSkipPermissions,
+        ));
+    } else {
+        let text = if toggle {
+            format!(" no skip-permissions mode in {} ", current.name)
+        } else {
+            " asks permission ".to_string()
+        };
+        segs.push(button(
+            Span::styled(text, Style::default().fg(DIM)),
+            Action::ToggleSkipPermissions,
+        ));
     }
-    segs.push(seg(dim(" ←/→ or click to choose")));
+    segs.push(button(key(" p"), Action::ToggleSkipPermissions));
+    segs.push(seg(dim(" toggle ")));
+
+    // The exact command a launch runs, only when it says more than the name.
+    let command = current.command_line(toggle);
+    if !current.installed {
+        segs.push(seg(Span::styled(
+            format!(" │ not installed — '{command}' is not on PATH "),
+            Style::default().fg(DANGER),
+        )));
+    } else if command != current.name {
+        segs.push(seg(dim(format!(" │ {command} "))));
+    }
     render_segments(frame, model, area, segs);
 }
 
 /// Every key hint is also a button — clicking it performs the same
 /// `Action` the key does (`tui::update::perform`).
 fn draw_help_line(frame: &mut Frame, model: &DashboardModel, area: Rect) {
-    let sep = || seg(dim(" · "));
-    let mut segs = vec![
-        seg(Span::raw(" ")),
-        button(key("enter"), Action::OpenFocused),
-        seg(Span::raw(" open")),
-        sep(),
-        button(key("n"), Action::NewWorktree),
-        seg(Span::raw(" new")),
-        sep(),
+    // Each hint is (priority, segments); when the line is too wide for the
+    // terminal, the lowest-priority hints are dropped first instead of the
+    // line being cut off mid-word.
+    let hint = |k: Span<'static>, action: Option<Action>, label: &'static str| {
+        let mut v = vec![match action {
+            Some(a) => button(k, a),
+            None => seg(k),
+        }];
+        v.push(seg(Span::raw(format!(" {label}"))));
+        v
+    };
+    let mut hints: Vec<(u8, Vec<Seg>)> = vec![
+        (9, hint(key("enter"), Some(Action::OpenFocused), "open")),
+        (8, hint(key("n"), Some(Action::NewWorktree), "new")),
     ];
-    if let Some(idx) = model.worktrees.selected_index() {
-        segs.push(button(key("space"), Action::ToggleMark(idx)));
-    } else {
-        segs.push(seg(key("space")));
-    }
-    segs.extend([
-        seg(Span::raw(" mark")),
-        sep(),
-        button(destructive_key("d"), Action::Delete),
-        seg(Span::raw(" delete")),
-        sep(),
-        button(key("r"), Action::Rescan),
-        seg(Span::raw(" rescan")),
-        sep(),
-    ]);
     if model.repos.is_some() {
-        segs.extend([
-            button(key("tab"), Action::ToggleFocus),
-            seg(Span::raw(" repos")),
-            sep(),
-        ]);
+        let other = match model.focus {
+            Focus::Repos => "worktrees",
+            Focus::Worktrees => "repos",
+        };
+        hints.push((9, hint(key("tab"), Some(Action::ToggleFocus), other)));
     }
-    segs.extend([
-        button(key("←/→"), Action::CycleAgent),
-        seg(Span::raw(" agent")),
-        sep(),
-        button(destructive_key("q"), Action::Quit),
-        seg(Span::raw(" quit")),
-        seg(dim("   click a row to focus, double-click to open")),
-    ]);
+    hints.push((7, hint(key("/"), None, "search")));
+    if model.focus == Focus::Worktrees {
+        let mark = model.worktrees.selected_index().map(Action::ToggleMark);
+        hints.push((5, hint(key("space"), mark, "mark")));
+        hints.push((
+            6,
+            hint(destructive_key("d"), Some(Action::Delete), "delete"),
+        ));
+    }
+    hints.push((6, hint(key("←/→"), Some(Action::CycleAgent), "agent")));
+    hints.push((
+        6,
+        hint(key("p"), Some(Action::ToggleSkipPermissions), "permissions"),
+    ));
+    hints.push((3, hint(key("r"), Some(Action::Rescan), "rescan")));
+    hints.push((9, hint(destructive_key("q"), Some(Action::Quit), "quit")));
+    hints.push((1, vec![seg(dim("click to focus · double-click to open"))]));
+
+    let sep_width = 3; // " · "
+    let width_of = |hints: &[(u8, Vec<Seg>)]| -> u16 {
+        1 + hints
+            .iter()
+            .map(|(_, h)| segs_width(h) + sep_width)
+            .sum::<u16>()
+            .saturating_sub(sep_width)
+    };
+    while width_of(&hints) > area.width {
+        let Some(lowest) = hints
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, _))| *p < 9)
+            .min_by_key(|(i, (p, _))| (*p, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        hints.remove(lowest);
+    }
+
+    let mut segs = vec![seg(Span::raw(" "))];
+    for (i, (_, h)) in hints.into_iter().enumerate() {
+        if i > 0 {
+            segs.push(seg(dim(" · ")));
+        }
+        segs.extend(h);
+    }
     render_segments(frame, model, area, segs);
 }
 
@@ -561,23 +816,20 @@ fn draw_help_line(frame: &mut Frame, model: &DashboardModel, area: Rect) {
 fn draw_modal(frame: &mut Frame, model: &DashboardModel, modal: &Modal, full: Rect) {
     match modal {
         Modal::HookConsent { resolved, .. } => {
-            let area = centered(full, 70, 7);
+            let body = vec![
+                Line::from(format!("{} {}", resolved.program, resolved.args.join(" "))),
+                Line::from(dim(format!("cwd: {}", resolved.cwd.display()))),
+                Line::from(dim(
+                    "this runs code the cloned repo supplies — asked once per repo",
+                )),
+            ];
+            let area = fitted_modal_area(full, 90, &body);
             let block = modal_block(" run hook? ", Style::default().fg(KEY_HINT));
             let inner = block.inner(area);
             frame.render_widget(Clear, area);
             frame.render_widget(block, area);
             let rows = split_last_line(inner);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(format!("{} {}", resolved.program, resolved.args.join(" "))),
-                    Line::from(dim(format!("cwd: {}", resolved.cwd.display()))),
-                    Line::from(dim(
-                        "this runs code the cloned repo supplies — asked once per repo",
-                    )),
-                ])
-                .wrap(Wrap { trim: false }),
-                rows.0,
-            );
+            frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows.0);
             render_segments(
                 frame,
                 model,
@@ -640,18 +892,14 @@ fn draw_confirm_delete(
         )
     };
 
-    // Height: one line per target (capped), a blank, two summary lines, the
-    // button row, plus the border.
+    // At most this many targets are listed (the rest summarized), so the
+    // summary and buttons always stay on screen.
     let max_list = (full.height.saturating_sub(10) as usize).max(3);
     let listed = targets.len().min(max_list);
-    let height = (listed + 6 + usize::from(listed < targets.len())) as u16;
-    let band = centered(full, 80, 0);
-    let strip = centered_fixed(full, 0, height);
-    let area = Rect::new(band.x, strip.y, band.width, strip.height);
-    let block = modal_block(title, title_style);
-    let inner = block.inner(area);
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
+    // Labels get whatever the width leaves after the marker, status and
+    // "(kept)" note, fitted with "…" rather than wrapped.
+    let width = modal_width(full, 90);
+    let label_width = width.saturating_sub(2 + 2 + 22 + 8).max(10);
 
     let mut lines: Vec<Line> = Vec::new();
     for t in targets.iter().take(listed) {
@@ -661,7 +909,9 @@ fn draw_confirm_delete(
         } else {
             dim("· ")
         };
-        let mut spans = vec![marker, Span::raw(format!("{:<40} ", t.label))];
+        let label = fit(&t.label, label_width);
+        let pad = (label_width as usize).saturating_sub(label.chars().count());
+        let mut spans = vec![marker, Span::raw(format!("{label}{} ", " ".repeat(pad)))];
         spans.extend(status_cell(t.state));
         if !will_go {
             spans.push(dim("  (kept)"));
@@ -703,8 +953,13 @@ fn draw_confirm_delete(
         ),
     }));
 
+    let area = fitted_modal_area(full, 90, &lines);
+    let block = modal_block(title, title_style);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
     let rows = split_last_line(inner);
-    frame.render_widget(Paragraph::new(lines), rows.0);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows.0);
 
     let mut buttons = vec![
         button(destructive_key("[y] remove"), Action::ModalConfirm),
@@ -767,11 +1022,29 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
         .split(vertical)[1]
 }
 
-/// A rect exactly `height` rows tall (clamped to `area`), vertically
-/// centered, spanning `area`'s full width — combined with `centered`'s
-/// horizontal band via `Rect::union`-style intersection by the caller.
-fn centered_fixed(area: Rect, _width: u16, height: u16) -> Rect {
-    let height = height.min(area.height);
-    let y = area.y + (area.height - height) / 2;
-    Rect::new(area.x, y, area.width, height)
+/// A dialog's width: up to `max` columns, never wider than the screen
+/// minus a small margin.
+fn modal_width(full: Rect, max: u16) -> u16 {
+    full.width
+        .saturating_sub(4)
+        .min(max)
+        .max(full.width.min(20))
+}
+
+/// A centered dialog sized to its content: `body` (wrapped to the dialog's
+/// width) plus a button row and the border, clamped to the screen.
+fn fitted_modal_area(full: Rect, max_width: u16, body: &[Line]) -> Rect {
+    let width = modal_width(full, max_width);
+    let inner_width = width.saturating_sub(2).max(1);
+    let body_height: u16 = body
+        .iter()
+        .map(|l| (l.width() as u16).div_ceil(inner_width).max(1))
+        .sum();
+    let height = (body_height + 1 + 2).min(full.height);
+    Rect::new(
+        full.x + (full.width - width) / 2,
+        full.y + (full.height - height) / 2,
+        width,
+        height,
+    )
 }

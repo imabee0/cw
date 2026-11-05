@@ -33,7 +33,11 @@ cw --repo owner/name my-slug # skip the repo picker, act on a named repo directl
 
 `cw`, `cw resume`, and `cw clean` open the dashboard: a repo pane (bare `cw` only) and a worktree pane listing every session across every repo, with its age and whether it holds changed files or unpushed commits. Enter (or a double-click) on a session resumes it; on a repo, or `n`, starts a new session. Click an agent in the footer (or `←`/`→`, or Ctrl-A) to choose claude/codex/grok/opencode/shell. Clone/fetch and launch failures open an error modal (also written to `~/.cache/cw/cw.log.<date>`); an agent that exits nonzero (Ctrl-C, a failed last shell command) is only noted in the status line — the session is kept either way.
 
-**Keys** — `j`/`k` or arrows move, Tab switches pane, `←`/`→` cycle the agent. Typing filters the focused pane; while its filter is empty, `q` quits, `n` starts a new session, `r` rescans, `u` applies a pending self-update, and in the worktree pane `Space` marks a row and `d` opens the removal confirm (marked rows, or the focused row if none are marked). Press `/` to search with every letter, shortcuts and `j`/`k` included; Enter or Tab keeps that filter, Esc clears it. Outside search, `Esc` clears the status, then the filter, then the marks, then quits.
+**Keys** — `j`/`k` or arrows move, Tab switches pane, `←`/`→` cycle the agent. Typing filters the focused pane; while its filter is empty, `q` quits, `n` starts a new session, `p` toggles skip-permissions for Claude Code and Codex, `r` rescans, `u` applies a pending self-update, and in the worktree pane `Space` marks a row and `d` opens the removal confirm (marked rows, or the focused row if none are marked). Press `/` to search with every letter, shortcuts and `j`/`k` included; Enter or Tab keeps that filter, Esc clears it. Outside search, `Esc` clears the status, then the filter, then the marks, then quits.
+
+**Skip permissions** — the agent bar shows whether the selected agent will ask for permission or run with a red **⚠ skip permissions** badge, plus the exact command it will launch. Press `p` or click the badge to toggle it for this session; `--yolo` or `skip_permissions = true` in the config starts with it on. It applies to Claude Code (`--dangerously-skip-permissions`) and Codex (`--dangerously-bypass-approvals-and-sandbox`) — any agent whose command is `claude` or `codex` — and leaves other agents as they are.
+
+**Layout** — `cw` opens on your sessions, or on the repo list when you have none. The focused pane is the wider one and the only one with a cursor; columns that don't fit a narrow terminal (age, status, owner, …) step aside so names stay readable, and anything cut short ends in `…`.
 
 **Mouse** — a click on a row focuses it; a second click on the same row within 400ms opens it (any key or scroll in between resets that). Clicks on the agent footer, the help line's keys, the mark column, and modal buttons act directly. The wheel scrolls the pane under the pointer.
 
@@ -55,7 +59,7 @@ cw --repo owner/name my-slug # skip the repo picker, act on a named repo directl
 - `--org ORG` (repeatable) — show only repos owned by these orgs/users. Discovery and its cache always cover everything; this only filters the view.
 - `--refresh` — ignore `cache_ttl_minutes` and re-list repos from GitHub now.
 - `--no-pull` — don't fetch an existing store; a new session branches from what was fetched last time.
-- `--yolo` (alias `--skip-permissions`) — launch Codex/Claude with their permission prompts skipped (`--dangerously-bypass-approvals-and-sandbox` / `--dangerously-skip-permissions`) for this invocation only; other agents are unaffected. For a permanent setting, put the flag in that agent's `args`.
+- `--yolo` (alias `--skip-permissions`) — start with skip-permissions on: Claude Code and Codex launch without permission prompts (`--dangerously-skip-permissions` / `--dangerously-bypass-approvals-and-sandbox`); other agents are unaffected. In the dashboard, `p` toggles it. For a permanent default, set `skip_permissions = true` in the config.
 - `--yes` — accept hook-consent prompts.
 - `--root PATH` — use this directory for session stores instead of `root`.
 - `--dry-run` (with `--repo` and a SLUG) — print the clone/fetch, worktree, hook, and agent decisions without changing anything.
@@ -79,6 +83,7 @@ root = "~/.local/share/cw/sessions"   # $XDG_DATA_HOME/cw/sessions when that's s
 cache_ttl_minutes = 15                # how long the repo list is reused before re-listing
 default_agent = "claude"
 idle_threshold_days = 14              # sessions untouched this long are flagged idle
+skip_permissions = false              # true: Claude Code/Codex start without permission prompts (p toggles it)
 
 # Dirs shared by every session of a repo instead of reinstalled per session,
 # e.g. ["node_modules"]. The shared copy lives in the repo's store, is

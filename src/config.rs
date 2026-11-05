@@ -22,6 +22,11 @@ pub struct Config {
     pub post_create_hook: Option<String>, // None = disabled; Some("auto") = lockfile-sniffing; Some(path) = that script
     #[serde(default = "default_agents")]
     pub agents: HashMap<String, AgentConfig>,
+    /// Launch Claude Code and Codex with their permission prompts skipped
+    /// (`permission_bypass_flag`). Off by default; `--yolo` turns it on for
+    /// one invocation, and the dashboard's `p` key toggles it per session.
+    #[serde(default)]
+    pub skip_permissions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +89,7 @@ impl Default for Config {
             post_clone_hook: None,
             post_create_hook: None,
             agents: default_agents(),
+            skip_permissions: false,
         }
     }
 }
@@ -148,14 +154,33 @@ pub fn resolve_agent(name: Option<&str>, cfg: &Config) -> Result<AgentConfig> {
             known.join(", ")
         )
     })?;
-    Ok(AgentConfig {
+    let mut resolved = AgentConfig {
         cmd: expand_var(&agent.cmd)?,
         args: agent
             .args
             .iter()
             .map(|a| expand_var(a))
             .collect::<Result<Vec<_>>>()?,
-    })
+    };
+    if cfg.skip_permissions {
+        if let Some(flag) = permission_bypass_flag(&resolved.cmd) {
+            if !resolved.args.iter().any(|a| a == flag) {
+                resolved.args.push(flag.to_string());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// The flag that launches an agent CLI without permission prompts, keyed by
+/// the command's file name (so a custom entry like `work = { cmd =
+/// "/opt/bin/claude" }` qualifies too). `None` for agents without one.
+pub fn permission_bypass_flag(cmd: &str) -> Option<&'static str> {
+    match std::path::Path::new(cmd).file_name()?.to_str()? {
+        "claude" => Some("--dangerously-skip-permissions"),
+        "codex" => Some("--dangerously-bypass-approvals-and-sandbox"),
+        _ => None,
+    }
 }
 
 /// Expands a leading `$VAR` or `${VAR}` by reading the env var directly
@@ -185,39 +210,48 @@ fn expand_var(s: &str) -> Result<String> {
     })
 }
 
-/// Apply only to the two supported agent entries; preserve custom arguments.
-pub fn enable_agent_permission_bypass(config: &mut Config) {
-    for (name, flag) in [
-        ("codex", "--dangerously-bypass-approvals-and-sandbox"),
-        ("claude", "--dangerously-skip-permissions"),
-    ] {
-        if let Some(agent) = config.agents.get_mut(name) {
-            if !agent.args.iter().any(|arg| arg == flag) {
-                agent.args.push(flag.into());
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn permission_bypass_is_idempotent_and_scoped() {
+    fn skip_permissions_adds_each_agents_own_flag_once() {
         let mut config = Config::default();
-        let shell = config.agents["shell"].args.clone();
-        enable_agent_permission_bypass(&mut config);
-        enable_agent_permission_bypass(&mut config);
+        assert!(resolve_agent(Some("claude"), &config)
+            .unwrap()
+            .args
+            .is_empty());
+        config.skip_permissions = true;
         assert_eq!(
-            config.agents["codex"].args,
-            ["--dangerously-bypass-approvals-and-sandbox"]
-        );
-        assert_eq!(
-            config.agents["claude"].args,
+            resolve_agent(Some("claude"), &config).unwrap().args,
             ["--dangerously-skip-permissions"]
         );
-        assert_eq!(config.agents["shell"].args, shell);
+        assert_eq!(
+            resolve_agent(Some("codex"), &config).unwrap().args,
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        // Not duplicated when the user's own args already carry it.
+        config.agents.get_mut("claude").unwrap().args =
+            vec!["--dangerously-skip-permissions".into()];
+        assert_eq!(
+            resolve_agent(Some("claude"), &config).unwrap().args,
+            ["--dangerously-skip-permissions"]
+        );
+        // Agents without such a mode are untouched.
+        assert!(resolve_agent(Some("grok"), &config)
+            .unwrap()
+            .args
+            .is_empty());
+    }
+
+    #[test]
+    fn permission_bypass_flag_matches_the_command_file_name() {
+        assert_eq!(
+            permission_bypass_flag("/opt/bin/claude"),
+            Some("--dangerously-skip-permissions")
+        );
+        assert_eq!(permission_bypass_flag("claude-wrapper"), None);
+        assert_eq!(permission_bypass_flag("/bin/zsh"), None);
     }
 
     #[test]

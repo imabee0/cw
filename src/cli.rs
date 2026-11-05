@@ -45,8 +45,10 @@ pub struct Cli {
     #[arg(long)]
     pub yes: bool,
 
-    /// Skip agent permission checks for Codex and Claude
-    #[arg(long, global = true, alias = "skip-permissions")]
+    /// Launch Claude Code and Codex with permission prompts skipped
+    /// (--dangerously-skip-permissions / --dangerously-bypass-approvals-and-sandbox).
+    /// In the dashboard, `p` toggles it; `skip_permissions = true` in config.toml makes it the default
+    #[arg(long, global = true, visible_alias = "skip-permissions")]
     pub yolo: bool,
 
     #[command(subcommand)]
