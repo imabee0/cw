@@ -81,6 +81,10 @@ fn perform(model: &mut DashboardModel, action: Action) -> Option<DashboardOutcom
             model.cycle_agent(1);
             None
         }
+        Action::ToggleSkipPermissions => {
+            model.toggle_skip_permissions();
+            None
+        }
         Action::ToggleFocus => {
             toggle_focus(model);
             None
@@ -145,6 +149,7 @@ fn modal_cancel(model: &mut DashboardModel) -> Option<DashboardOutcome> {
 
 fn handle_key(model: &mut DashboardModel, key: KeyEvent) -> Option<DashboardOutcome> {
     model.last_click = None;
+    model.initial_focus_pending = false;
     if is_ctrl_c(key) {
         return Some(DashboardOutcome::Cancelled);
     }
@@ -260,6 +265,10 @@ fn handle_pane_key(model: &mut DashboardModel, key: KeyEvent) -> Option<Dashboar
         // active filter, same discipline as `d`.
         KeyCode::Char('n') if focused_query_empty(model) => perform(model, Action::NewWorktree),
         KeyCode::Char('r') if focused_query_empty(model) => perform(model, Action::Rescan),
+        // Same gating: `p` stays typable into an active filter.
+        KeyCode::Char('p') if focused_query_empty(model) => {
+            perform(model, Action::ToggleSkipPermissions)
+        }
         // Same query-gating discipline. Additionally only live once a
         // background check has actually found something pending
         // (`model.update_available`) — otherwise 'u' is just filter text.
@@ -426,6 +435,9 @@ fn type_into_focused(model: &mut DashboardModel, c: char) {
 /// under the cursor, falling back to the focused pane.
 fn handle_mouse(model: &mut DashboardModel, mouse: MouseEvent) -> Option<DashboardOutcome> {
     let at = Position::new(mouse.column, mouse.row);
+    if !matches!(mouse.kind, MouseEventKind::Moved) {
+        model.initial_focus_pending = false;
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => handle_click(model, at),
         MouseEventKind::ScrollDown => {
@@ -694,7 +706,20 @@ mod tests {
             None,
         );
         std::mem::forget(consent_dir);
+        // Pinned to the opening focus so tests of other behavior don't
+        // depend on the no-sessions-opens-on-repos rule (tested on its own
+        // below, via `fresh_browse_model`).
+        model.initial_focus_pending = false;
         model.apply_worktrees_load(Ok(load(entries)));
+        model
+    }
+
+    /// `browse_model` as the dashboard really starts: the first worktree
+    /// scan may still choose the opening pane.
+    fn fresh_browse_model(repos: Vec<(&str, &str)>) -> DashboardModel {
+        let mut model = browse_model(repos, vec![]);
+        model.focus = Focus::Worktrees;
+        model.initial_focus_pending = true;
         model
     }
 
@@ -1782,5 +1807,112 @@ mod tests {
             Some(DashboardOutcome::Suspend(_)) => "Suspend",
             None => "None",
         }
+    }
+
+    // --- Opening focus ------------------------------------------------------
+
+    #[test]
+    fn with_no_sessions_the_dashboard_opens_on_the_repo_list() {
+        let mut model = fresh_browse_model(vec![("acme", "proj")]);
+        model.apply_worktrees_load(Ok(load(vec![])));
+        assert_eq!(model.focus, Focus::Repos);
+    }
+
+    #[test]
+    fn with_sessions_the_dashboard_opens_on_them() {
+        let mut model = fresh_browse_model(vec![("acme", "proj")]);
+        model.apply_worktrees_load(Ok(load(vec![scanned_entry("acme/proj", "one")])));
+        assert_eq!(model.focus, Focus::Worktrees);
+    }
+
+    #[test]
+    fn a_key_before_the_first_scan_keeps_the_users_focus() {
+        let mut model = fresh_browse_model(vec![("acme", "proj")]);
+        update_dashboard(&mut model, key(KeyCode::Down));
+        model.apply_worktrees_load(Ok(load(vec![])));
+        assert_eq!(model.focus, Focus::Worktrees);
+    }
+
+    #[test]
+    fn only_the_first_scan_chooses_the_opening_pane() {
+        let mut model = fresh_browse_model(vec![("acme", "proj")]);
+        model.apply_worktrees_load(Ok(load(vec![scanned_entry("acme/proj", "one")])));
+        // A later rescan finding nothing must not yank focus away.
+        model.apply_worktrees_load(Ok(load(vec![])));
+        assert_eq!(model.focus, Focus::Worktrees);
+    }
+
+    // --- Skip permissions ------------------------------------------------------
+
+    #[test]
+    fn p_toggles_skip_permissions_and_the_command_shows_the_flag() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        let claude = model
+            .agents
+            .iter()
+            .position(|a| a.name == "claude")
+            .unwrap();
+        model.select_agent(claude);
+        assert!(!model.skip_permissions());
+        assert_eq!(model.current_agent().unwrap().command_line(false), "claude");
+
+        update_dashboard(&mut model, key(KeyCode::Char('p')));
+        assert!(model.skip_permissions());
+        let agent = model.current_agent().unwrap();
+        assert!(agent.skips_permissions(true));
+        assert_eq!(
+            agent.command_line(true),
+            "claude --dangerously-skip-permissions"
+        );
+
+        update_dashboard(&mut model, key(KeyCode::Char('p')));
+        assert!(!model.skip_permissions());
+    }
+
+    #[test]
+    fn p_is_filter_text_while_a_query_is_active() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        update_dashboard(&mut model, key(KeyCode::Char('o')));
+        update_dashboard(&mut model, key(KeyCode::Char('p')));
+        assert_eq!(model.worktrees.query, "op");
+        assert!(!model.skip_permissions());
+    }
+
+    #[test]
+    fn agents_without_a_skip_mode_are_unaffected() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        let grok = model.agents.iter().position(|a| a.name == "grok").unwrap();
+        model.select_agent(grok);
+        update_dashboard(&mut model, key(KeyCode::Char('p')));
+        let agent = model.current_agent().unwrap();
+        assert!(!agent.supports_skip_permissions());
+        assert!(!agent.skips_permissions(true));
+        assert_eq!(agent.command_line(true), "grok");
+    }
+
+    #[test]
+    fn launching_with_skip_permissions_on_passes_the_flag() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        let claude = model
+            .agents
+            .iter()
+            .position(|a| a.name == "claude")
+            .unwrap();
+        model.select_agent(claude);
+        update_dashboard(&mut model, key(KeyCode::Char('p')));
+        match update_dashboard(&mut model, key(KeyCode::Enter)) {
+            Some(DashboardOutcome::Suspend(SuspendReq::LaunchAgent { agent, .. })) => {
+                assert_eq!(agent.cmd, "claude");
+                assert_eq!(agent.args, ["--dangerously-skip-permissions"]);
+            }
+            other => panic!("expected a launch, got {}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn clicking_the_permissions_badge_toggles_it() {
+        let mut model = all_worktrees_model(vec![scanned_entry("acme/proj", "one")]);
+        perform(&mut model, Action::ToggleSkipPermissions);
+        assert!(model.skip_permissions());
     }
 }

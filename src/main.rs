@@ -150,7 +150,7 @@ fn run(cli: Cli) -> Result<()> {
 
     let mut config = config::load()?;
     if cli.yolo {
-        config::enable_agent_permission_bypass(&mut config);
+        config.skip_permissions = true;
     }
     let root = resolve_root(cli.root.as_deref(), &config)?;
 

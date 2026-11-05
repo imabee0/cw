@@ -5,7 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result};
@@ -175,28 +175,18 @@ impl<T> ListState<T> {
 /// A repo, pre-annotated for the repo pane's table + fuzzy filter.
 pub struct RepoRow {
     pub repo: Repo,
-    /// Whether `root/owner/name/.git` already exists — the LOCAL column, so
-    /// the user sees clone-vs-pull cost before picking.
-    pub local: bool,
     pub filter_text: String,
 }
 
 impl RepoRow {
-    fn new(repo: Repo, root: &Path) -> Self {
-        let local = sync::resolve_local_path(root, &repo.owner, &repo.name)
-            .join(".git")
-            .exists();
+    fn new(repo: Repo) -> Self {
         let filter_text = repo.full_name();
-        Self {
-            repo,
-            local,
-            filter_text,
-        }
+        Self { repo, filter_text }
     }
 }
 
-fn build_repo_rows(repos: Vec<Repo>, root: &Path) -> Vec<RepoRow> {
-    repos.into_iter().map(|r| RepoRow::new(r, root)).collect()
+fn build_repo_rows(repos: Vec<Repo>) -> Vec<RepoRow> {
+    repos.into_iter().map(RepoRow::new).collect()
 }
 
 // ---------------------------------------------------------------------
@@ -276,26 +266,67 @@ fn build_worktree_rows(
 /// and fixed, never filtered).
 pub struct AgentEntry {
     pub name: String,
+    /// `cmd` plus the configured `args` — never the skip-permissions flag,
+    /// which `view.rs` appends while that mode is on.
     pub cmd_preview: String,
     pub installed: bool,
+    /// The flag that skips this agent's permission prompts, when it has
+    /// one (`config::permission_bypass_flag`) and the configured `args`
+    /// don't already pass it.
+    pub bypass_flag: Option<&'static str>,
+    /// The configured `args` already skip permissions: always on, whatever
+    /// the dashboard toggle says.
+    pub bypass_in_args: bool,
 }
 
 impl AgentEntry {
-    fn new(name: String, cfg: &AgentConfig, installed: bool) -> Self {
+    /// `cfg` is the entry as configured (shown in the footer); `resolved_cmd`
+    /// is its command after `$VAR` expansion, which decides the flag.
+    fn new(name: String, cfg: &AgentConfig, resolved_cmd: &str, installed: bool) -> Self {
         let mut cmd_preview = cfg.cmd.clone();
         for arg in &cfg.args {
             cmd_preview.push(' ');
             cmd_preview.push_str(arg);
         }
+        let flag = config::permission_bypass_flag(resolved_cmd);
+        let bypass_in_args = flag.is_some_and(|f| cfg.args.iter().any(|a| a == f));
         Self {
             name,
             cmd_preview,
             installed,
+            bypass_flag: flag.filter(|_| !bypass_in_args),
+            bypass_in_args,
+        }
+    }
+
+    /// Whether this agent has a skip-permissions mode at all.
+    pub fn supports_skip_permissions(&self) -> bool {
+        self.bypass_flag.is_some() || self.bypass_in_args
+    }
+
+    /// Whether launching it now skips permission prompts, given the
+    /// dashboard toggle.
+    pub fn skips_permissions(&self, toggle: bool) -> bool {
+        self.bypass_in_args || (toggle && self.bypass_flag.is_some())
+    }
+
+    /// The exact command line a launch would run right now.
+    pub fn command_line(&self, toggle: bool) -> String {
+        match self.bypass_flag {
+            Some(flag) if toggle => format!("{} {flag}", self.cmd_preview),
+            _ => self.cmd_preview.clone(),
         }
     }
 }
 
 fn build_agent_entries(config: &Config) -> Vec<AgentEntry> {
+    // Entries describe the agents as configured: the skip-permissions flag
+    // is a live toggle layered on top (`AgentEntry::command_line`), never
+    // baked into `cmd_preview`.
+    let config = &Config {
+        skip_permissions: false,
+        ..config.clone()
+    };
     // Sorted, not `HashMap` iteration order — deterministic run to run.
     let mut names: Vec<&String> = config.agents.keys().collect();
     names.sort();
@@ -304,10 +335,12 @@ fn build_agent_entries(config: &Config) -> Vec<AgentEntry> {
         .map(|name| {
             // Resolved (not the raw `cmd`) so `$SHELL` is checked as the
             // real binary it expands to — same as `cw doctor`.
-            let installed = config::resolve_agent(Some(name), config)
-                .map(|a| doctor::check_binary_on_path(&a.cmd).is_ok())
-                .unwrap_or(false);
-            AgentEntry::new(name.clone(), &config.agents[name], installed)
+            let raw = &config.agents[name];
+            let resolved_cmd = config::resolve_agent(Some(name), config)
+                .map(|a| a.cmd)
+                .unwrap_or_else(|_| raw.cmd.clone());
+            let installed = doctor::check_binary_on_path(&resolved_cmd).is_ok();
+            AgentEntry::new(name.clone(), raw, &resolved_cmd, installed)
         })
         .collect()
 }
@@ -355,6 +388,8 @@ enum PaneRepoFilter {
 pub enum Action {
     SelectAgent(usize),
     CycleAgent,
+    /// `p`: launch Claude Code/Codex with or without permission prompts.
+    ToggleSkipPermissions,
     /// `Tab`: swap focus between the repo and worktree panes.
     ToggleFocus,
     /// Enter on the focused row.
@@ -569,6 +604,10 @@ pub struct DashboardModel {
     pub last_click: Option<(Focus, usize, Instant)>,
     /// `Msg::Tick` counter — drives the in-flight pipeline's spinner.
     pub ticks: u64,
+    /// Whether the initial focus may still be adjusted once the first
+    /// worktree scan lands — cleared by that scan and by any key or click,
+    /// so focus never moves out from under the user.
+    pub(crate) initial_focus_pending: bool,
 
     // `config` is a snapshot (not a reference — `DashboardModel` outlives
     // any one `Config` borrow across suspend/resume) supplying hook paths/
@@ -634,6 +673,7 @@ impl DashboardModel {
             editing_filter: false,
             last_click: None,
             ticks: 0,
+            initial_focus_pending: true,
             config,
             force_delete,
             forced_slug,
@@ -656,7 +696,7 @@ impl DashboardModel {
         auto_yes: bool,
         forced_slug: Option<String>,
     ) -> Self {
-        let repos = ListState::new(build_repo_rows(initial_repos, &root));
+        let repos = ListState::new(build_repo_rows(initial_repos));
         let mut model = Self::base(
             Scope::Browse,
             Focus::Worktrees,
@@ -736,7 +776,7 @@ impl DashboardModel {
             return;
         };
         let query = std::mem::take(&mut repos.query);
-        *repos = ListState::new(build_repo_rows(load.repos, &self.root));
+        *repos = ListState::new(build_repo_rows(load.repos));
         repos.query = query;
         repos.refilter(|r| r.filter_text.as_str());
 
@@ -761,7 +801,24 @@ impl DashboardModel {
                 self.status = Some(format!("worktree scan failed: {e}"));
             }
         }
+        // Bare `cw` opens on the worktree pane so you land on your sessions —
+        // but with none to resume, the repo list is the only useful place.
+        if std::mem::take(&mut self.initial_focus_pending)
+            && self.repos.is_some()
+            && self.all_entries.is_empty()
+        {
+            self.focus = Focus::Repos;
+        }
         self.refresh_worktree_pane();
+    }
+
+    /// Open sessions per repo label (`owner/name`), for the repo pane.
+    pub fn session_counts(&self) -> HashMap<&str, usize> {
+        let mut counts = HashMap::new();
+        for entry in &self.all_entries {
+            *counts.entry(entry.repo.as_str()).or_insert(0) += 1;
+        }
+        counts
     }
 
     pub fn apply_work_refresh(&mut self, path: PathBuf, result: Result<WorkState, String>) {
@@ -873,6 +930,22 @@ impl DashboardModel {
         if idx < self.agents.len() {
             self.agent_index = idx;
         }
+    }
+
+    /// Whether agents that support it launch with permission prompts
+    /// skipped — `--yolo`/`skip_permissions` set the start value, `p`
+    /// toggles it for this session. Read at launch through
+    /// `config::resolve_agent`, so the footer and the launch can't disagree.
+    pub fn skip_permissions(&self) -> bool {
+        self.config.skip_permissions
+    }
+
+    pub fn toggle_skip_permissions(&mut self) {
+        self.config.skip_permissions = !self.config.skip_permissions;
+    }
+
+    pub fn current_agent(&self) -> Option<&AgentEntry> {
+        self.agents.get(self.agent_index)
     }
 
     fn current_agent_name(&self) -> Option<String> {
