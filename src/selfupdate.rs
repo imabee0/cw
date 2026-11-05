@@ -226,7 +226,10 @@ fn verify_sha256(file: &Path, expected: &str) -> Result<()> {
         .context("checksum file is empty")?
         .to_ascii_lowercase();
     let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-    let actual = format!("{:x}", Sha256::digest(&bytes));
+    let actual: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if actual != expected {
         bail!(
             "SHA256 mismatch for {}: expected {expected}, got {actual}",

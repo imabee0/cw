@@ -82,7 +82,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"  # persists a copy of the run's log to ~/.cache/cw/cw.log — see §5m
 clap_complete = "4"      # `cw completions <shell>` — see §4
-sha2 = "0.10"            # verifies the SHA256 of a self-update download (selfupdate.rs)
+sha2 = "0.11"            # verifies the SHA256 of a self-update download (selfupdate.rs)
 workspace-hack = { version = "0.1", path = "workspace-hack" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
