@@ -271,9 +271,13 @@ fn cache_file(cache_dir: &Path) -> PathBuf {
     cache_dir.join("update-check.json")
 }
 
+/// A cache whose version isn't plain `X.Y.Z` — e.g. `"cw-v0.2.2"`, as the
+/// axoupdater-based 0.2.0 wrote it — reads as no cache, so the next check
+/// runs now instead of trusting an entry it can't compare for up to a day.
 fn read_cache(path: &Path) -> Option<UpdateCache> {
     let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let cache: UpdateCache = serde_json::from_slice(&bytes).ok()?;
+    parse_version(&cache.version).is_some().then_some(cache)
 }
 
 /// Atomic tmp+rename, matching `cache.rs`'s own convention — this file can
@@ -399,6 +403,21 @@ mod tests {
         let path = cache_file(dir.path());
         std::fs::write(&path, b"not json").unwrap();
         assert!(read_cache(&path).is_none());
+    }
+
+    #[test]
+    fn read_cache_ignores_a_version_it_cannot_compare() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = cache_file(dir.path());
+        // Written by the axoupdater-based 0.2.0: the tag, not a version.
+        std::fs::write(&path, br#"{"version":"cw-v0.2.2","checked_at":1793845949}"#).unwrap();
+        assert!(read_cache(&path).is_none());
+
+        std::fs::write(&path, br#"{"version":"0.2.2","checked_at":1793845949}"#).unwrap();
+        assert_eq!(
+            read_cache(&path).map(|c| c.version),
+            Some("0.2.2".to_string())
+        );
     }
 
     #[test]
