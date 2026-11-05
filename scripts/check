@@ -550,10 +550,6 @@ run_gate() {
   # Cross-target checks, one at a time (one cargo already uses every core).
   local triple crates=() line pflags=()
   for triple in $(cfg '.TARGETS[].triple'); do
-    if [ "$triple" = "$HOST_TRIPLE" ]; then
-      skip_stage "check-$triple" "host triple — the clippy stage already checked it"
-      continue
-    fi
     case "$triple" in
       *-apple-*)
         case "$HOST_TRIPLE" in
@@ -605,11 +601,10 @@ EOF
   fi
 
   collect_all_bg
-  if [ -n "$not_verified" ]; then
-    finish "${C_GREEN}PASS gate in $((SECONDS - START))s.${C_OFF} Not verified on this host:${not_verified} (cross-target check; CI covers it)."
-  else
-    finish "${C_GREEN}PASS gate in $((SECONDS - START))s.${C_OFF}"
+  if [ -n "$not_verified" ] && [ ${#FAILURES[@]} -eq 0 ]; then
+    say "${C_YELLOW}Not verified on this host:${not_verified} (cross-target check; the merge queue checks it on macOS).${C_OFF}"
   fi
+  finish "${C_GREEN}PASS gate in $((SECONDS - START))s.${C_OFF}"
 }
 
 run_build() {
